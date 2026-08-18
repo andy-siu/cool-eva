@@ -38,8 +38,8 @@ import { describeNegativeResponseCode } from "./obd-dtc.ts";
 //     (obd-garage/DIAG_ADDRESSES.md §9.1): service `0x17` was sent 29 times, to
 //     micro A8 and to no other, and every one of the 29 got a POSITIVE `57`
 //     reply. So the service exists on THIS bike, on that micro, and it answers.
-//   • In Energica's own code, 2026-08-16: `the service tool's shared library`'s
-//     `KWP2000::ReadDiagnosticTroubleCodeInformation` emits service byte `0x17`
+//   • In Energica's own code, 2026-08-16: the service tool's shared library has
+//     `KWP2000::ReadDiagnosticTroubleCodeInformation` emitting service byte `0x17`
 //     with a two-byte identifier `[(code & 0xFF00) >> 8, code & 0xFF]`, and its
 //     caller `ReadDTCDetails` does TesterPresent → `10 81` → SetFullDLC → send,
 //     against `MotorbikeECU.VCUSafety`. No SecurityAccess anywhere in that path.
@@ -50,8 +50,8 @@ import { describeNegativeResponseCode } from "./obd-dtc.ts";
 // ⚠️ THE RESPONSE LAYOUT IS NOT PROVEN. The census counted service bytes and
 // discarded the payloads, so no `0x17` reply has ever been recorded.
 //
-// 🟡 What IS known: the service tool's `DTCode.GetInfoDetails` reads the status from index
-// 3 of its buffer and starts the fields at index 4, walking the DTC's infokeys in
+// 🟡 What IS known: the service tool's `DTCode.GetInfoDetails` reads the status from
+// index 3 of its buffer and starts the fields at index 4, walking the DTC's infokeys in
 // order by datatype width (recovered from IL; the second owner's tool documents
 // the same two constants). Both agree the status sits immediately before the
 // fields. What neither settles is whether that buffer still has the `57` service
@@ -62,7 +62,7 @@ import { describeNegativeResponseCode } from "./obd-dtc.ts";
 //
 // The 5-byte reading is preferred because it makes `0x17` the same shape as its
 // sibling `0x18` ReadDTCByStatus, which was seen on A8 in the same capture and
-// answers `58 <count>` followed by 3-byte `<hi> <lo> <status>` records — the service tool
+// answers `58 <count>` followed by 3-byte `<hi> <lo> <status>` records — the tool
 // "unconditionally skips payload[0]" before walking those. A `0x17` reply that is
 // that header with exactly one record, then the fields, puts status at index 3
 // and fields at index 4 of a service-byte-less buffer, which is precisely what
@@ -77,8 +77,8 @@ import { describeNegativeResponseCode } from "./obd-dtc.ts";
 // away.
 //
 // ── The OTHER freeze-frame route, deliberately not implemented ──────────────
-// the service tool has a second one: `KWP2000Moto.ReadFreezeFrame` dumps the whole stored
-// freeze-frame LOG as a stream, via `0x35` RequestUpload with identifier byte
+// The service tool has a second one: `KWP2000Moto.ReadFreezeFrame` dumps the whole
+// stored freeze-frame LOG as a stream, via `0x35` RequestUpload with identifier byte
 // `0x12` (`RoutinesID.ReadFreezeFrame`) and operand `FF`×10, then N × `0x36`
 // TransferData, then `0x37`. That is what the 1198-frame transfer in
 // obd-garage/DIAG_ADDRESSES.md §9.6 actually was: `A8 10 0C 35 12 FF FF FF` is
@@ -93,12 +93,12 @@ import { describeNegativeResponseCode } from "./obd-dtc.ts";
 //
 // ── ⚠️ READ-ONLY, AND STRUCTURALLY SO ──────────────────────────────────────
 // `FreezeFrameRequest` is a closed union with ONE member, and the encoder throws
-// on anything else. `0x17` is a read; the things next to it in the service tool are not,
+// on anything else. `0x17` is a read; the things next to it in the tool are not,
 // and none of them may ever be expressible here:
 //
 //   • `31 FE` StartRoutine (`RoutinesID.VCUErase`) with the 8-byte operand
 //     `01 00 00 00 01 FF FF FF`, then `33 FE` RequestRoutineResults polled until
-//     it reports 0 — the service tool's freeze-frame ERASE, and it takes SecurityAccess
+//     it reports 0 — the tool's freeze-frame ERASE, and it takes SecurityAccess
 //     first (`27 01` on A8) where the read takes none. It exists, it is written
 //     down here so nobody has to rediscover it, and it is deliberately not
 //     implemented. It is a flash erase of the bike's own record of why it
@@ -438,7 +438,7 @@ export function decodeFreezeFrameResponse(payload: Uint8Array, requestedComponen
     return { kind: "component-mismatch", requested: requestedComponent, received: component, rawHex };
   }
   // The symptom is part of the code's identity, not a status flag: component 8
-  // symptom 3 is U0113 and symptom 4 is U0114. the service tool's own DTCode.FindDTCFrom
+  // symptom 3 is U0113 and symptom 4 is U0114. The service tool's own DTCode.FindDTCFrom
   // matches on `(status & 240) >> 4`.
   const symptom = (status & 0xf0) >> 4;
 

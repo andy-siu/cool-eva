@@ -82,7 +82,7 @@ export const LIST_STORED_DTCS_FRAME = "A8 04 18 02 FF FF 00 00";
  * §D — a constructed `0x18` reply: two components with codes, then padding.
  *
  * Layout per the service tool's decoder — `58 <count>` then 3-byte `<hi> <lo> <status>`
- * records. The `(0, 0)` third record is the padding the service tool filters out and this
+ * records. The `(0, 0)` third record is the padding that tool filters out and this
  * repo counts instead, so that "the micro padded" stays distinguishable from
  * "component 0 has a fault".
  */

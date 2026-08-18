@@ -4,11 +4,11 @@ import { lookupInfokey, infokeyWidth, type InfokeyField } from "./infokey-table.
 // one ordered shortlist of ./infokey-table.ts ids per fault. Data only.
 //
 // 155 faults, 944 references, every one resolving into 1…120 with none dangling.
-// Extracted 2026-08-16 from the `DTCodes` JSON embedded in the service-tool executable (2024
-// build, via the second owner's `dtc_codes.py`); the 2021 build carried the same
-// table with 153 faults and 931 references, and the newer one only ADDS (4,5)
-// U0115 and (35,2) B1021 — no removals and no changes to a shared list. So the
-// two builds are one source carried forward, not two agreeing sources.
+// Extracted 2026-08-16 from the `DTCodes` JSON embedded in the service-tool
+// executable (2024 build, via the second owner's `dtc_codes.py`); the 2021 build
+// carried the same table with 153 faults and 931 references, and the newer one
+// only ADDS (4,5) U0115 and (35,2) B1021 — no removals and no changes to a shared
+// list. So the two builds are one source carried forward, not two agreeing sources.
 //
 // ── ⚠️ THE ORDER IS THE WIRE LAYOUT, NOT A DISPLAY PREFERENCE ───────────────
 // A freeze-frame payload is these fields concatenated in exactly this order, each
@@ -30,14 +30,14 @@ import { lookupInfokey, infokeyWidth, type InfokeyField } from "./infokey-table.
 // answer.
 //
 // ── ⚠️ `serviceToolObdCode` IS A CROSS-CHECK, NOT AN AUTHORITY ──────────────
-// It is what the service tool calls each (component, symptom) pair, carried so a change in
-// either source shows up as a diff rather than as nothing. Where it disagrees
-// with ./dtc-table.ts, THE DTC TABLE WINS: that table is reconciled against the
-// type-approval PDF and against this bike's own mode-03 reply, and this one is a
-// single vendor build. There are exactly two disagreements today, both the water
-// pump — the service tool swaps (44,0) and (44,2) relative to the PDF — and
-// scripts/check-freeze-frame.ts asserts that the set is still exactly those two,
-// so a third one cannot appear quietly.
+// It is what the manufacturer's service tool calls each (component, symptom) pair,
+// carried so a change in either source shows up as a diff rather than as nothing.
+// Where it disagrees with ./dtc-table.ts, THE DTC TABLE WINS: that table is
+// reconciled against the type-approval PDF and against this bike's own mode-03
+// reply, and this one is a single vendor build. There are exactly two disagreements
+// today, both the water pump — the tool swaps (44,0) and (44,2) relative to the
+// PDF — and scripts/check-freeze-frame.ts asserts that the set is still exactly
+// those two, so a third one cannot appear quietly.
 //
 // One fault, (60,0) `P1052` BATTERY STATISTICS INFO3, has an EMPTY shortlist. That
 // is Energica's data, not a gap in the extraction, and it decodes to a freeze

@@ -546,7 +546,7 @@ expect(damaged.rows[0].value !== -366, "…and must not keep 16407's signed read
 // belongs in the check, where it is a proof rather than a startup cost.
 expect(
   KNOWN_TABLE_TYPES.length === 28,
-  `the 2024 the service tool build selects 28 tables, the catalogue has ${KNOWN_TABLE_TYPES.length}`
+  `the 2024 service-tool build selects 28 tables, the catalogue has ${KNOWN_TABLE_TYPES.length}`
 );
 expect(
   new Set(KNOWN_TABLE_TYPES).size === KNOWN_TABLE_TYPES.length,
@@ -1879,7 +1879,7 @@ expect(
   "the mismatch remedy must say that reading will not help and name the script that fixes it"
 );
 expect(
-  mismatchedGate.remedy.includes("the service-tool executable") && mismatchedGate.remedy.includes("README"),
+  mismatchedGate.remedy.includes("service-tool install") && mismatchedGate.remedy.includes("README"),
   "…and must say what the owner needs (their own service-tool install) and where the walkthrough is"
 );
 expect(
@@ -2052,11 +2052,11 @@ expect(
 // ⚠️ THE SERVICE ACTIONS ARE DELIBERATELY NOT GATED, and this is where that decision
 // is pinned down rather than left to a comment. `31 FC` addresses a routine local
 // identifier, which is not a bank-1 parameter index and appears in none of Energica's
-// 28 parameter tables — it comes from the service tool's shared library (SERVICE_RESET.md §3). Mode 04 and the
-// 0x120 clock broadcast carry no identifier at all. So the reasoning that motivates the
-// gate does not reach them, and blocking them would be a refusal resting on evidence
-// with no bearing on the action. The type system carries the argument: a routine
-// request has nowhere to put a table type.
+// 28 parameter tables — it comes from the service tool's shared library
+// (SERVICE_RESET.md §3). Mode 04 and the 0x120 clock broadcast carry no identifier at
+// all. So the reasoning that motivates the gate does not reach them, and blocking them
+// would be a refusal resting on evidence with no bearing on the action. The type system
+// carries the argument: a routine request has nowhere to put a table type.
 expect(
   toHex(buildWriteFrame("A8", { kind: "start-routine", routine: "set-service-point" })) === "A8 02 31 FC 00 00 00 00",
   "31 FC must still build with no table-type evidence anywhere in the request"

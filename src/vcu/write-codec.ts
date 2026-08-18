@@ -63,8 +63,8 @@ import type { ParameterWritePlan } from "./write-targets.ts";
 //   write refused                                 → 7E0: F1 03 7F 2E 33   (securityAccessDenied)
 //
 // A BYTE write is the same with `len = 04` and one value byte. The routine is from
-// obd-garage/SERVICE_RESET.md §3, decompiled from Energica's `the service tool's shared library` rather
-// than captured: `7C0: A8 02 31 FC` → `7E0: F1 02 71 FC`.
+// obd-garage/SERVICE_RESET.md §3, decompiled from the service tool's shared library
+// rather than captured: `7C0: A8 02 31 FC` → `7E0: F1 02 71 FC`.
 //
 // ── ⚠️ What is proven and what is not, as of 2026-08-16 ──────────────────────
 //  • ✅ The seed→key algorithm. Four real A8 seed/key pairs off this bike's bus
