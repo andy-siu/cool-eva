@@ -30,6 +30,22 @@
   --dim: #334155; /* borders only — never text */
   --bad: #f87171;
   --good: #4ade80;
+  /* The same amber as WARN in public/lib/colors.js, and it has to stay the same:
+     the menu sheet marks a reversible write amber in CSS and colours the sentences
+     that argue against it amber from JS, and two ambers that nearly match would
+     read as two different meanings. 7.9:1 on --bg, 6.5:1 on --tile.
+     --bad measures 6.5:1 on --bg but only 5.3:1 on --tile, so red text in the sheet
+     sits on the sheet's own background and never on a tile. */
+  --warn: #fb923c;
+
+  /* The same two hues at the alpha the sheet's borders want, declared ONCE.
+     ⚠️ They are hand-expanded from --warn and --bad because a var() cannot be given
+     an alpha without color-mix(), which this dashboard does not assume — but hand-
+     expanding them at each use site is exactly the drift the note above forbids, and
+     there were four such copies. If you change --warn or --bad, change these; a grep
+     for the hex now finds every place the colour lives. */
+  --warn-edge: rgba(251, 146, 60, 0.45);
+  --bad-edge: rgba(248, 113, 113, 0.55);
 
   /* The tab bar is fixed; every scrolling surface has to clear it plus the home
      indicator, or the last tile sits permanently under your thumb. */
@@ -316,6 +332,21 @@ body {
 
 /* ---------- sheet ---------- */
 
+/* ⚠️ `visibility: hidden`, and it is not belt-and-braces on top of the opacity.
+   `opacity: 0; pointer-events: none` hides a sheet from the eye and from a finger, and
+   from NOTHING ELSE: every control inside it stays in the tab order and stays
+   activatable. Verified before this line existed — open the sheet, open the red fold,
+   close the sheet, and `.focus()` still lands on "Say a service was performed NOW",
+   where two activations POST `31 FC`. The fold re-collapses on the next OPEN
+   (refreshVcuWrite), so the window is "closed and not yet reopened", which is most of
+   the time. Near-zero risk on a phone with no keyboard — but the whole argument for the
+   fold is that an irreversible action must not be reachable by accident, and an
+   invisible page is a worse place to reach one from than a visible one.
+
+   Transitioned rather than switched, so the fade survives: `visibility` steps at the
+   START of the transition going visible and at the END going hidden, which is exactly
+   the two moments wanted. Anything overriding .sheet for layout (the screenshot
+   harness) has to override this too. */
 .sheet {
   position: fixed;
   inset: 0;
@@ -323,13 +354,17 @@ body {
   display: flex;
   align-items: flex-end;
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.2s;
+  transition:
+    opacity 0.2s,
+    visibility 0.2s;
   z-index: 10;
 }
 
 .sheet.open {
   opacity: 1;
+  visibility: visible;
   pointer-events: auto;
 }
 
@@ -350,12 +385,87 @@ body {
   transform: translateY(0);
 }
 
+/* The sheet has two levels of heading, and it needs both: it is one scroll
+ * containing five top-level sections, one of which (service mode) has four
+ * subsections of its own. With a single style for all nine, "Service actions"
+ * announced itself exactly as loudly as "This session" and nothing said which
+ * was inside which.
+ *
+ * Level 1 is a real heading — near-white, larger, and preceded by a rule that
+ * does most of the separating. Level 2 keeps the old small grey caps, which are
+ * a good subsection marker and were only ever a bad section marker.
+ *
+ * ⚠️ 1.15rem is chosen against `.action`'s 1rem, not by eye. A heading has to be
+ * BIGGER than the things it organises, and the first version of this rule was
+ * 0.95rem — measurably smaller than the button labels underneath it and than
+ * `.sheet-close`, which inherits 1rem. A heading out-sized by its own contents is
+ * the same "no hierarchy" complaint in a new place. If you change either number,
+ * change it knowing about the other.
+ */
+.sheet-heading {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--fg);
+  border-top: 1px solid var(--tile-edge);
+  margin-top: 1.5rem;
+  padding: 1rem 0.2rem 0.15rem;
+}
+
+/* No rule above the sheet's OWN first heading: it would sit a few pixels under the
+   sheet's top edge and read as a second border.
+   ⚠️ `.sheet-body >` is load-bearing, not tidiness. A bare `.sheet-heading:first-child`
+   also matches "Change something on the bike", which is the first child of the div
+   VcuWrite() returns — so the one heading in the sheet whose rule carries the most
+   meaning was the one silently losing it. */
+.sheet-body > .sheet-heading:first-child {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0.2rem;
+}
+
+/* One line under a level-1 heading saying what the whole section can do to the
+   bike — the risk tiers below, stated once for a group instead of per control.
+   Only the sections that hold controls get one; the two that are pure readouts
+   have nothing to warn about. The read/write boundary this makes visible existed
+   until now solely as a comment in public/views/service-mode.js, where no rider
+   could see it. */
+.sheet-heading-note {
+  font-size: 0.74rem;
+  color: var(--sub);
+  padding: 0.15rem 0.2rem 0;
+}
+
+/* The boundary itself.
+   ⚠️ The heading STAYS --fg; the amber is on the rule above it and the line under it.
+   Painting the heading amber sounds right and measures backwards: --warn is 7.9:1
+   where --fg is 14.5:1, so the one section heading that announces the bike can be
+   changed came out at half the contrast of "Stored codes", which announces "none set".
+   It is also the same amber as the deck directly under it, so head and deck stopped
+   separating. Rank belongs to the heading; hue belongs to the rule and the deck. */
+.sheet-heading.writes {
+  border-top-color: var(--warn);
+  /* ⚠️ Larger than its peers, because rank should track consequence. At one size for
+     all six, "Link" — a one-line status readout — announced itself exactly as loudly
+     as the section that permanently alters a motorcycle. The colour stays --fg (see
+     above); size is the channel that raises it without dimming it. */
+  font-size: 1.35rem;
+}
+
+.sheet-heading.writes + .sheet-heading-note {
+  color: var(--warn);
+}
+
+/* Level 2. Heavier and a touch larger than it was, because the sheet also uses
+   small grey caps for FIELD labels (`.probe-label`, `.stat-label`) and at 0.68rem
+   the only thing separating "SERVICE ACTIONS" from "ECU" was a point of tracking.
+   Weight is what tells them apart now; nobody perceives a pixel of cap height. */
 .sheet-title {
-  font-size: 0.68rem;
+  font-size: 0.72rem;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.14em;
   color: var(--sub);
-  padding: 0.9rem 0.2rem 0.5rem;
+  padding: 1rem 0.2rem 0.5rem;
 }
 
 .stats {
@@ -383,28 +493,283 @@ body {
   margin-top: 0.15rem;
 }
 
+/* ---------- the sheet's three risk tiers ---------- */
+
+/* Every control in this sheet used to be the same grey rectangle, which meant
+ * "read the last-service date", "say a service was performed NOW" and "clear the
+ * stored trouble codes" were indistinguishable until you had read all three —
+ * and one of them cannot be undone.
+ *
+ * The tier is carried by a 3 px gutter down the left edge of every control.
+ *
+ * ⚠️ Measured against --tile, the three gutters are NOT three comparable colours,
+ * and an earlier version of this comment claimed they were:
+ *
+ *   grey  --dim   1.41:1     amber --warn  6.46:1     red --bad  5.29:1
+ *
+ * At 1.41:1 through a visor in daylight nobody perceives the grey one, so what
+ * is actually read is presence against absence — a mark on the two tiers that
+ * have one, and nothing on the tier that does not. Which is the right signal to
+ * be carrying, and better than the one the claim described: presence/absence
+ * survives deuteranopia, which flattens amber against red, and it survives
+ * sunlight, which flattens everything. Grey is the default tier precisely
+ * because it means "unmarked", and an unmarked control looking unmarked is the
+ * system working. Do not raise --dim to "fix" this: it would put a visible
+ * stripe on eight read buttons that carry no risk, and spend the one channel
+ * that still works in daylight on saying nothing.
+ *
+ * The grey declaration stays anyway, and is not decoration: it fixes the
+ * geometry, so a tier modifier only ever RECOLOURS and can never shift a text
+ * baseline.
+ *
+ *   grey (default)     reads. A parameter read, a CSV export, a probe, a
+ *                      download. Cannot change the bike, and the safe tier
+ *                      deliberately needs no modifier — a control acquires risk
+ *                      by being marked, never by being forgotten.
+ *   amber .writes      a parameter write. Changes the bike, and can be written
+ *                      back, which is exactly what makes it a middle tier rather
+ *                      than being lumped in with the red one.
+ *   red .irreversible  the 31 FC service point, clearing stored DTCs, setting
+ *                      the bike's clock. No unset, and in the clock's case not
+ *                      even a read-back.
+ *
+ * ⚠️ EVERY tier keeps the filled tile. The first version of this made the read
+ * tier transparent so it would recede, which is a fine idea on a monitor and a
+ * bad one here: --tile against --bg is a 1.22:1 edge, so in daylight through a
+ * visor the only buttons still visible would have been the three that cannot be
+ * undone. Recession is not worth buying with legibility on the controls used
+ * most. Colour is the only thing that varies between tiers — the gutter and, at
+ * a lower volume, the hairline border. Every dimension is shared.
+ *
+ * ⚠️ The gutter is an inset shadow, not a fat border-left. A 3 px border meeting
+ * a 1 px border under a 0.8rem radius does not reconcile — the corner comes out
+ * visibly lumpy. An inset shadow is clipped by the border-radius and curves
+ * cleanly, and it costs no layout, so the text baseline is identical on all
+ * three tiers.
+ *
+ * ⚠️ And the red tier does not rest on any of this. It sits behind a fold
+ * (.risk-fold), so it is not on screen at all until it is asked for, and each
+ * button carries a red IRREVERSIBLE line above it. Four redundant channels —
+ * fold, badge, border, gutter — because a thumb scrolling this sheet on a
+ * handlebar-mounted phone must not be able to land on an irreversible action,
+ * and no single visual channel is trustworthy enough to be the one that stops it.
+ */
 .action {
   width: 100%;
   background: var(--tile);
   border: 1px solid var(--tile-edge);
   border-radius: 0.8rem;
+  box-shadow: inset 3px 0 0 var(--dim);
   color: var(--fg);
   font: inherit;
   font-size: 1rem;
+  /* Tall enough for a gloved thumb. `min-height` as well as padding, because without
+     it the row height is set by whichever GLYPH is in the label — emoji run taller
+     than the text arrows, so "Download ride log" came out 4 px shorter than "Save
+     waypoint here" directly above it. Icon metrics must not decide layout. */
   padding: 1rem;
+  min-height: 3.75rem;
   margin-top: 0.5rem;
   text-align: left;
   cursor: pointer;
 }
 
-.action:disabled {
-  opacity: 0.5;
+.action.writes {
+  border-color: var(--warn-edge);
+  box-shadow: inset 3px 0 0 var(--warn);
 }
 
+.action.irreversible {
+  border-color: var(--bad-edge);
+  box-shadow: inset 3px 0 0 var(--bad);
+}
+
+/* ⚠️ 0.66, and the number is measured rather than felt. This is the state most of the
+   sheet sits in whenever the bike is off or not in reach — which is most of the time
+   somebody opens it — so the label has to clear the 6:1 floor this file sets at the top
+   while the button still reads unmistakably as "off".
+
+   Composite --fg and --tile against --bg at the opacity, then measure the label against
+   its own dimmed fill:
+
+     0.50  4.08:1   what it was, and well under the floor
+     0.62  5.52:1   the first correction, which did NOT reach the floor and said ~5.9:1
+     0.66  6.06:1   clears it
+
+   0.65 gives 5.92 and misses. If you change this, compute it — the value that looks
+   right and the value that measures right were four hundredths apart here. */
+.action:disabled {
+  opacity: 0.66;
+}
+
+/* 0.2rem horizontally, matching .sheet-heading and .sheet-title rather than the 0.3rem
+   this used to carry — two text left-edges 1.3 px apart is a wobble you can see as you
+   scroll, and there is no reason for captions to hang off the heading grid. */
 .action-note {
   font-size: 0.72rem;
   color: var(--label);
-  padding: 0.35rem 0.3rem 0;
+  padding: 0.35rem 0.2rem 0;
+}
+
+/* The prose under a control is three different things, and they were one
+ * undifferentiated amber block: "it will probably do nothing" sat in the same
+ * colour and size as "IRREVERSIBLE. There is no unset."
+ *
+ *   (unmarked)  what this does. Grey, always visible — it is how you know you
+ *               are on the right control.
+ *   .caution    why you might not want to. Amber. Folded away wherever there is
+ *               more than a sentence of it.
+ *   .no-undo    this cannot be taken back. Red, and never more than one short
+ *               line, because a paragraph of red is read as a paragraph.
+ *
+ * .no-undo leads the three under a button rather than following them: inside an
+ * opened fold, what separates the three irreversible actions from each other is
+ * precisely what each one cannot take back.
+ */
+.action-note.caution {
+  color: var(--warn);
+}
+
+/* The write section could not be reached at all.
+ *
+ * ⚠️ Ranked like .no-undo and NOT with it. The header of vcu-write.js calls this "the
+ * loudest failure this section has", and at the bare .action-note size (11.52 px,
+ * --label) it rendered byte-for-byte identically to "Reads four identifiers on the A8"
+ * — the one sentence saying the whole section is dead, set as the quietest type in it.
+ * Deliberately not the .no-undo class: that means one specific thing (this action
+ * cannot be taken back), and inheriting its badge spacing here would be borrowing a
+ * meaning that does not apply. This is red because something is broken. */
+.action-note.failure {
+  color: var(--bad);
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+/* ⚠️ Bigger and heavier, not only redder — and it sits ABOVE its button, so it also
+   needs the space that says it belongs to what follows rather than to what precedes.
+   Red is the dimmest ink in this palette (6.5:1 on --bg, against 14.5:1 for a
+   heading), so carrying severity in hue alone put the most consequential sentence on
+   the page at the BOTTOM of its own contrast ranking — quieter than every throwaway
+   grey line around it. Weight and size are the two channels that survive both that
+   and daylight through a visor. */
+.action-note.no-undo {
+  color: var(--bad);
+  font-size: 0.82rem;
+  font-weight: 600;
+  line-height: 1.35;
+  padding: 0.9rem 0.2rem 0.25rem;
+}
+
+/* The category, as a badge rather than as the first half of the sentence.
+   "IRREVERSIBLE" was appearing five times in a screen and a half — section deck, fold
+   label, and once per card — and at that rate it stops being read, while the only new
+   information on each card is what came after it. Same on all three cards, because the
+   category IS the same on all three; the consequence is what differs and it now gets
+   the weight. */
+.no-undo-badge {
+  display: inline-block;
+  margin-right: 0.4rem;
+  padding: 0.05rem 0.35rem;
+  border: 1px solid var(--bad-edge);
+  border-radius: 0.25rem;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  vertical-align: 0.08em;
+}
+
+/* The fold in front of the irreversible actions.
+ *
+ * The same idiom as the parameter warnings' toggle — a counted, caret-ended
+ * toggle built on .code-toggle, from the fix that stopped four amber paragraphs
+ * stacking above the write form — rather than a second kind of disclosure. Red
+ * instead of amber because what is behind it is.
+ *
+ * ⚠️ But it has real chrome, which that toggle does not, and the reason is not
+ * decoration. As a bare line of coloured text it read as a footnote on the
+ * caption above it rather than as the gate on three destructive operations, and
+ * it was a ~20 px line of text for somebody wearing gloves. It is now a
+ * full-width row with a real target: measured at 390x844, 49.8 px opened and
+ * 72.1 px collapsed — the collapsed state is taller because it carries the
+ * contents line as well, and it is the state the sheet spends its life in.
+ *
+ * ⚠️ Selected as `.code-toggle.risk-fold`, not `.risk-fold`. .code-toggle is
+ * declared further down this file, so at equal specificity it wins on source order
+ * and the variant silently rendered as the thing it was varying. */
+.code-toggle.risk-fold {
+  width: 100%;
+  text-align: left;
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--bad);
+  /* Solid, not dashed. Dashed was reached for to say "there is something behind
+     this", but a dashed edge means placeholder / empty state / drop target in every
+     UI vocabulary there is, and it was the only dashed thing on the page — so the one
+     control gating `31 FC` read as the component nobody had finished. What keeps it
+     from reading as a fourth button to press is that it has no fill and red type
+     where an action has a filled tile and near-white type. */
+  background: transparent;
+  border: 1px solid var(--bad-edge);
+  border-radius: 0.8rem;
+  padding: 0.9rem 1rem;
+  margin-top: 1.5rem;
+}
+
+/* The second line of the fold's label: what is actually in the drawer. The first line
+   says why it is shut, which is the more important fact and keeps the lead — but
+   "3 actions that cannot be undone" is a caveat used as a name, and somebody standing
+   at the bike who wants the clock should not have to open it to find out the clock is
+   in there. */
+.risk-fold-contents {
+  display: block;
+  margin-top: 0.2rem;
+  font-weight: 400;
+  color: var(--label);
+}
+
+/* One action and the prose that belongs to it. The gap between two of these is
+   deliberately wider than the gap inside one: with both at the default, the last
+   sentence about one irreversible action sat as close to the NEXT button as to the
+   one it was about. */
+.action-block + .action-block {
+  margin-top: 1.5rem;
+}
+
+/* The opened group.
+ *
+ * Spacing only — no rule and no indent. It had both, and both were wrong: the
+ * cards already carry a red gutter, so a second red rail 9 px to the left of it
+ * was the same line drawn twice, and indenting the group moved its LEFT edge
+ * while its right edge stayed on the page gutter, which reads as a layout bug
+ * rather than as grouping. What says these three belong together is that they
+ * are the only red things on the page and they appeared together when the fold
+ * opened. */
+/* ⚠️ The closing rule lives on the WRAPPER, not on the opened group, so it is there in
+   both states. On the group it existed only while open — so folded, "Recently written"
+   hung under the red panel with no divider at all, while "Stored codes" and "Link" each
+   got one, and it read as a caption on the danger box rather than as the next section.
+   The fold row is the opening edge and this is the closing one; neither touches the
+   left edge, which is what made the first attempt (a left rail plus an indent) ragged
+   on one side. */
+.risk-group {
+  padding-bottom: 1.1rem;
+  border-bottom: 1px solid var(--bad-edge);
+  margin-bottom: 0.5rem;
+}
+
+/* Spacing only. What says these three belong together is that they are the only red
+   things on the page and they appeared together when the fold opened. */
+.danger-zone {
+  margin-top: 1.5rem;
+}
+
+/* ⚠️ The first card's gap comes from .danger-zone, the others' from
+   `.action-block + .action-block` — so they have to be the same number or the stack
+   leads raggedly (it ran 25 / 41 / 42 px). Both are 1.5rem; change them together. */
+.danger-zone > .action-block:first-child {
+  margin-top: 0;
 }
 
 .sheet-close {
@@ -659,6 +1024,17 @@ body {
   font: inherit;
   font-size: 0.95rem;
   padding: 0.65rem 0.5rem;
+}
+
+/* The one field-shaped thing in the sheet that cannot be typed into: what the bike
+   currently holds, sitting immediately left of the box you type the new value into.
+   In identical chrome those two read as a pair of inputs, one of which silently
+   ignores you. Keeps the padding so the arrow between them still lines up; loses
+   everything that says "edit me". */
+.probe-input.readout {
+  background: transparent;
+  border-color: transparent;
+  padding-left: 0.15rem;
 }
 
 /* ---------- toast ---------- */

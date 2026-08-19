@@ -7,7 +7,7 @@ import { MUTED } from "../lib/colors.js";
 import { VcuProbe } from "./vcu-probe.js";
 import { VcuWrite, refreshVcuWrite } from "./vcu-write.js";
 
-const { a, button, div } = van.tags;
+const { a, button, div, h3 } = van.tags;
 
 // Service mode: read the VCU's calibration parameters off the bike on demand, and
 // hand the result over as the file another owner's energica_tool.py reads.
@@ -84,12 +84,16 @@ export function ServiceMode() {
     // "can we reach the bike" answer this section already has, rather than fetching
     // its own: both are governed by the same gate and the same switch, and two
     // sections deciding separately could only disagree.
-    div({ class: "sheet-title" }, "Probe one identifier"),
+    h3({ class: "sheet-title" }, "Probe one identifier"),
     VcuProbe(() => state.val !== null && state.val.enabled && state.val.gate.safe),
     // ⚠️ Everything above this line reads. Everything below it can CHANGE the
     // motorcycle, and it is behind its own switch (SERVICE_WRITE_ENABLED, off by
     // default) and fetches its own state. It is last on the sheet on purpose: the
     // things you do most often should not be underneath the things you cannot undo.
+    //
+    // This comment used to be the only place that boundary existed. It is now on
+    // screen as well — an amber level-1 heading with a rule above it, and a line
+    // under the "Service mode" heading in ./sheet.js saying it is coming.
     VcuWrite()
   );
 }
@@ -169,7 +173,12 @@ function ReadButton() {
       if (armed.val) {
         return "⚠  Tap again — this puts ~277 requests on the bus";
       }
-      return "🔧  Read VCU parameters from the bike";
+      // 🔎, not 🔧. The wrench was on this button AND on "say a service was
+      // performed NOW", i.e. on the safest control in the sheet and on one of the
+      // three that cannot be undone — the one glyph collision that actively
+      // mislead. 🔎 now means "this reads the bike" everywhere in the sheet, and
+      // 🔧 is left to mean the service point and nothing else.
+      return "🔎  Read VCU parameters from the bike";
     }
   );
 }
