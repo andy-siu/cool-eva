@@ -589,12 +589,13 @@ export const SIGNALS: SignalDef[] = [
   //
   // The whole block costs 3820 rows over that lap — 33 700 rows/h of bike-on time, against
   // 64 100/h for the 224 signals already logged from the same capture. So this is a ~53 %
-  // increase in the ride log's row rate while riding, for 31 signals, and the three biggest
-  // contributors are the torque pair and the 12 V load current: between them they are more
-  // than half of it, and 0x100's fourteen flags are 14 rows in total. That is the number to
-  // argue with if the SD card starts complaining; the deadbands most worth revisiting first
-  // are noted per signal below, and every one of them was chosen off a measured curve rather
-  // than a round number.
+  // increase in the ride log's row rate while riding, for the 31 signals that batch added, and
+  // the three biggest contributors are the torque pair and the 12 V load current: between them
+  // they are more than half of it, and 0x100's fourteen flags are 14 rows in total. (0x0A0's six
+  // flags joined on 2026-08-19 and are NOT in that measurement; they cost ~52 rows a ride, argued
+  // where they are declared below.) That is the number to argue with if the SD card starts
+  // complaining; the deadbands most worth revisiting first are noted per signal below, and every
+  // one of them was chosen off a measured curve rather than a round number.
   //
   // 0x0A0 — the ABS module. See src/can/abs.ts for what the capture proves and what it can't.
   //
@@ -617,6 +618,67 @@ export const SIGNALS: SignalDef[] = [
   // 441/h. Nothing to smooth, and a deadband of 1 here would swallow every single-bar step,
   // which on a 0-17 signal is most of it.
   { key: "front_brake_pressure_bar", unit: "bar", group: "controls", source: "stream" },
+  // 0x0A0's six flags, added 2026-08-19 to complete the ten signals Energica's `ParseABS_INFO`
+  // names. All six are true 1/0 bits, so none may carry a deadband — |1 − 0| > 1 is false, and
+  // a flag with a deadband of 1 logs once after boot and then never again, silently. That is
+  // enforced rather than merely intended: scripts/check-can-decoders.ts asks bounds.js which
+  // signals are gated to 0/1 and fails the build for any of them carrying one.
+  //
+  // Free to log, and this is measured rather than assumed. Four of the six have never been seen
+  // set in 48 923 captured frames of this ID, so they are one row each at boot and nothing
+  // after. The two that do fire, `abs_event` and `abs_rear_control_active`, fire in 25 frames
+  // total across two rides — 13 bursts of 1-2 frames, so ~26 edges each, ~52 rows for the pair
+  // across 53 minutes of riding. Against the 33 700 rows/h this block already costs, that is
+  // nothing, and there is no deadband that could reduce it without hiding the whole signal.
+  //
+  // No entry is needed in public/lib/bounds.js for any of them: `diag` and `controls` are both
+  // BOOLEAN_GROUPS and their unit is "", so the group rule already gates them to [0, 1] — which
+  // is exactly right here, and is the opposite of the situation `abs_warning_lamp` above had to
+  // be named for. That gate is also what catches a decoder returning the vendor's mask (16 or
+  // 128) instead of the bit; see the note in src/can/abs.ts on why they read through `bit()`.
+  //
+  // The two `*SENS_FAIL` bits go in `diag` beside the warning lamp they would light. The event
+  // and the two channel-active bits go in `controls`, next to front_brake_pressure_bar and the
+  // combined `brake` switch, because that is where you look when watching the brakes rather
+  // than hunting a fault — and `diag` is 170 signals deep with the generated dtc_* flags, which
+  // would bury them. `abs_event` sits with `abs_rear_control_active` deliberately: they fire in
+  // the same frame, always, and splitting them across two sections of the All tab would hide that.
+  //
+  // ⚠️ `abs_rear_control_active` is NOT `rear_brake`, and now that both are on the All tab the
+  // names are close enough to be worth separating explicitly. `rear_brake` (0x102 b2 0x40, in
+  // the `buttons` group) is the pedal switch — the rider's foot. `abs_rear_control_active`
+  // (0x0A0 b6 bit2) is the ABS module modulating the rear channel. Measured across the two road
+  // captures they do not merely differ, they are DISJOINT: in all 25 intervention frames
+  // **neither brake switch was on**, and the rear switch is on in 0 of 16 188 and 0 of 17 435
+  // ABS frames in those rides — the rear pedal was not touched once. Same for
+  // `abs_front_control_active` against `front_brake`. 🟡 The obvious reading of "the rear ABS
+  // channel intervening with no brake applied" is rear-wheel slip under regen, which is what an
+  // e-motorcycle's rear wheel does on a closed throttle — but that is an inference from the
+  // absence of a brake signal, not something these frames state.
+  //
+  // ⚠️ These two are LOG-FIRST, and the All tab's flash should not be relied on to catch one.
+  // An intervention is 1-2 frames, 100-200 ms, which is at the edge of what a person notices —
+  // the same problem public/lib/press.js was written for, and it chose a 600 ms latch because
+  // ~200 ms is roughly the threshold. `controls` gets the plain RawTile, which renders the live
+  // value with no latch, so on screen an intervention is a brief flip to 1 and back. The RIDE
+  // LOG is unaffected: no deadband, so both edges are sealed, and that is where an intervention
+  // is meant to be read from. Deliberately not fixed here rather than overlooked, and the shape
+  // of the fix is now known: views/all.js picks its latching tile by `groupOf(key) ===
+  // BUTTON_GROUP` and press.js's derive tracks that one group, so the change is to generalise
+  // that switch from a single group to a per-key momentary SET, and add these two to it.
+  // Moving them into `buttons` instead would be wrong — nothing presses an ABS intervention,
+  // and that tile's whole vocabulary is "PRESSED", "3 presses", "held for". A separate
+  // momentary path in views/all.js would be worse still. Neither belongs in a change whose
+  // subject is a frame decode, so it is named here rather than done here.
+  { key: "abs_front_sensor_fault", unit: "", group: "diag", source: "stream" }, // b4 0x10 A_FSENS_FAIL
+  { key: "abs_rear_sensor_fault", unit: "", group: "diag", source: "stream" }, // b4 0x20 A_RSENS_FAIL
+  { key: "abs_event", unit: "", group: "controls", source: "stream" }, // b4 0x80 A_EVENT
+  // ⚠️ Polarity unestablished — 0 in every captured frame, including the ones where the pressure
+  // demonstrably works, so "1 = valid" and "1 = invalid" are both live readings of it. It is
+  // logged as the raw bit and front_brake_pressure_bar is NOT gated on it. See src/can/abs.ts.
+  { key: "abs_front_pressure_validity", unit: "", group: "controls", source: "stream" }, // b6 bit0
+  { key: "abs_front_control_active", unit: "", group: "controls", source: "stream" }, // b6 bit1
+  { key: "abs_rear_control_active", unit: "", group: "controls", source: "stream" }, // b6 bit2
 
   // 0x127 — the throttle position sensor's two channels, 12-bit counts, at 4 Hz. Blank unit on
   // purpose: these are ADC counts and converting them to a percentage would need 0x109's own
