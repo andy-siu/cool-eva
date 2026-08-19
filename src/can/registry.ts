@@ -220,6 +220,31 @@ export const SIGNALS: SignalDef[] = [
   { key: "mains_a", unit: "A", group: "charge", source: "stream" },
   { key: "charge_limit_a", unit: "A", group: "charge", source: "stream" }, // 0x10a b7 ÷7 ✅
 
+  // 0x121 — the DC charge-current limit the RIDER picked on the bike's charging screen.
+  // The companion to charge_limit_a above, which is the AC side of the same dial: on DC
+  // that one reads 0 all session and nothing else on the bus carries the setting.
+  //
+  // "selected" is in the name because three different numbers here are all "a DC charge
+  // current limit" and only this one is a choice: 0x625 b2 is the configured ceiling the
+  // dial runs up to (75, VCU parameter 258), 0x620 b0 is what the vehicle is advertising
+  // to the station moment to moment, and charger_max_dc_a above is the ON-BOARD AC
+  // charger's own register, which reads 0.0 A throughout a DC session.
+  //
+  // ⚠️ An EVENT signal: the frame arrives only when the dial moves, so the tile shows the
+  // last setting seen and greys out 8 s later. That is honest, and charge-setpoint.ts
+  // explains why it must not be papered over with a timer.
+  //
+  // ⚠️ And a consequence of log-on-change that bites HERE and nowhere else: record() seals
+  // a row only when the value differs from `lastLogged` by more than the deadband, so
+  // RE-SELECTING THE VALUE YOU ALREADY HAD WRITES NO ROW — and notifyChange, inside the
+  // same branch, does not fire either. Dial 5 A, then dial 5 A again on the next charge in
+  // the same process lifetime, and the second one leaves no trace in the ride log. The
+  // dashboard is fine (the 5 s snapshot heartbeat refreshes ts, so the tile un-greys), but
+  // an absent row means "not touched OR re-picked the same number", not "not touched".
+  // waypoint_seq escapes this by being a monotonic counter; a setting cannot. Setting a
+  // deadband here would make it strictly worse, which is why there is none.
+  { key: "dc_charge_limit_selected_a", unit: "A", group: "charge", source: "stream" },
+
   // OBD-II polled @1 Hz
   { key: "speed_kmh", unit: "km/h", group: "obd", source: "poll" },
   { key: "motor_rpm", unit: "rpm", group: "obd", source: "poll", deadband: 20 },
