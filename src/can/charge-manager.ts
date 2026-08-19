@@ -22,6 +22,38 @@
 // a DC session at 99 % SOC. So "0x201 = 0x02 means AC" is false in both directions.
 // Ground truth used throughout is `0x615` b2 > 0 for DC (this frame's own current, below)
 // and 0x305 mains current > 0.5 A for AC, both of which are unambiguous.
+//
+// ## A note on the frame counts
+//
+// The counts added on 2026-08-19 (44 262, 44 862, 47 642, …) came from the change-plus-keepalive
+// scanner described at the bottom of this file — a row per payload CHANGE plus one every 2 s,
+// not a row per frame. The 2026-08-20 pass re-ran the invariants over EVERY raw frame instead,
+// deduplicated on (timestamp, id, payload) because several captures in the archive overlap in
+// time. That is the same data seen at ~20× the resolution:
+//
+//     0x605   967 865      0x610   968 629      0x615   941 765
+//     0x620   968 618      0x625 1 571 617   (0x625 is higher because it broadcasts parked too)
+//
+// Where a claim below has been re-measured at full rate it says so and carries the larger n.
+// Every invariant re-checked so far came out at the same 100.000 %, which is the reassuring
+// part — but the sampling is NOT uniform, and one percentage moved twelvefold because of it.
+// A keepalive scanner over-represents frames that are CHANGING, so any statistic about
+// transients is inflated: 0x620's "b2 > b0 in 0.4 %" is 0.033 % at full rate (see b0 below).
+// Treat a sampled percentage about a steady state as sound and one about an edge as suspect,
+// and re-derive before leaning on it.
+//
+// One thing the recount turned up that is about the ARCHIVE rather than the bike. Every frame
+// of all five ids is DLC 8 — the `data.length < 8` guards below have never fired on real data —
+// with one apparent exception, and the exception is not a frame:
+//
+//     capture-20260807-211634-0541697e.log ends
+//      (2026-08-07 21:17:38.503667)  can0  625   [8]  6B 01
+//
+// candump was killed mid-write, so the line says DLC 8 and carries two bytes. Same family as
+// the 2060-clock artefact at the bottom of this file: a truncated capture is indistinguishable
+// from a truncated frame to anything that parses these logs by counting fields, and it would
+// have "shown" that this bus produces short frames. It does not. Any scan of the archive should
+// drop a final line whose byte count disagrees with its own DLC.
 
 import { bit, type DecodedValue } from "./frame.ts";
 
@@ -74,10 +106,31 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
   switch (id) {
     // 0x605 — what the vehicle tells the BMS about the session in progress.
     //
-    // b1 and b4-6 are 00 in all 44 323 frames of the corpus. b0 is 0x0F on AC and 0x11 on DC
-    // (99.93 %) but is not read here: 15 and 17 are not a bitfield relationship and naming a
-    // two-valued byte would be inventing a meaning for it. b3 is a byte-for-byte copy of b2 —
-    // 100.000 % over 44 323 frames — so only one of the pair is emitted.
+    // b1 and b4-6 are 00, and b3 is a byte-for-byte copy of b2, both in 100.000 % of 967 865
+    // frames, so only one of the b2/b3 pair is emitted.
+    //
+    // ⚠️ b0 is NOT the two-valued byte the 2026-08-19 pass recorded. "0x0F on AC and 0x11 on DC
+    // (99.93 %)" is 97.19 % at full rate, and the byte takes TEN values, not two: 0x0F 783 865,
+    // 0x11 156 765, 0x02 25 704, 0x0B 1 080, 0x00 196, 0x01 148, 0x0E 53, 0x06 28, 0x03 24,
+    // 0x0A 2. Still not read here, and now for a better reason than "15 and 17 are not a bitfield
+    // relationship" — a byte with ten values and a 3 % tail is a state or a sequence number, and
+    // the two-valued reading was an artefact of a sample that under-represented the transitions.
+    // ⚠️ This is the one frame in the group with NO invariant gate, and that is a measurement
+    // rather than a preference — worth stating, because four of the five now have one and the
+    // asymmetry otherwise looks like an oversight.
+    //
+    // It has no invariant left to gate on. The all-ones shape is caught by bounds.js (255 fails
+    // both `charge_type`'s [0, 2] and `bms_leak_detect_inhibit`'s [0, 1]). The all-zero shape
+    // cannot be caught at all: b1 and b4-6 are 00 by definition, b3 = b2 holds trivially, and
+    // every remaining byte takes 0 in real traffic — b0 = 0x00 in 196 frames, b2 = 0 in 27 134,
+    // b7 = 0 in 811 039. THE BUS ITSELF SENDS A COMPLETELY ZERO 0x605 PAYLOAD 126 TIMES in the
+    // archive, so any gate that rejected that shape would be dropping real frames.
+    //
+    // Which is tolerable here and would not be on 0x620, for a reason worth keeping: this frame's
+    // all-zero decode is FAIL-SAFE. charge_type = 0 says "no path live" and
+    // bms_leak_detect_inhibit = 0 says "the isolation monitor is running" — both the safe reading
+    // of a charge manager that has gone away. 0x620's all-zero decode claims two ceilings, which
+    // is a measurement, and that is why it is gated and this is not.
     case CHARGE_BMS_COMMAND_CAN_ID: {
       if (data.length < 8) return [];
       return [
@@ -109,10 +162,29 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
     // b1-3 are 00 in every frame of every completed session. They are non-zero in exactly one
     // place in the whole corpus — the aborted DC attempt of 2026-08-09 14:42, where they read
     // 07 55 03 — so they are very likely a fault code. One aborted session is not enough to
-    // decode one, so they are left alone and recorded on issue #21 instead.
-    // b4-6 are the constant F1 05 01 in 100.000 % of 44 862 frames.
+    // decode one, so they are left alone and recorded on issue #21 instead. This is also why
+    // the gate below reads b4-6 and NOT b1-3: gating on b1-3 would drop the one aborted session
+    // in the corpus, which is the most interesting DC data this project has.
     case CHARGE_STATE_CAN_ID: {
       if (data.length < 8) return [];
+      // The same frame-invariant gate 0x625 has, and this frame is the one that needs it most.
+      // Both keys below are logged RAW and are DELIBERATELY bounded only to [0, 255] in
+      // bounds.js — the point of a raw state byte is to catch a state nobody has seen yet, and a
+      // bound drawn round today's set would reject exactly that. Which means bounds.js cannot
+      // reject anything at all for these two, and this check is the only defence they have.
+      //
+      // b4-6 are the constant F1 05 01 in 100.000 % of 968 629 frames — every raw frame of this
+      // id in the archive, not a sampled subset; see "A note on the frame counts" above. A
+      // 24-bit constant is not something a dead sender reproduces: none of all-zero, all-ones or
+      // an alternating pattern passes it.
+      //
+      // ⚠️ The trade-off, which 0x625 already accepts and which deserves stating once. A decoder
+      // is pure, so a gate that DROPS is silent by construction: if a firmware update ever moves
+      // F1 05 01, these two bytes go quiet rather than loud, and quiet looks exactly like a
+      // charge manager that never woke up. That is the right way round — 0x610 b7 is the
+      // cleanest AC/DC discriminator on this bus, so a wrong value for it is worse than no
+      // value — but it is the first thing to suspect if the state bytes ever vanish.
+      if (data[4] !== 0xf1 || data[5] !== 0x05 || data[6] !== 0x01) return [];
       return [
         // ✅ b0 = status bitfield. 0x19 on AC, 0x5E on DC, with the entry/exit sequence
         // passing through 0x08/0x0A/0x2A/0x4A/0x5A. What is established is the bottom two
@@ -129,13 +201,33 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
     }
 
     // 0x615 — the charge manager's own view of the pack. b1 is the constant 01 and b4-7 are
-    // 00 in 100.000 % of 47 642 frames, so three bytes carry everything.
+    // 00 in 100.000 % of 941 765 frames, so three bytes carry everything.
     case CHARGE_TELEMETRY_CAN_ID: {
       if (data.length < 8) return [];
+      // The frame invariant, for the same reason 0x625 below checks its own — and this frame is
+      // the worst-exposed of the three, because two of its three keys are real MEASUREMENTS
+      // rather than flags. An all-ones payload, which is one of the two shapes
+      // check-can-decoders.ts calls out as what a dead or disconnected sender produces, decodes
+      // to:
+      //
+      //     charge_manager_pack_v = 255 + 242.5 = 497.5 V
+      //     fast_dc_a             = 255 A
+      //     charge_manager_soc    = 255 %
+      //
+      // Only the SOC is caught, by bounds.js's "%" band. The other two passed the wide "V" and
+      // "A" unit fallbacks until this change named them (see public/lib/bounds.js), and a named
+      // bound is still only the second line of defence: 255 A on the only DC charge current on
+      // this bus is the kind of number that sets a chart's autoscale and then a conclusion.
+      //
+      // b1 = 0x01 and b4-7 = 00 in 100.000 % of 941 765 raw frames — b1 has never held any other
+      // value in the whole archive — so requiring them costs nothing and turns both dead-sender
+      // shapes back into "no reading". The same silent-drop trade-off applies as for 0x610
+      // above.
+      if (data[1] !== 0x01 || data[4] !== 0 || data[5] !== 0 || data[6] !== 0 || data[7] !== 0) return [];
       const values: DecodedValue[] = [];
       // b0 = 0 would decode to 242.5 V, which is a believable reading for this pack and sails
       // straight through bounds.js's "V" band — a phantom that is far harder to spot later
-      // than an obviously silly number. It has never happened: b0 spans 28…94 over all 47 632
+      // than an obviously silly number. It has never happened: b0 spans 28…94 over all 941 765
       // frames of the corpus and is never 0, including through the ~3 s DC handshake before
       // any current flows. So this guard should be dead code, and it is here because the one
       // way to find out that it is not would otherwise be a plausible voltage in the log.
@@ -185,15 +277,123 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
 
     // 0x620 — the current ceilings. One byte per charge path, and each is 0 while the other
     // path is the live one: b0 is 0 in 100.000 % of 36 924 AC frames and b1 is 0 in 100.000 %
-    // of 10 057 DC frames. That mutual exclusion is the argument for reading them as a pair.
+    // of 10 057 DC frames. That mutual exclusion is the argument for reading them as a pair, and
+    // re-measuring it at full rate lets it be stated without needing the mode at all: across all
+    // 968 618 frames the two are NEVER both non-zero. b0 alone in 152 581, b1 alone in 784 508,
+    // both zero in 31 529 — no frame at all in the fourth cell.
     //
     // b2 is 1 on AC and 0 on DC (99.98 % of 46 625) — the same fact as b0/b1 in one bit, so it
-    // is not logged separately. b3 is left undecoded: it is 0xFF on AC and moves between 9 and
-    // 64 on DC, correlating with current at r = +0.72 but not resolving the plateaus (it reads
-    // the same 22-23 across everything from 59 to 66 A), so no scaling survives contact with a
-    // second session. b4-7 are 00 in every frame.
+    // is not logged separately. b4-7 are 00 in 100.000 % of 968 618 frames.
+    //
+    // ## b3 — still undecoded, and the 2026-08-19 description of it was wrong
+    //
+    // ⚠️ RETRACTED: "0xFF on AC and moves between 9 and 64 on DC, correlating with current at
+    // r = +0.72". Every clause of that is wrong except the first, and the counter-example was
+    // sitting in the same change — the DC taper replay case `2C 00 00 51` in
+    // check-can-decoders.ts has b3 = 0x51 = 81. Re-measured over every raw 0x620 frame in the
+    // archive, 157 423 of them on DC across 11 DC sessions and 807 907 on AC:
+    //
+    //   • 0xFF on AC: 100.000 % of 807 907 frames — this part holds.
+    //   • But 0xFF appears on DC too, in 4 604 frames, so it does not mean "AC". Seven of the
+    //     nine DC sessions that contain any put all of them before the first real value;
+    //     2026-08-09 17:51 has 40 of its 173 interleaved after that; and the aborted attempt of
+    //     2026-08-09 14:42 has 952 of its 1 911 after the last real value as well. It reads as
+    //     "no DC figure", which covers both not-yet and never.
+    //   • The DC range is 9…82, not 9…64, over 31 distinct values.
+    //   • r(b3, fast_dc_a) = −0.333 over 152 612 aligned samples — the OPPOSITE SIGN to the
+    //     +0.72 recorded. Per session it runs from −0.97 to +0.78, which is what a pooled r over
+    //     a quantity that is not a function of current looks like. Withdrawn, not corrected.
+    //   • ❌ b3 = SOC − 18, suggested by the two replay frames (22 at 40 %, 81 at 99 %), is
+    //     REFUTED: it holds in 8.14 % of those samples, i.e. by coincidence.
+    //
+    // 🟡 One lead did come out of the re-measurement, recorded because the next pass should start
+    // here rather than at r = +0.72. Read b3 as KILOWATTS — an available POWER — and b0 as that
+    // power converted to amps at the present pack voltage and clamped to the 75 A ceiling.
+    //
+    // Over the 37 754 samples where b3-as-kW would ask for LESS than 75 A, the conversion has to
+    // land on a specific number, and it does: `b0 − b3 × 1000 / pack_v` is within ±2 A in 98.4 %
+    // of them, against roughly 7 % for agreeing that closely by chance over b0's observed range.
+    //
+    // ⚠️ Read that as a conditional fit, NOT as a test of the model over the data, because the
+    // subset is selected on the model's own predictor. b0 never exceeds 75, so wherever b3-as-kW
+    // implies more than 75 A the model degenerates to "b0 = 75" and cannot be wrong; excluding
+    // that region excludes precisely where a refutation could come from. The other 80 973 samples
+    // are duly consistent and prove nothing — b0 is 75 in 51 % of them and lower in the rest, and
+    // "lower" is what a pack-side taper produces too. Both b3 = 30 sessions (2026-08-08 17:44 and
+    // 18:02) are entirely in that region: 30 kW is ~102 A at their pack voltage, so they never
+    // enter the testable subset at all.
+    //
+    // 🟡 The ±2 A tolerance is also not a loose allowance — it is about one count of b3. If b3 is
+    // integer kilowatts then one count is 1000 / pack_v ≈ 3.3 A, so the implied current cannot be
+    // resolved better than roughly ±1.7 A no matter what. That also answers what the residual is
+    // NOT: not a fixed offset and not a proportional margin, because it moves with the power band
+    // — median +2.35 A at 5-9 kW, −0.95 at 10-14, −0.40 at 15-19, −1.85 at 20-24 — and scatter of
+    // that size is exactly the ±1.65 A a 1 kW quantisation produces.
+    //
+    // What it is remains open, and the SIGN pattern is the reason to say so rather than stop
+    // here: one rounding rule has one sign. Floor biases the residual positive in every band,
+    // round-to-nearest centres it on zero in every band, and neither flips sign across bands the
+    // way these do. A handful of distinct stations with distinct true powers, spread unevenly
+    // over the bands (n = 239 in the top row against 30 248 in the bottom), fits better — which
+    // is another way of saying the sample is four stations wearing a histogram, and one more
+    // reason the corpus is not what settles this byte.
+    //
+    // The session split lines up with it. Seven of the eleven DC sessions keep b3 under 55 and
+    // four park it at 79-81 (96 % of their frames), and in the eight sessions where the window
+    // before the first amp is captured, the value b3 holds there predicts which half every time:
+    // 50 in all four low ones, 64 in all four high ones.
+    //
+    // 🟢 Corroboration from a completely different direction, which is why this is worth keeping
+    // at all: `src/vcu/write-targets.ts` records, from the VCU-parameter side and on eight DC
+    // sessions, that "the ceiling is the STATION, not the bike — station identity explains 84 %
+    // of the variance, the highest ever delivered is 73.2 A, and no station has offered even the
+    // 75 A already permitted". A station-advertised figure arriving in this frame is exactly what
+    // that observation predicts, and the two were derived independently.
+    //
+    // So: a hypothesis with a mechanism, one supporting fit and one independent corroboration —
+    // NOT a decode, and nothing is emitted for b3. The corpus cannot settle it, for the selection
+    // reason above. What settles it is a session at a station whose advertised power is known
+    // independently, i.e. one photograph of a charger's rating plate, which makes it the cheapest
+    // open question on issue #21.
     case CHARGE_LIMITS_CAN_ID: {
       if (data.length < 8) return [];
+      // This frame's invariants, and it is the one whose dead-sender decode is hardest to spot.
+      // An all-zero payload decodes to fast_dc_limit_a = 0 and ac_supply_limit_a = 0, and both
+      // are LEGITIMATE — every DC frame reads b1 = 0 and every AC frame reads b0 = 0, and 31 529
+      // real frames read both as 0 between sessions. So bounds.js cannot help, and the frame
+      // reads as "plugged in, both ceilings at zero" rather than as a missing sender.
+      //
+      // b4-7 = 00 catches all-ones and the alternating pattern. b3 is what separates the all-zero
+      // shape, and the argument for it is stronger than "never observed at 0": THIS BYTE ALREADY
+      // HAS A "NOTHING TO REPORT" ENCODING AND IT IS 0xFF — 100.000 % of 807 907 AC frames plus
+      // the 4 604 DC frames before a handshake completes. A field that spells "no figure" as 0xFF
+      // is unlikely to also spell it as 0, and that argument survives the kilowatts reading above
+      // turning out to be wrong. The observation that b3 is never 0 across 968 618 frames (lowest
+      // 9) is then the confirmation rather than the whole case.
+      //
+      // The gate is the minimal `=== 0` and NOT the observed {0xFF} ∪ [9, 82], deliberately:
+      // baking 9…82 in would harden a range this same change retracts, off eleven sessions at a
+      // handful of stations. Values 1-8 and 83-254 pass, and should.
+      //
+      // ⚠️ Still the weakest of the four gates in this file, because b3 is the one byte here whose
+      // MEANING is open. If the kilowatts reading is right and a station ever advertises zero,
+      // this frame goes silent at the moment it gets interesting. Judged the better risk than a
+      // decoder reporting "no ceiling on either path" for a sender that has stopped talking — but
+      // if the limits ever vanish from a live session, look here first.
+      //
+      // ⚠️ And be clear what it does NOT buy. It removes the ambiguity for the dead-sender payload
+      // only. A live reader still sees fast_dc_limit_a = 0 with ac_supply_limit_a = 0 on 31 529
+      // real frames, so "both ceilings zero" remains an ordinary state downstream and nothing here
+      // makes it mean "charging is impossible".
+      //
+      // 🟡 One invariant is deliberately NOT used, so that it is visibly a decision. b0 and b1 are
+      // never both non-zero across all 968 618 frames — a 100.000 % invariant on the two bytes
+      // actually decoded, and unlike b3 its meaning is not open, so `data[0] !== 0 && data[1] !== 0`
+      // would catch a byte-shifted frame that slipped past b3 and the zero tail. It is left out
+      // because it gates on the DECODE rather than on filler: a firmware that ever granted both
+      // paths at once would go silent instead of showing the single most interesting frame this
+      // ECU could produce. Gating on bytes we do not read is the safer half of that trade.
+      if (data[3] === 0 || data[4] !== 0 || data[5] !== 0 || data[6] !== 0 || data[7] !== 0) return [];
       return [
         // ✅ b0 = the DC current limit in force right now, in amps — the one of the three DC
         // limits on this bus that moves during a session.
@@ -201,28 +401,71 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
         // 🧨 It was put to a direct test, because #79 read the same byte as "not a limit at
         // all — it follows the delivered current", having watched it ramp 0 → 22 → 44 → 66 →
         // 75 → 66 → 44 and read 44 while only 10 A flowed. If that were right, naming it a
-        // limit would be this project's `charging`-was-the-high-beam mistake over again. It is
-        // not right, and the discriminator is headroom: an echo of delivered current has to
-        // touch it, and this byte never does. Over 10 771 aligned (0x620, 0x615) samples in
-        // all ten DC sessions that carry both:
+        // limit would be this project's `charging`-was-the-high-beam mistake over again.
         //
-        //     b0 − b2 == 0 (hugging the delivery):        0.0 %      ← an echo lives here
-        //     b0 − b2 >= 5 A of headroom:                83.9 %
-        //     b0 − b2 median 12 A, p75 28 A, p95 44 A
-        //     b2 > b0 (the bound broken):                 0.4 %
+        // Re-measured at full frame rate over 151 202 aligned (0x620, 0x615) samples in which
+        // current is actually flowing, across all 11 DC sessions:
+        //
+        //     b0 − b2 == 0 (hugging the delivery):     0.005 %      ← an echo lives here
+        //     b0 − b2 >= 5 A of headroom:               79.2 %
+        //     b0 − b2 median 12 A, p75 28 A, p95 41 A
+        //     b2 > b0 (the bound broken):               0.033 %
+        //
+        // The 2026-08-19 pass had 10 771 of these samples and reported 0.0 / 83.9 / 12 / 28 / 44
+        // / 0.4. The conclusion is unchanged and the medians are identical; the two figures that
+        // moved are both tail statistics, and they moved in the direction the sampling predicts.
+        // A change-plus-keepalive scanner over-represents frames that are CHANGING, and both
+        // b2 > b0 (0.4 % → 0.033 %) and the p95 headroom live on edges, so the sample saw an
+        // edge roughly twelve times more often than the bus produces one. Worth knowing before
+        // quoting any of the remaining sampled percentages in this file.
         //
         // The 44-while-10-A reading is the headroom case, not a contradiction: session 27's
-        // median gap is 35 A because the pack was at 99 % and taking almost nothing. So b0
-        // bounds the delivery with room to spare and never tracks it. It is a limit.
+        // median gap is 35 A because the pack was at 99 % and taking almost nothing.
+        //
+        // 🟡 But headroom is a NEGATIVE, and a negative cannot separate a raw echo from a
+        // SCALED one — `b0 ≈ 1.2 × b2` would show exactly the same never-touching. The ratio is
+        // what kills that, and the ratio is nothing like constant: b0 ÷ b2 has p5 1.03, median
+        // 1.19, p95 7.33 and a maximum of 75.0, and its per-session median runs from 1.03 to
+        // 9.20. No scale, no offset, no quantisation of the delivered current produces that.
+        //
+        // ✅ And two POSITIVE tests, which is what actually makes this a limit rather than
+        // merely not-an-echo. A readback of delivery cannot do either of these:
+        //
+        //   • b0 STEPS WHILE THE DELIVERY IS FLAT. Of the 884 b0 steps in the DC sessions, 396
+        //     happen with b2 unchanged to within ±2 A for two seconds either side. 2026-08-04
+        //     20:13:29 b0 75 → 64 while b2 held 55 A; 2026-08-08 13:37:47 b0 75 → 66 while b2
+        //     held 43-44 A, and back up 66 → 75 two seconds later with b2 still at 43-44.
+        //   • b0 LEADS THE FIRST AMP. In all eight DC sessions whose ramp-up is captured, b0
+        //     goes 0 → 75 between 13.0 and 19.1 s BEFORE b2 leaves zero — e.g. 2026-08-04
+        //     19:58:28.65 against a first amp at 19:58:45.51. This is the same argument that was
+        //     already accepted for b1, whose 10 → 13 step preceded the AC setpoint by 120 ms,
+        //     and it is much longer than the ~3 s state-machine handshake.
+        //
+        // Between them: it bounds the delivery with room to spare, it moves when the delivery
+        // does not, and it is up before there is any delivery to echo. It is a limit.
         //
         // ⚠️ What it is NOT is a command, and #79 is right about the direction of causation.
         // On 2026-08-04 it dropped 75 → 64 eleven seconds AFTER the delivered current had
         // already fallen to 55.6 A. It reacts to the station.
         //
-        // ❓ And whose limit it is stays open: vehicle-advertised and station-granted look
-        // identical from this port, and both would bound delivery and both would move when
-        // the station derates. All that is established is that it never exceeds 0x625 b2's
-        // configured 75. So the name says which limit (the live one) and not whose.
+        // ⚠️ And "in force" must NOT be read as "binding". `b0 − b2 == 0` in 0.005 % is the
+        // statistic that kills the echo, and it says in the same breath that the corpus contains
+        // essentially no observation of this byte ever CONSTRAINING anything. The defensible
+        // claim is "a ceiling the delivery has never violated", not "the constraint doing the
+        // limiting" — which was something else the whole time, and there are at least three
+        // candidates: a pack-temperature or SOC derate, the rider's own 0x121 setting, and the
+        // station's own envelope. A reader who takes "in force" as "binding" will be surprised
+        // later.
+        //
+        // The 50 frames where b2 > b0 are not counter-evidence: 49 of them fall within 1.00 s of
+        // a b0 step and the fiftieth is exactly 1.00 s from one, so all are the 10 Hz/20 Hz skew
+        // across an edge, none is a sustained violation, and the overshoot never exceeds 12 A.
+        //
+        // ❓ And whose limit it is stays open, though b3 above now has real evidence for the
+        // station-advertised reading. Vehicle-advertised and station-granted look identical from
+        // this port, and both would bound delivery and both would move when the station derates.
+        // All that is established is that it never exceeds 0x625 b2's configured 75. So the name
+        // says which limit (the live one) and not whose.
         //
         // The three DC current limits, which are genuinely three different numbers:
         //   dc_charge_limit_selected_a  0x121 b2   what the RIDER picked (charge-setpoint.ts)
@@ -250,13 +493,13 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
     // 0x625 — the one frame in this group that is NOT gated on a charge cable. It broadcasts
     // whenever the bike is awake, parked and unplugged included, which is why it was filed for
     // a long time as an unrelated always-on frame. b1 = 01, b3 = 0xFF and b5-7 = 00 in
-    // 100.000 % of 44 262 frames. b0 is left undecoded: it reads 0x6B everywhere until
+    // 100.000 % of 1 571 617 frames. b0 is left undecoded: it reads 0x6B everywhere until
     // 2026-08-09 17:55 and 0x73 in every capture after, a one-way change that no charge event
     // in the corpus lines up with.
     case CHARGE_CONFIG_CAN_ID: {
       if (data.length < 8) return [];
       // Refuse a frame that does not carry this frame's own invariants. b1 = 0x01 and
-      // b3 = 0xFF hold in 100.000 % of 44 262 frames, and checking them costs nothing —
+      // b3 = 0xFF hold in 100.000 % of 1 571 617 frames, and checking them costs nothing —
       // whereas trusting b4 blindly is actively dangerous, because b4's DC bit is read
       // INVERTED. An all-zero payload has bit 5 clear and would decode to "DC charging";
       // an all-ones payload has bit 2 set and would decode to "AC charging". Those are
@@ -264,11 +507,16 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
       // disconnected sender produces, and because both keys are legitimately 0/1,
       // bounds.js cannot reject either — a false charge claim would reach the log and the
       // dashboard looking like an ordinary flag. This turns both back into "no reading".
+      //
+      // ⚠️ The gate is on b1/b3 and NOT on a whitelist of b4 values, and that is a tested
+      // decision rather than a stylistic one. b4 takes NINE values across the archive, not the
+      // three named below — a b4 whitelist drawn from the three would have rejected 129 601 real
+      // frames. See the b4 comment for the full list.
       if (data[1] !== 0x01 || data[3] !== 0xff) return [];
       const flags = data[4];
       return [
         // ✅ b2 = the configured maximum DC charge current, 75 A. Static in 100.000 % of
-        // 44 262 frames — through DC sessions, AC sessions and parked alike — and equal to
+        // 1 571 617 frames — through DC sessions, AC sessions and parked alike — and equal to
         // `MAX_DC_CHG_CURRENT` read from the VCU's own parameter block. A configuration
         // constant, and the anchor that every other current-like byte here is calibrated
         // against. Logged because it is the ceiling every other DC limit is measured against;
@@ -283,6 +531,19 @@ export function decodeChargeManagerFrame(id: number, data: Buffer): DecodedValue
         // The byte takes 0x32 parked or idle, 0x12 while DC flows, 0x2C while AC flows. Note
         // the inverted sense of bit 5: it is asserted when NOT DC charging, so a frame that
         // never arrives cannot be mistaken for a DC charge.
+        //
+        // ⚠️ Those three are the COMMON values, not the whole set, and the difference is what
+        // decides how this frame is gated. Over all 1 571 617 frames b4 takes nine values:
+        //
+        //     0x2C 748 103   0x32 542 726   0x12 151 187   0x29  76 724   0x6C  36 564
+        //     0x72  15 466   0x2D     495   0x2E     347   0x52       5
+        //
+        // All nine satisfy both bit rules above, so the decode is unaffected — but a whitelist
+        // of {0x12, 0x2C, 0x32} as the frame's sanity check would have thrown away 129 601 real
+        // frames, 8.2 % of them. That is why the gate above reads b1/b3, which are genuinely
+        // constant, rather than the byte whose meaning we are trying to read. Anyone hardening
+        // this frame further will look at the three named values and reach for the whitelist;
+        // this is the note saying it was tried and is wrong.
         //
         // These are "current is flowing", not "a session exists" — through the 155 s aborted
         // DC attempt of 2026-08-09 14:42 b4 stays 0x32 while 0x605 b2 says DC and 0x610 says

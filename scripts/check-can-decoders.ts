@@ -1,8 +1,9 @@
 import { STREAM_IDS, decodeFrame } from "../src/can/decode.ts";
 import { SIGNALS } from "../src/can/registry.ts";
+import { CHARGE_MANAGER_CAN_IDS } from "../src/can/charge-manager.ts";
 // The dashboard's own plausibility gate, imported rather than reimplemented — see the
 // boolean-deadband check below for why asking it beats keeping a copy of its rules.
-import { boundsFor } from "../public/lib/bounds.js";
+import { boundsFor, isPlausible } from "../public/lib/bounds.js";
 import { resetAttitudeDecoder } from "../src/can/attitude.ts";
 import { resetGpsCanDecoder } from "../src/can/gps.ts";
 import type { DecodedValue } from "../src/can/frame.ts";
@@ -34,6 +35,39 @@ import type { DecodedValue } from "../src/can/frame.ts";
 // Every emitted key must have a registry entry, or it logs into the catch-all "misc" group
 // with a blank unit, which switches off the dashboard's plausibility gate for it (see
 // public/lib/bounds.js — a blank unit in a non-boolean group is unbounded).
+//
+// ⚠️ That check used to enumerate the emitted keys by feeding PROBE_PAYLOADS to the ids that
+// answered PROBE_PAYLOADS, which is circular, and the circle closed the moment decoders started
+// gating on frame invariants. 0x625 wants b1 = 0x01, 0x615 wants b1 = 0x01 with a zero tail,
+// 0x610 wants b4-6 = F1 05 01 and 0x121 wants opcode 0x18 — none of the four probe payloads is
+// any of those shapes, so all four ids answer nothing, drop out of `answeringIds`, and their
+// nine keys quietly stop being checked. Nothing failed, because the entries exist; the
+// PROTECTION was gone, while the script went on printing "every emitted key is declared". That
+// is precisely the one-directional silence this file exists to catch, so it is worth saying how
+// it got in: the fix for a real decoder bug disabled the check that guards the same decoder.
+//
+// So the emitted set is now the UNION of what the probes produce and what the replay cases at
+// the bottom produce, and the check runs after both. That a gated id has replay cases is itself
+// asserted in section 4, so for every id NAMED IN `REQUIRED_IN_FILTER` it is a check rather than
+// a convention: gated tightly enough to dodge the probes and carrying no replay case now fails
+// the build. A fifth probe payload shaped like a real 0x625 would have patched today's symptom
+// and left the next differently-gated frame to rediscover the hole.
+//
+// ⚠️ Read that scope literally. An id that is NOT in `REQUIRED_IN_FILTER` is invisible to all
+// three guards at once: it answers no probe so it never enters `answeringIds`, the STREAM_IDS
+// check is one-directional by design so it never fires for a silent id, and the section-4
+// assertion only walks that list. So a gated decoder for, say, 0x400 wired into STREAM_IDS but
+// not into the list below is exactly as unprotected as 0x625 was — the hole has moved up a
+// level, not closed. What actually closes it is the `CHARGE_MANAGER_CAN_IDS` cross-check below
+// generalised: more modules exporting their own id list, and less prose here.
+//
+// ⚠️ The residual hole, stated rather than left implicit. This covers an id with no coverage at
+// all; it does NOT cover a NEW KEY added to an already-gated decoder whose existing replay cases
+// do not happen to produce it. That key is still invisible here. Closing it properly means
+// asserting a full expected key set per gated id — deriving the expectation from SIGNALS via a
+// per-id annotation — which is more machinery than this file has earned so far. Until then, a
+// key added to 0x610, 0x615, 0x620, 0x625 or 0x121 needs a replay case that emits it, and that
+// is a rule a person has to follow.
 //
 // No signal bounds.js gates to 0/1 may carry a deadband of 1 or more. `Math.abs(1 - 0) > 1` is
 // false, so such a signal logs its first sample after boot and then never logs again — a trap
@@ -113,6 +147,11 @@ const REQUIRED_IN_FILTER: [number, string][] = [
   // four probe payloads is that shape. It is exactly the "future decoder that needs a
   // particular byte pattern" this list exists for — without this line, dropping it from the
   // filter would go unnoticed.
+  //
+  // ⚠️ As of 2026-08-20 that is no longer the exceptional case: 0x610, 0x615 and 0x625 all gate
+  // on their own frame invariants too, so four of the ids in this list are now invisible to the
+  // probe and this is the ONLY thing checking their filter entry. Anything added below that
+  // gates on a byte pattern must be named here; the probe will not do it for you.
   [0x121, "the rider's DC charge-current limit, set on the bike's own screen"],
   // The charge manager, 2026-08-19. Four of these five matter more than most: they are silent
   // on a parked bike, so dropping one from the filter cannot be noticed until the next charge —
@@ -130,8 +169,22 @@ for (const [id, what] of REQUIRED_IN_FILTER) {
   }
 }
 
+// The list above is hand-maintained, which is the wrong property for ids the probe can no longer
+// see. This half of it does not have to be: `CHARGE_MANAGER_CAN_IDS` is exported, so a sixth
+// charge-manager frame cannot arrive with a byte-gated decoder and no filter check.
+const namedInFilter = new Set(REQUIRED_IN_FILTER.map(([id]) => id));
+for (const id of CHARGE_MANAGER_CAN_IDS) {
+  if (!namedInFilter.has(id)) {
+    failures.push(
+      `0x${id.toString(16).toUpperCase()} is a charge-manager id but is not named in REQUIRED_IN_FILTER — the probe cannot see a byte-gated decoder, so nothing else would notice it leaving the filter`
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------------------
-// 2. Registry coverage and the boolean-deadband trap.
+// 2. Collecting the emitted keys, and the boolean-deadband trap.
+//    The registry-coverage check itself is section 4, after the replay cases have contributed
+//    their keys — see the top of this file for why it cannot run here.
 // ---------------------------------------------------------------------------------------
 
 const defined = new Map(SIGNALS.map(signal => [signal.key, signal]));
@@ -146,11 +199,8 @@ for (const id of answeringIds) {
     }
   }
 }
-const undeclared = [...emitted].filter(key => !defined.has(key)).sort();
-if (undeclared.length > 0) {
-  failures.push(`decoders emit keys with no registry entry (they would log as group "misc"): ${undeclared.join(", ")}`);
-}
-console.log(`${emitted.size} distinct keys emitted, all declared in the registry`);
+const probedKeyCount = emitted.size;
+console.log(`${probedKeyCount} distinct keys emitted for the probe payloads`);
 
 // Which signals are 1/0 flags is bounds.js's decision, not this file's — it depends on a group
 // set (`BOOLEAN_GROUPS`) and a per-key table that both grow, and "buttons" joined that set on
@@ -194,6 +244,16 @@ interface ReplayCase {
   expect: Record<string, number>;
   /** Keys this frame must NOT produce. */
   absent?: string[];
+  /**
+   * Keys whose expected value bounds.js is SUPPOSED to reject — sentinels replayed on purpose,
+   * like 0x0A0's 0xFFFF wheel counts. Everything else in `expect` is a value the decoder is
+   * pinned to produce, so a bound that rejects one is a bug in bounds.js.
+   *
+   * Checked in BOTH directions: naming a key here suppresses the too-tight failure, and it also
+   * asserts that bounds.js really does still reject it. Widen the bound past the sentinel and
+   * this fails rather than going quiet. A key named here that `expect` does not contain fails too.
+   */
+  outsideBounds?: string[];
 }
 
 const REPLAY: ReplayCase[] = [
@@ -339,6 +399,9 @@ const REPLAY: ReplayCase[] = [
       abs_warning_lamp: 0,
       front_brake_pressure_bar: 0,
     },
+    // The only case in the file where a replayed real reading is MEANT to fail bounds.js, which
+    // is the whole point of it — so the intent is declared rather than left to the `why` line.
+    outsideBounds: ["wheel_speed_front_kmh", "wheel_speed_rear_kmh"],
   },
   {
     id: 0x109,
@@ -619,7 +682,7 @@ const REPLAY: ReplayCase[] = [
   {
     id: 0x620,
     frame: "2C 00 00 51 00 00 00 00",
-    why: "DC late in a taper (2026-08-09 18:15:22) — the advertised ceiling has itself fallen to 44 A. It follows the station rather than commanding it, so this byte is not the rider's setting",
+    why: "DC late in a taper (2026-08-09 18:15:22) — the advertised ceiling has itself fallen to 44 A. It follows the station rather than commanding it, so this byte is not the rider's setting. This is also the frame that caught the b3 error: b3 = 0x51 = 81, outside the 9…64 the file claimed for DC until 2026-08-20, and 81 with 7 A flowing against 22 with 63 A flowing in the case above is the opposite sign to the r = +0.72 it claimed as well. Both are retracted in charge-manager.ts",
     expect: { fast_dc_limit_a: 44, ac_supply_limit_a: 0 },
   },
   {
@@ -655,7 +718,7 @@ const REPLAY: ReplayCase[] = [
   {
     id: 0x625,
     frame: "00 00 00 00 00 00 00 00",
-    why: "⚠️ SYNTHETIC, and the reason 0x625 checks its own invariants. b4's DC bit is read INVERTED, so an all-zero payload has bit 5 clear and would decode to dc_charging = 1 — a false charge claim that bounds.js cannot reject, because 1 is a legitimate value for a flag. b1 = 0x01 and b3 = 0xFF in 100.000 % of 44 262 real frames, so requiring them turns this shape back into no reading",
+    why: "⚠️ SYNTHETIC, and the reason 0x625 checks its own invariants. b4's DC bit is read INVERTED, so an all-zero payload has bit 5 clear and would decode to dc_charging = 1 — a false charge claim that bounds.js cannot reject, because 1 is a legitimate value for a flag. b1 = 0x01 and b3 = 0xFF in 100.000 % of 1 571 617 real frames, so requiring them turns this shape back into no reading",
     expect: {},
     absent: ["fast_dc_limit_max_a", "dc_charging", "ac_charging"],
   },
@@ -669,9 +732,51 @@ const REPLAY: ReplayCase[] = [
   {
     id: 0x615,
     frame: "00 01 00 1F 00 00 00 00",
-    why: "⚠️ SYNTHETIC — b0 = 0 would decode to 242.5 V, which is inside this pack's real range and inside bounds.js's V band, so it would look like a measurement rather than a fault. b0 spans 28…94 over all 47 632 captured frames and is never 0, so this should be unreachable; the guard is what makes that a fact rather than a hope. The other two fields still decode",
+    why: "⚠️ SYNTHETIC — b0 = 0 would decode to 242.5 V, which is inside this pack's real range and inside bounds.js's V band, so it would look like a measurement rather than a fault. b0 spans 28…94 over all 941 765 captured frames and is never 0, so this should be unreachable; the guard is what makes that a fact rather than a hope. The other two fields still decode",
     expect: { fast_dc_a: 0, charge_manager_soc: 31 },
     absent: ["charge_manager_pack_v"],
+  },
+  {
+    id: 0x620,
+    frame: "00 00 00 00 00 00 00 00",
+    why: "⚠️ SYNTHETIC — the shape this frame's gate exists for, and the hardest dead sender in the group to spot. Ungated it decodes to fast_dc_limit_a = 0 and ac_supply_limit_a = 0, and BOTH are legitimate values that bounds.js must accept: every DC frame reads b1 = 0, every AC frame reads b0 = 0, and 31 529 real frames read both as 0 between sessions. So it reads as 'plugged in, both ceilings at zero' rather than as a sender that has stopped talking. b3 is what separates it — 0xFF or 9…82 across all 968 618 frames, never 0",
+    expect: {},
+    absent: ["fast_dc_limit_a", "ac_supply_limit_a"],
+  },
+  {
+    id: 0x620,
+    frame: "FF FF FF FF FF FF FF FF",
+    why: "⚠️ SYNTHETIC — the other dead-sender shape, caught by b4-7 = 00 (100.000 % of 968 618 frames) rather than by b3, which is 0xFF here and legitimately so on every AC frame. Ungated it would decode to a 255 A DC ceiling and a 255 A AC supply, and the bounds added in this PR would reject both — this case is what makes the decoder refuse them a layer earlier",
+    expect: {},
+    absent: ["fast_dc_limit_a", "ac_supply_limit_a"],
+  },
+  {
+    id: 0x615,
+    frame: "FF FF FF FF FF FF FF FF",
+    why: "⚠️ SYNTHETIC — the all-ones dead-sender shape, and the worst-exposed frame in this group, because two of its three keys are measurements rather than flags. Ungated it decodes to charge_manager_pack_v = 255 + 242.5 = 497.5 V and fast_dc_a = 255 A; bounds.js passed BOTH until the entries added alongside this case (its V band is [-50, 900] and the A fallback [-1000, 1000]), and only charge_manager_soc = 255 was ever caught, by the % band. 255 A on the only DC charge current on this bus is a number that reaches a chart's autoscale and then a conclusion. b1 = 0x01 with b4-7 = 00 in 100.000 % of 941 765 real frames is what turns it back into no reading",
+    expect: {},
+    absent: ["charge_manager_pack_v", "fast_dc_a", "charge_manager_soc"],
+  },
+  {
+    id: 0x615,
+    frame: "00 00 00 00 00 00 00 00",
+    why: "⚠️ SYNTHETIC — the other dead-sender shape. The b0 = 0 guard alone would already drop the voltage, but not fast_dc_a = 0 and charge_manager_soc = 0, and those two are worse than a silly number: they read as a healthy 'plugged in, nothing flowing, empty pack'. b1 = 0x00 fails the invariant",
+    expect: {},
+    absent: ["charge_manager_pack_v", "fast_dc_a", "charge_manager_soc"],
+  },
+  {
+    id: 0x610,
+    frame: "00 00 00 00 00 00 00 00",
+    why: "⚠️ SYNTHETIC — all-zero, and the frame with the least defence of the three: both its keys are logged raw and are bounded to [0, 255] in bounds.js ON PURPOSE, so that a state nobody has seen yet is not rejected. That means bounds.js cannot reject anything at all for them and this invariant is the only check there is. b4-6 = F1 05 01 in 100.000 % of 968 629 real frames, and 0x00 0x00 0x00 is not it",
+    expect: {},
+    absent: ["charge_manager_status", "charge_manager_state"],
+  },
+  {
+    id: 0x610,
+    frame: "FF FF FF FF FF FF FF FF",
+    why: "⚠️ SYNTHETIC — all-ones, which ungated decodes to charge_manager_status = 255 and charge_manager_state = 255, both inside the deliberate [0, 255] band. Note what is NOT gated: b1-3, which read 07 55 03 through the aborted DC attempt of 2026-08-09 14:42 and are 00 everywhere else. Gating on them would have thrown away the most interesting DC data in the archive",
+    expect: {},
+    absent: ["charge_manager_status", "charge_manager_state"],
   },
   {
     id: 0x605,
@@ -696,7 +801,18 @@ const REPLAY: ReplayCase[] = [
 for (const testCase of REPLAY) {
   const data = Buffer.from(testCase.frame.split(" ").map(byte => Number.parseInt(byte, 16)));
   const decoded = new Map(decodeFrame(testCase.id, data).map(value => [value.key, value.value]));
+  // These are the only keys a byte-gated decoder ever produces here, so section 4 needs them —
+  // and this is now also the only path that exercises those decoders at all, since they answer
+  // none of the probe payloads. Section 1's non-finite check therefore no longer covers them, so
+  // it is repeated here rather than left to a payload that never reaches them.
+  for (const [key, value] of decoded) {
+    emitted.add(key);
+    if (!Number.isFinite(value)) {
+      failures.push(`0x${testCase.id.toString(16).toUpperCase()} ${testCase.frame} produced a non-finite ${key}`);
+    }
+  }
   const label = `0x${testCase.id.toString(16).toUpperCase().padStart(3, "0")} ${testCase.frame}`;
+  const declaredOutside = new Set(testCase.outsideBounds ?? []);
   for (const [key, expected] of Object.entries(testCase.expect)) {
     const actual = decoded.get(key);
     if (actual === undefined) {
@@ -705,6 +821,64 @@ for (const testCase of REPLAY) {
     }
     if (Math.abs(actual - expected) > 1e-9) {
       failures.push(`${label}: expected ${key} = ${expected}, got ${actual}`);
+    }
+    // The other direction of this PR's two-layer argument, and the one nothing checked until now.
+    // Every value in `expect` is one this decoder is PINNED to produce — most copied byte for byte
+    // out of the archive, the rest constructed for the ⚠️ SYNTHETIC cases — so a bounds.js that
+    // rejects one is a contradiction either way, and this is the one place that can catch a bound
+    // drawn TOO TIGHT. Not hypothetical: the first version of this PR bounded `fast_dc_limit_max_a`
+    // at 80 because it read a write policy as a field range, and the only reason no real reading
+    // was rejected is that this bike happens to hold 75. `psu_12v_mv` is in bounds.js for the same
+    // mistake made from the other end.
+    //
+    // `expected` is deliberately what is tested, not `actual`: the question is whether the gate
+    // accepts the reading the bike is known to produce, and on a decode mismatch `actual` is by
+    // definition not that. The mismatch is already a failure two lines up.
+    //
+    // Both directions are asserted. `outsideBounds` may only SUPPRESS the first failure, never
+    // stand in for the second — an annotation that merely silences is indistinguishable from one
+    // that has gone stale, which is the exact failure mode the header of this file is about.
+    //
+    // The predicate is `isPlausible`, not a comparison written here, for the same reason section 2
+    // asks bounds.js which signals are 0/1 flags instead of restating the rule: "showing as a
+    // fault" is decided in exactly one place, `isPlausible` at public/lib/store.js:236, and a copy
+    // of its body here would go on asserting a rejection that no longer happens the moment either
+    // comparison turns exclusive or a rule is added above the range test. `boundsFor` is still
+    // called, but only to name the band in the message.
+    const signal = defined.get(key);
+    const range = signal ? boundsFor(signal.key, signal.unit, signal.group) : null;
+    const accepted = signal ? isPlausible(signal.key, expected, signal.unit, signal.group) : true;
+    if (range && !accepted && !declaredOutside.has(key)) {
+      failures.push(
+        `${label}: ${key} = ${expected} is a value this decoder is pinned to produce, but bounds.js gates it to [${range[0]}, ${range[1]}] — either the bound is too tight, or this case belongs in outsideBounds`
+      );
+    }
+    if (accepted && declaredOutside.has(key)) {
+      // Three different situations, and they send the reader to three different files. `range`
+      // being null does NOT on its own mean bounds.js is unbounded for this key — it also happens
+      // when the key has no registry entry and boundsFor was never asked.
+      if (!signal) {
+        failures.push(
+          `${label}: ${key} is declared in outsideBounds but has no registry entry, so nothing here can say whether bounds.js would reject it — the missing line is in the registry, not in bounds.js`
+        );
+      } else if (range) {
+        failures.push(
+          `${label}: ${key} = ${expected} is declared in outsideBounds, but bounds.js now accepts it within [${range[0]}, ${range[1]}] — the sentinel has stopped showing as a fault, or the annotation is stale`
+        );
+      } else {
+        failures.push(
+          `${label}: ${key} is declared in outsideBounds, but bounds.js does not bound it at all — nothing can reject it, so "supposed to be rejected" is false`
+        );
+      }
+    }
+  }
+  // A key named in outsideBounds that this case does not expect asserts nothing and hides the
+  // fact — a rename or a deleted expectation would leave it behind looking like protection.
+  for (const key of declaredOutside) {
+    if (!(key in testCase.expect)) {
+      failures.push(
+        `${label}: outsideBounds names ${key}, which this case does not expect — a stale annotation asserts nothing`
+      );
     }
   }
   for (const key of testCase.absent ?? []) {
@@ -740,6 +914,37 @@ for (const [kmPerKwhRaw, kwhPer100KmRaw] of RECIPROCAL_PAIRS) {
   }
 }
 console.log(`\n0x10B: ${RECIPROCAL_PAIRS.length} captured pairs all satisfy b0-1 × b2-3 ≈ 10^6`);
+
+// ---------------------------------------------------------------------------------------
+// 4. Registry coverage. Last on purpose: `emitted` is only complete once the replay cases
+//    above have run, because a decoder that gates on a frame invariant answers none of the
+//    probe payloads. See "And the other two" at the top of this file.
+// ---------------------------------------------------------------------------------------
+
+const undeclared = [...emitted].filter(key => !defined.has(key)).sort();
+if (undeclared.length > 0) {
+  failures.push(`decoders emit keys with no registry entry (they would log as group "misc"): ${undeclared.join(", ")}`);
+}
+// The convention the header describes, made into a check rather than left as a habit. An id that
+// answers no probe payload contributes nothing to `emitted` by itself, so its keys reach this
+// section only through the replay cases — and if it has none it is silently unprotected, exactly
+// as 0x625 was between #77 and this change. Asserting it means the next byte-gated decoder cannot
+// repeat that quietly.
+const replayedIds = new Set(REPLAY.map(testCase => testCase.id));
+for (const [id, what] of REQUIRED_IN_FILTER) {
+  if (!answeringIds.has(id) && !replayedIds.has(id)) {
+    failures.push(
+      `0x${id.toString(16).toUpperCase()} (${what}) answers none of the probe payloads and has no replay case either, so none of its keys are checked for a registry entry`
+    );
+  }
+}
+
+// The claim is conditional on purpose. Printing "all declared" unconditionally would state the
+// reassuring thing two lines above the FAILED: block that contradicts it — which is the same
+// shape of one-directional silence described at the top of this file.
+console.log(
+  `${emitted.size} distinct keys emitted, ${undeclared.length === 0 ? "all declared in the registry" : `${undeclared.length} NOT declared in the registry`} — ${probedKeyCount} of them reachable from the probe payloads and ${emitted.size - probedKeyCount} only through the replay cases`
+);
 
 if (failures.length > 0) {
   console.error("\nFAILED:");
