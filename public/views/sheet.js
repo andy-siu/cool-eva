@@ -178,9 +178,23 @@ function DownloadButton() {
       if (!current || !current.log.enabled) {
         return div();
       }
+      // Both halves of this line are narrower than they look, and both were wider
+      // once — it read "N sealed segments · encrypted, safe over any network", which
+      // is where "it always says 10" came from.
+      //
+      // FILES, not segments: one `.celog` is a whole day of them, so this number
+      // cannot move before midnight however far the bike rides. src/http/status.ts
+      // has the mechanism.
+      //
+      // And unreadable, not safe. The log genuinely cannot be read back without the
+      // laptop's private key, which is why serving it over untrusted wifi is fine.
+      // But the public key the Pi holds is not a secret, so it is also all anyone
+      // needs to WRITE a segment that decrypts cleanly, and /dl authenticates
+      // nobody. Confidentiality is what we have; claiming safety claimed more.
+      const fileCount = current.log.files;
       return div(
         { class: "action-note" },
-        `${current.log.segments} sealed segments · encrypted, safe over any network`
+        `${fileCount} daily log file${fileCount === 1 ? "" : "s"} · unreadable without the laptop's private key`
       );
     }
   );
