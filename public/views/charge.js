@@ -6,14 +6,8 @@ import { Fact, PairTile, STALE_MS, SectionLabel, SignalTile } from "../lib/tiles
 import { heatmap, meter, ring } from "../lib/svg.js";
 import * as colors from "../lib/colors.js";
 import { power, whole } from "../lib/format.js";
-import {
-  COOLANT_FLOW_LPH,
-  isCharging,
-  coolantDelta,
-  coolantHeatRemovedWatts,
-  isOnboardChargerLive,
-  resistiveLossWatts,
-} from "../lib/derive.js";
+import { COOLANT_FLOW_LPH, coolantDelta, coolantHeatRemovedWatts, resistiveLossWatts } from "../lib/derive.js";
+import { chargeMode } from "../lib/charge-mode.js";
 import {
   CELL_COUNT,
   CELL_VOLTAGE_PATTERN,
@@ -38,13 +32,6 @@ const { div, span } = van.tags;
 // (`0x201` byte 0 held `02` = Charge for 18 400 frames, with `0x305`/`0x306`
 // arriving throughout).
 
-/**
- * A charger frame seen this recently means the onboard AC charger is live. During
- * DC fast charging those frames are silent, so their freshness — not the state
- * bitfield, which only says charging-vs-not — is what separates AC from DC.
- */
-const CHARGER_LIVE_MS = 6000;
-
 export function ChargeView() {
   return div(
     { class: "view" },
@@ -53,13 +40,18 @@ export function ChargeView() {
     // Which tiles even exist depends on where the charge is coming from. On DC the
     // charger frames are silent, so the AC-sourced tiles below would sit there
     // showing the last values of a session that ended — which is what made this
-    // screen useless at a fast charger. See isOnboardChargerLive().
+    // screen useless at a fast charger. See lib/charge-mode.js.
+    //
+    // "charging" takes the pack-side set for the same reason DC does, and not because
+    // it is thought to be DC: the AC tiles are made entirely of charger frames, so
+    // when those are not arriving there is nothing honest to put in them.
     () => {
       switch (deliveryMode.val) {
         case "ac":
           return AcDelivery();
         case "dc":
-          return DcDelivery();
+        case "charging":
+          return PackDelivery();
         default:
           return NotCharging();
       }
@@ -92,23 +84,18 @@ export function ChargeView() {
   );
 }
 
-/** True while the onboard AC charger is talking; false at a DC fast charger. */
-function onboardChargerLive() {
-  return isOnboardChargerLive(isStale, CHARGER_LIVE_MS);
-}
-
 /**
- * The same answer as a boolean state, so the DOM binding above only fires when AC/DC
- * actually flips.
+ * The one answer this whole screen is built on, held as a state so the DOM binding
+ * above only fires when it actually flips.
  *
  * isStale() reads serverTime, which apply() writes on EVERY message including 20 Hz
- * pack_a patches — so binding the subgrid straight to onboardChargerLive() would
- * tear down and rebuild four tiles at frame rate, sparklines included, defeating the
- * chartTick pacing they exist to have. Assigning an unchanged value to a VanJS state
- * is a no-op, so this derive absorbs the churn: it still re-runs per message, but
- * that is four Map lookups rather than four tiles and an SVG.
+ * pack_a patches — so binding the subgrid straight to chargeMode() would tear down
+ * and rebuild four tiles at frame rate, sparklines included, defeating the chartTick
+ * pacing they exist to have. Assigning an unchanged value to a VanJS state is a
+ * no-op, so this derive absorbs the churn: it still re-runs per message, but that is
+ * a handful of Map lookups rather than four tiles and an SVG.
  */
-const deliveryMode = van.derive(() => (!isCharging() ? "idle" : onboardChargerLive() ? "ac" : "dc"));
+const deliveryMode = van.derive(() => chargeMode(valueOf, isStale));
 
 /**
  * Charge is a tab, so this screen is reachable mid-ride. Without this the DC branch
@@ -171,11 +158,15 @@ function AcDelivery() {
 }
 
 /**
- * DC: nothing on the charger side is talking, but the pack is — and what the pack
- * is taking is the charge, measured closer to the thing you care about than the
+ * Nothing on the charger side is talking, but the pack is — and what the pack is
+ * taking is the charge, measured closer to the thing you care about than the
  * charger's own claim would be anyway.
+ *
+ * Named for where the numbers come from rather than for DC, because it serves the
+ * unidentified case too: a charge the BMS reports while no charger frames arrive is
+ * not necessarily a fast charge, and only the caption is entitled to guess.
  */
-function DcDelivery() {
+function PackDelivery() {
   return div(
     { class: "subgrid" },
     SignalTile({
@@ -187,7 +178,10 @@ function DcDelivery() {
       className: "span2",
       chart: true,
       minSpan: 5,
-      sub: () => "measured at the pack — the DC charger reports nothing on this bus",
+      sub: () =>
+        deliveryMode.val === "dc"
+          ? "measured at the pack — the DC charger reports nothing on this bus"
+          : "measured at the pack — the charger's own frames have gone quiet",
     }),
     SignalTile({
       key: "pack_a",
@@ -223,7 +217,15 @@ function ChargeHero() {
       ),
       div({ class: "sub" }, () => {
         const kilowatts = valueOf("pack_kw");
-        return kilowatts == null ? "" : `${power(Math.abs(kilowatts))} kW in`;
+        if (kilowatts == null) {
+          return "";
+        }
+        // Direction, not just magnitude. Math.abs() alone said "0.1 kW in" on a parked
+        // bike whose pack was feeding the housekeeping loads — the same wrong-way-round
+        // reading as the label below it, from the same missing sign. Exactly zero gets
+        // no direction rather than a made-up one.
+        const direction = kilowatts > 0 ? " in" : kilowatts < 0 ? " out" : "";
+        return `${power(Math.abs(kilowatts))} kW${direction}`;
       }),
       div({ class: "sub" }, chargeModeText)
     )
@@ -231,28 +233,48 @@ function ChargeHero() {
 }
 
 /**
- * AC or DC, plus whichever phase of the charge the BMS says it is in. The state
- * bits matter here: trickle and maintenance both look like "charging" but mean the
- * interesting part is over.
+ * Where the charge is coming from, plus whichever phase of it the BMS says it is in.
+ * The state bits matter here: trickle and maintenance both look like "charging" but
+ * mean the interesting part is over.
  */
 function chargeModeText() {
-  // The same rule the delivery section switches on, not a second copy of the list:
-  // if a fifth charger signal turns out to be the reliable one, the hero must not be
-  // able to say "AC" while the tiles below show the DC set.
-  const kind = onboardChargerLive() ? "AC" : "DC";
-  if (valueOf("bms_state_charge_complete") === 1) {
-    return `${kind} · complete`;
+  // deliveryMode itself, not a second derivation of the same question. This line used
+  // to work out AC-vs-DC on its own and never asked whether anything was charging at
+  // all, so a parked bike read "DC charging" — "not AC" being the only test it made —
+  // directly above the card below correctly reporting the pack as DELIVERING 0.1 kW.
+  // Reading the state the tiles switch on makes that disagreement unrepresentable.
+  const mode = deliveryMode.val;
+  if (mode === "none") {
+    return "not charging";
   }
-  if (valueOf("bms_state_trickle") === 1) {
-    return `${kind} · trickle`;
+  // A source is named only when the bus has shown it: "DC" needs the contactor bit,
+  // "AC" needs the charger's own frames. Otherwise the word is simply left out —
+  // guessing which one it must be is the whole mistake being corrected here, and it
+  // is no more excusable in this direction than it was in the other.
+  const source = mode === "ac" ? "AC" : mode === "dc" ? "DC" : null;
+  const phase = chargePhase();
+  if (phase != null) {
+    return source == null ? `charging · ${phase}` : `${source} · ${phase}`;
   }
-  if (valueOf("bms_state_maintenance") === 1) {
-    return `${kind} · maintenance`;
-  }
-  if (valueOf("bms_state_balancing") === 1) {
-    return `${kind} · balancing`;
-  }
-  return `${kind} charging`;
+  return source == null ? "charging" : `${source} charging`;
+}
+
+/**
+ * Which phase of a charge the BMS is reporting, or null for an ordinary one.
+ *
+ * Charge-complete is not among them and has no branch anywhere on this screen: it
+ * would need `0x201` byte 0 to hold 0x20, and across ~24 M frames that byte has taken
+ * exactly three values — 0x01, 0x02 and 0x10. The label it used to have ("AC ·
+ * complete") could therefore never render, and a dead branch that looks like it
+ * distinguishes a finished charge from one that never started is worse than not
+ * drawing the distinction: it reads as though the case were covered.
+ * @returns {string | null}
+ */
+function chargePhase() {
+  if (valueOf("bms_state_trickle") === 1) return "trickle";
+  if (valueOf("bms_state_maintenance") === 1) return "maintenance";
+  if (valueOf("bms_state_balancing") === 1) return "balancing";
+  return null;
 }
 
 /** What the BMS is granting the charger, against what the charger is doing. */
