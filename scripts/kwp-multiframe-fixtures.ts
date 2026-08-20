@@ -2,19 +2,21 @@
 // to a bus.
 //
 // ── ⚠️ HOW MUCH OF EACH ONE IS REAL. READ THIS BEFORE TRUSTING A PASS. ─────
-// This channel has almost no captured payloads. The 2026-08-08 passive capture of
-// the factory software counted 26 662 requests and kept only their SERVICE bytes,
-// so `0x17`, `0x18`, `0x36` and `0x37` have counts and outcomes behind them and
-// no bytes. What follows is graded, and the grades differ sharply:
+// ⚠️ The paragraph that stood here said this channel "has almost no captured payloads",
+// because a 2026-08-08 CENSUS of the passive capture had kept service bytes and thrown the
+// payloads away. The capture itself kept everything — see docs/vcu-parameters.md §10 — so
+// the grades below now say "captured" where they used to say "constructed":
 //
-//   §A  RECONSTRUCTED FROM TWO INDEPENDENT LIVE RECORDS. The strongest thing
-//       here, and the only multi-frame reply on this channel with any real bytes
-//       in it at all. See `BANK2_IDENTIFIER_0001_FRAMES`.
-//   §B  CAPTURED VERBATIM, request side only — the `0x35` First Frame.
-//   §C  DECOMPILED, not sniffed — the `0x18` request.
-//   §D  CONSTRUCTED. Everything else, including every `0x36` block. These prove
-//       the transport is self-consistent and rejects what it should. They prove
-//       nothing about the bike.
+//   §A  RECONSTRUCTED FROM TWO INDEPENDENT LIVE RECORDS, then corrected against the
+//       capture's sequence numbering. See `BANK2_IDENTIFIER_0001_FRAMES`.
+//   §B  CAPTURED VERBATIM — the whole `0x35` request, the `0x36` request, the `0x37`
+//       request, and the `75` grant.
+//   §C  CAPTURED VERBATIM, and it agrees byte for byte with the decompiled note that was
+//       all this had before — the `0x18` request.
+//   §D  CONSTRUCTED. The replies, including every `0x36` block body. These prove the
+//       transport is self-consistent and rejects what it should. They prove nothing about
+//       the bike. ⚠️ Real `0x36` block bodies ARE in the capture now, 1198 of them; see
+//       docs/vcu-parameters.md §11 for why replacing these is its own piece of work.
 //
 // The malformed frames in §D are the ones actually worth having regardless of
 // provenance: a transport that completes a transfer from a short Consecutive
@@ -32,11 +34,15 @@
  * it is inferred from two independent live records that had to agree and did.
  * docs/diagnostics-and-checks.md §11.3 shows the arithmetic.
  *
+ * ⚠️ Its SEQUENCE NUMBER was inferred wrongly and read `F1 21` until 2026-08-20: these
+ * micros number the first Consecutive Frame 0 (docs/vcu-parameters.md §10). The bytes were
+ * never in doubt; the PCI was.
+ *
  * ⚠️ What it does NOT establish: THE ZERO PADDING. Both DLC modes exist on this bus and
  * the length byte governs either way — the reassembler takes 2 bytes here because the
  * First Frame said 7, not because the frame is 8 long.
  */
-export const BANK2_IDENTIFIER_0001_FRAMES = ["F1 10 07 62 20 01 00 09", "F1 21 3C B6 00 00 00 00"];
+export const BANK2_IDENTIFIER_0001_FRAMES = ["F1 10 07 62 20 01 00 09", "F1 20 3C B6 00 00 00 00"];
 
 /** What §A must reassemble to: `62` + identifier `2001` + the 4-byte record. */
 export const BANK2_IDENTIFIER_0001_PAYLOAD = "62 20 01 00 09 3C B6";
@@ -45,21 +51,40 @@ export const BANK2_IDENTIFIER_0001_PAYLOAD = "62 20 01 00 09 3C B6";
 export const BANK2_IDENTIFIER_0001_RECORD = "00 09 3C B6";
 
 /**
- * §B — the `0x35` RequestUpload First Frame, captured verbatim.
+ * §B — the whole `0x35` RequestUpload request, captured verbatim at 19:04:32, all three
+ * frames of it. This repo's segmenter must produce them byte for byte, which is the
+ * strongest assertion in the check and the one that pins BOTH the ten-`0xFF` operand and
+ * the 0-based Consecutive Frame numbering.
  *
- * obd-garage/DIAG_ADDRESSES.md §9.6, from the 2026-08-08 passive capture of the
- * factory software: `A8 10 0C 35 12 FF FF FF`, declaring `0x00C` = 12 payload
- * bytes and carrying the first five. This repo's segmenter must produce this
- * frame byte for byte, which is the single strongest assertion in the check.
- *
- * ⚠️ The Consecutive Frames that followed it were NOT captured — the census
- * filtered by service byte and a Consecutive Frame has none. So the seven operand
- * bytes they carried are unknown, and the two frames below are what
- * src/vcu/multiframe-codec.ts' guess produces, not what the tool sent.
+ * 5 + 6 + 1 = 12 = the `0x00C` the First Frame declares.
  */
 export const REQUEST_UPLOAD_FIRST_FRAME = "A8 10 0C 35 12 FF FF FF";
+export const REQUEST_UPLOAD_FRAMES = [REQUEST_UPLOAD_FIRST_FRAME, "A8 20 FF FF FF FF FF FF", "A8 21 FF 00 00 00 00 00"];
 
-/** §C — `7C0: A8 04 18 02 FF FF`, from obd-garage/OTHER_TOOL_AUDIT.md §4.3. Decompiled, not sniffed. */
+/** The micro's own flow control between them — the only one ever captured on this channel. */
+export const REQUEST_UPLOAD_FLOW_CONTROL_FROM_MICRO = "F1 30 FF 00 00 00 00 00";
+
+/**
+ * §B — `0x36` TransferData, captured verbatim and 1198 times over.
+ *
+ * Every request in the 2026-08-08 transfer is this frame: `A8 02 36 12`, a Single Frame
+ * declaring TWO payload bytes. The operand never varies across the 1198, which is what
+ * rules out a block-sequence counter — and it is not empty either, which is what this repo
+ * assumed until 2026-08-20.
+ */
+export const TRANSFER_DATA_FRAME = "A8 02 36 12 00 00 00 00";
+
+/**
+ * §B — `0x37` RequestTransferExit, captured verbatim: `A8 01 37` at 19:11:49.670991,
+ * answered `F1 02 77 FF`. A bare `37`; there is no `37 FF` to fall back to.
+ *
+ * ⚠️ Zero-padded here where the tool sent a 3-byte DLC. Both DLC modes appear in the same
+ * session — 3050 of the tool's own `A8 01 3E` are padded to 8 and 31 are not — and the
+ * length byte governs, so the padding is not what this fixture asserts.
+ */
+export const REQUEST_TRANSFER_EXIT_FRAME = "A8 01 37 00 00 00 00 00";
+
+/** §C — `7C0: A8 04 18 02 FF FF 00 00`, captured on A8 at 19:03:59 and answered `58`. */
 export const LIST_STORED_DTCS_FRAME = "A8 04 18 02 FF FF 00 00";
 
 /**
@@ -70,7 +95,7 @@ export const LIST_STORED_DTCS_FRAME = "A8 04 18 02 FF FF 00 00";
  * repo counts instead, so that "the micro padded" stays distinguishable from
  * "component 0 has a fault".
  */
-export const STORED_DTC_LIST_FRAMES = ["F1 10 0B 58 03 00 2C 05", "F1 21 00 04 2D 00 00 00"];
+export const STORED_DTC_LIST_FRAMES = ["F1 10 0B 58 03 00 2C 05", "F1 20 00 04 2D 00 00 00"];
 
 /** What §D's list must decode to: 3 declared, 3 parsed, one of them padding, nothing left over. */
 export const STORED_DTC_LIST_EXPECTED = { declaredCount: 3, codes: [0x2c, 0x04, 0x00], paddingRecords: 1 };
@@ -91,8 +116,27 @@ export const UPLOAD_BLOCK_BODIES = [
   "0C A1 B5 42 00 33 11 00 01",
 ];
 
-/** The `75` grant body, captured as part of `75 12 E9` in DIAG_ADDRESSES.md §9.6. */
+/**
+ * §B — the `75` grant body, captured as `F1 03 75 12 E9`.
+ *
+ * `E9` = 233 is a maxNumberOfBlockLength, settled rather than guessed: the longest of the
+ * 1198 `76` replies that followed is exactly 233 bytes, and none is longer.
+ */
 export const UPLOAD_GRANT_BODY = "12 E9";
+/** The longest `0x36` reply in the captured transfer, and what `E9` turns out to mean. */
+export const UPLOAD_MAX_BLOCK_PAYLOAD_BYTES = 233;
+
+/**
+ * §D — one block of the largest size the grant allows: `76` plus 232 body bytes.
+ *
+ * ⚠️ The CONTENT is filler and means nothing; the LENGTH is the assertion. It is here
+ * because `TRANSFER_BLOCK_MAX_PAYLOAD_BYTES` was 128 until 2026-08-20 — under the 206…233
+ * every real block turns out to be — so the reassembler abandoned block 1 and the read
+ * collected nothing. Every other block fixture here is 9…12 bytes and sailed past that.
+ */
+export const UPLOAD_MAX_LENGTH_BLOCK_BODY = Array.from({ length: UPLOAD_MAX_BLOCK_PAYLOAD_BYTES - 1 }, (_, index) =>
+  (index & 0xff).toString(16).padStart(2, "0").toUpperCase()
+).join(" ");
 
 /**
  * §D — the malformed replies the transport must ABANDON rather than complete.
@@ -116,19 +160,19 @@ export const MALFORMED_TRANSFERS: readonly {
 }[] = [
   {
     name: "gapped consecutive frame",
-    frames: ["F1 10 0D 62 20 01 00 09", "F1 22 3C B6 00 00 00 00"],
+    frames: ["F1 10 0D 62 20 01 00 09", "F1 21 3C B6 00 00 00 00"],
     refusal: "abandoned",
-    because: "sequence 2 arrived where 1 was expected, so bytes are missing",
+    because: "sequence 1 arrived where 0 was expected, so bytes are missing",
   },
   {
     // THE one that matters. A Consecutive Frame with a short DLC in the MIDDLE of
-    // a transfer: the sequence numbers still run 1, 2, 3…, so nothing looks wrong,
+    // a transfer: the sequence numbers still run 0, 1, 2…, so nothing looks wrong,
     // and a transport that takes what arrived writes every later byte at the wrong
     // offset and completes at the declared length. A review caught exactly this in
     // the freeze-frame decoder — it produced an int16 with °C on it and an empty
     // `trailingHex`, indistinguishable from a good read.
     name: "short consecutive frame mid-transfer",
-    frames: ["F1 10 0D 62 20 01 00 09", "F1 21 3C B6", "F1 22 00 00 00 00 00 00"],
+    frames: ["F1 10 0D 62 20 01 00 09", "F1 20 3C B6", "F1 21 00 00 00 00 00 00"],
     refusal: "abandoned",
     because: "a mid-transfer consecutive frame carried 2 bytes where 6 were needed",
   },
@@ -146,7 +190,7 @@ export const MALFORMED_TRANSFERS: readonly {
   },
   {
     name: "consecutive frame with no first frame",
-    frames: ["F1 21 3C B6 00 00 00 00"],
+    frames: ["F1 20 3C B6 00 00 00 00"],
     refusal: "not-consumed",
     because: "the tail of somebody else's transfer, and it must go back to the shared socket",
   },
@@ -160,7 +204,7 @@ export const MALFORMED_TRANSFERS: readonly {
  * left. This must COMPLETE. 13 declared bytes = 5 in the First Frame, 6 in the
  * first Consecutive Frame, 2 in the last.
  */
-export const SHORT_FINAL_FRAME_TRANSFER = ["F1 10 0D 62 20 01 00 09", "F1 21 3C B6 11 22 33 44", "F1 22 55 66"];
+export const SHORT_FINAL_FRAME_TRANSFER = ["F1 10 0D 62 20 01 00 09", "F1 20 3C B6 11 22 33 44", "F1 21 55 66"];
 export const SHORT_FINAL_FRAME_PAYLOAD = "62 20 01 00 09 3C B6 11 22 33 44 55 66";
 
 /**

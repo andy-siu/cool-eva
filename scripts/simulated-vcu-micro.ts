@@ -21,13 +21,13 @@ import { TESTER_ADDRESS, canIdsFor, type VcuTarget } from "../src/vcu/param-code
 // for ours. That is what lets scripts/check-kwp-multiframe.ts exercise the
 // `0x35`/`0x36`/`0x37` sequence and its cancellation without a bike.
 //
-// ── ⚠️ IT IS A TEST DOUBLE, AND THE MULTI-FRAME HALF IS A DOUBLE OF A GUESS ──
-// The single-frame behaviours above are modelled from things measured on the bike.
-// The multi-frame ones are not, and cannot be: no multi-frame reply, no flow-control
-// frame and no `0x36` payload has ever been captured on this channel. So passing
-// against this proves the client is well-behaved against the framing this repo
-// believes in — it does not prove the bike behaves that way. src/vcu/multiframe-codec.ts
-// marks each individual guess.
+// ── ⚠️ IT IS A TEST DOUBLE, AND THE REPLY HALF IS A DOUBLE OF A GUESS ───────
+// The REQUEST side is modelled from the 2026-08-08 capture: the `0x35` length and the
+// `36 12` operand are both refused here when they are wrong, because both were wrong in
+// this repo and the bike is where that would otherwise have been found out.
+// The REPLY side is still invented — no real block body is served here. So passing against
+// this proves the client is well-behaved against the framing this repo believes in; it does
+// not prove the bike behaves that way. docs/vcu-parameters.md §§10-11 grades each part.
 
 export interface SimulatedMicro {
   /** Which target this stands in for. Decides its address AND which CAN ids it speaks on. */
@@ -104,11 +104,22 @@ const SERVICE_READ_DTC_BY_STATUS = 0x18;
 const SERVICE_REQUEST_UPLOAD = 0x35;
 const SERVICE_TRANSFER_DATA = 0x36;
 const SERVICE_REQUEST_TRANSFER_EXIT = 0x37;
+/** `RoutinesID.ReadFreezeFrame` — the operand `0x35` opens with and every `0x36` repeats. */
+const ROUTINE_READ_FREEZE_FRAME = 0x12;
 const POSITIVE_RESPONSE_OFFSET = 0x40;
 const DEFAULT_SESSION_IDLE_MS = 2500;
 
 /** Replies land on the next tick or two, so the client's timers are exercised rather than short-circuited. */
 const REPLY_DELAY_MS = 2;
+
+/**
+ * ⚠️ The first Consecutive Frame is sequence 0 on this channel, not the 1 ISO 15765-2
+ * specifies — 1229 of 1229 captured replies, and the factory tool's own request. This
+ * double is 0-based in BOTH halves so it stays a double of the bike rather than of the
+ * standard: it refuses a 1-based request, and it numbers its own replies the way A8 does.
+ * src/diagnostics/extended-iso-tp.ts holds the evidence.
+ */
+const FIRST_CONSECUTIVE_FRAME_SEQUENCE_NUMBER = 0;
 
 /** Payload bytes each frame type carries under extended addressing. */
 const MAX_SINGLE_FRAME_PAYLOAD = 6;
@@ -186,7 +197,7 @@ function receiveFrame(context: BusContext, data: Buffer): void {
       conversation.incoming = {
         payload: new Uint8Array(totalLength),
         filled: FIRST_FRAME_PAYLOAD_BYTES,
-        expectedSequenceNumber: 1,
+        expectedSequenceNumber: FIRST_CONSECUTIVE_FRAME_SEQUENCE_NUMBER,
       };
       conversation.incoming.payload.set(data.subarray(3, 8));
       if (context.micro.sendsRequestFlowControl !== false) {
@@ -276,7 +287,7 @@ function respond(context: BusContext, payload: Uint8Array): Uint8Array | null {
     case SERVICE_REQUEST_UPLOAD:
       return respondToRequestUpload(context, payload);
     case SERVICE_TRANSFER_DATA:
-      return respondToTransferData(context);
+      return respondToTransferData(context, payload);
     case SERVICE_REQUEST_TRANSFER_EXIT:
       conversationFor(context).uploadPosition = null;
       return Uint8Array.from([SERVICE_REQUEST_TRANSFER_EXIT + POSITIVE_RESPONSE_OFFSET, 0xff]);
@@ -331,9 +342,16 @@ function respondToRequestUpload(context: BusContext, payload: Uint8Array): Uint8
   return Uint8Array.from([SERVICE_REQUEST_UPLOAD + POSITIVE_RESPONSE_OFFSET, ...upload.grantBody]);
 }
 
-function respondToTransferData(context: BusContext): Uint8Array | null {
+function respondToTransferData(context: BusContext, payload: Uint8Array): Uint8Array | null {
   const upload = context.micro.upload;
   const conversation = conversationFor(context);
+  if (payload.length !== 2 || payload[1] !== ROUTINE_READ_FREEZE_FRAME) {
+    // ⚠️ Modelled from the capture rather than from the standard, and it is the whole
+    // reason this branch exists: all 1198 captured requests are `36 12`. A bare `36` used
+    // to pass here and would have failed at the bike, which is the failure this double
+    // exists to move forward in time. `0x13` is the length refusal.
+    return refusal(SERVICE_TRANSFER_DATA, 0x13);
+  }
   if (!upload || conversation.uploadPosition === null) {
     // No upload open. `0x24 requestSequenceError` is what a `36` before its `35`
     // should draw, and modelling it is how the check proves the runner opens one.
@@ -374,7 +392,7 @@ function sendReply(context: BusContext, payload: Uint8Array): void {
 
   conversation.outgoing = [];
   let sent = FIRST_FRAME_PAYLOAD_BYTES;
-  let sequenceNumber = 1;
+  let sequenceNumber = FIRST_CONSECUTIVE_FRAME_SEQUENCE_NUMBER;
   while (sent < payload.length) {
     const consecutive = new Uint8Array(8);
     consecutive[0] = TESTER_ADDRESS;
