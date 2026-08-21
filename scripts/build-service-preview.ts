@@ -1,6 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize, posix } from "node:path";
+import { buildPayload as buildDtcTable } from "../src/http/dtc-table.ts";
+import { buildPayload as buildFaultInfokeys } from "../src/http/fault-infokeys.ts";
 
 // Builds a single self-contained HTML file showing the service sheet with no Pi on the
 // other end. The point is being able to look at a design change before riding out to the
@@ -145,7 +147,14 @@ const modules = [...registry]
   .map(([key, code]) => `  ${JSON.stringify(key)}: function (__exports, __imp) {\n${code}\n  }`)
   .join(",\n");
 
-const template = await readFile(join(HERE, "service-preview-template.html"), "utf8");
+// Two templates. The default is the WHOLE dashboard as it actually runs — every tab,
+// the real navigation, nothing annotated — because that is what you want when checking
+// a change. `--annotated` gives the design-review sheet instead: the same modules, but
+// mounted one state per panel with prose explaining each, which is only useful while
+// arguing about a specific design decision.
+const annotated = process.argv.includes("--annotated");
+const templateFile = annotated ? "service-preview-template.html" : "app-preview-template.html";
+const template = await readFile(join(HERE, templateFile), "utf8");
 const css = await readFile(join(PUBLIC, "style.css"), "utf8");
 // String.replace no-ops SILENTLY when the pattern is absent. Deleting either
 // placeholder produced "✓ 32 modules" and an empty registry that renders nothing —
@@ -156,10 +165,26 @@ if (!template.includes("__CSS__")) {
 if (!/__MODULES__,?/.test(template)) {
   throw new Error("build-service-preview: the template has no __MODULES__ placeholder");
 }
+if (!template.includes("__TABLES__")) {
+  throw new Error("build-service-preview: the template has no __TABLES__ placeholder");
+}
 // Function replacements, not strings: a `$&` or `$1` inside the substituted CSS or JS
 // would otherwise be read as a replacement pattern and silently corrupt the output.
-const html = template.replace("__CSS__", () => css).replace(/__MODULES__,?/, () => modules);
+// The Faults tab fetches these two, and they are TABLES rather than bike state — so the
+// preview serves the real ones, generated here. A hand-written stub would make the
+// preview say "not in Energica's code table" about codes that are in it, which is
+// exactly the failure src/http/dtc-table.ts's own header warns about.
+const tables = JSON.stringify({ "/dtc-table": buildDtcTable(), "/fault-infokeys": buildFaultInfokeys() });
 
-const out = process.argv[2] ?? join(HERE, "..", "service-sheet-preview.html");
+const html = template
+  .replace("__CSS__", () => css)
+  .replace(/__MODULES__,?/, () => modules)
+  .replace("__TABLES__", () => tables);
+
+const out =
+  process.argv.slice(2).find(argument => !argument.startsWith("--")) ?? join(HERE, "..", "service-sheet-preview.html");
 await writeFile(out, html, "utf8");
-console.log(`✓ ${out} — ${registry.size} modules, ${Math.round(html.length / 1024)} kB, no network at runtime`);
+console.log(
+  `✓ ${out} — ${annotated ? "annotated sheet" : "whole dashboard"}, ${registry.size} modules, ` +
+    `${Math.round(html.length / 1024)} kB, no network at runtime`
+);
