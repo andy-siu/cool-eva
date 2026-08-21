@@ -59,14 +59,17 @@ import {
   securityKeyForSeed,
 } from "../src/vcu/write-codec.ts";
 import {
-  WRITE_TARGETS,
+  CURATED_WRITE_TARGETS,
+  writeTargets,
   allowlistProblemsIn,
   planBitWrite,
   planWrite,
+  writeTargetNamed,
+  writeTargetProblemIn,
   writeTargetNames,
 } from "../src/vcu/write-targets.ts";
 import { evaluateTableGate, registerAllowlistTableCheck } from "../src/vcu/table-gate.ts";
-import { sweptValueOf } from "../src/vcu/write-runner.ts";
+import { sweptValueOf, createVcuWriteRunner } from "../src/vcu/write-runner.ts";
 import { fingerprintTable } from "../src/vcu/table-catalog.ts";
 import {
   SERVICE_STAMP_IDENTIFIERS,
@@ -632,9 +635,13 @@ expect(
   "…and every table is on one side or the other, so nothing is quietly a third thing"
 );
 
-// ⚠️ THE ALLOWLIST, against every table this software carries. Today all five ids are
+// ⚠️ THE CURATED FIVE, against every table this software carries. All five are
 // identical in name, width, signedness and micro across all 28, so there is nothing to
-// refuse — this is measured rather than assumed, because it is the property that makes
+// refuse. ⚠️ That is exactly why this loop is NOT the property that makes the write path
+// safe any more: it passes on every bike, and it now covers 5 of 269 writable
+// parameters. The other 264 are checked per write by writeTargetProblemIn, because 26
+// of the 28 tables put a different parameter at the index of at least one of them. This
+// loop is measured rather than assumed, because it is what makes
 // the write path safe on a bike this repo has never seen, and the next contributed table
 // is exactly the thing that could break it.
 for (const table of builtTables) {
@@ -1532,15 +1539,170 @@ expect(
 // ALLOWLIST, and a check that cannot tell which guard fired is not checking either.
 const confirmedTable = reportTableType(snapshotOf([reading(276, "40 17"), reading(277, "40 17")]));
 
-expect(WRITE_TARGETS.length === 5, `the allowlist should hold 5 parameters, holds ${WRITE_TARGETS.length}`);
+// ⚠️ THE PER-PARAMETER TABLE CHECK. This is the guard that replaced the five-name
+// allowlist, and the first version of it was DEFINED AND NEVER CALLED — the suite stayed
+// green while a mutation making it refuse every write on every bike changed nothing. So
+// it is exercised here at both layers, against a bike naming a table that disagrees.
+//
+// Table 4102 puts `RegenFade_0` at index 70, where the active table puts `CELL_COUNT`.
+// The gate cannot see that: the curated five are identical in all 28 tables, so it says
+// writesAllowed on every bike. Only this check notices.
+const table4102 = reportTableType(snapshotOf([reading(276, "10 06"), reading(277, "10 06")]));
+const bike4102 = parameterTableFor(4102);
+expect(bike4102 !== null, "table 4102 must be rebuildable for this check to mean anything");
+if (bike4102) {
+  const cellCount = writeTargetNamed("CELL_COUNT");
+  expect(cellCount !== null, "CELL_COUNT should be writable now that every parameter is");
+  if (cellCount) {
+    const problem = writeTargetProblemIn(cellCount, bike4102);
+    expect(
+      problem !== null && problem.includes("RegenFade_0"),
+      `CELL_COUNT must be refused on a 4102 bike, naming what is really there; got ${problem}`
+    );
+    // …and the CURATED five must still pass, or the check is just refusing everything.
+    const dc = writeTargetNamed("MAX_DC_CHG_CURRENT");
+    expect(
+      dc !== null && writeTargetProblemIn(dc, bike4102) === null,
+      "MAX_DC_CHG_CURRENT is identical in all 28 tables and must NOT be refused on 4102"
+    );
+  }
+  // The codec layer, which is the one a curl cannot bypass.
+  const planned = planWrite("CELL_COUNT", 1, 0);
+  expect(planned.ok, "CELL_COUNT should plan against the ACTIVE table");
+  if (planned.ok) {
+    expectThrows(
+      () => buildWriteFrame("A9", { kind: "write-parameter", tableType: table4102, plan: planned.plan }),
+      "the codec must refuse a plan whose index means something else on the bike's own table"
+    );
+    // The same plan on a bike that agrees must still encode, or this proves nothing.
+    buildWriteFrame("A9", { kind: "write-parameter", tableType: confirmedTable, plan: planned.plan });
+  }
+}
+
+// ⚠️ THE RUNNER LAYER. The block above exercises writeTargetProblemIn directly and the
+// codec through buildWriteFrame — but NOT checkPreconditions, and a review proved it:
+// neutralising the runner's own call left the suite green. The codec is the layer a
+// curl cannot bypass and it is covered, so the bytes were never at risk; what was
+// uncovered is the readable refusal a person standing at the bike actually sees.
+//
+// createVcuWriteRunner takes all three of its dependencies as functions, and the table
+// check refuses BEFORE the bus is acquired, so this never touches a channel.
+{
+  const runner = createVcuWriteRunner({
+    enabled: true,
+    busIsActive: true,
+    directory: "/tmp",
+    // Never dereferenced: the table guard refuses before the bus is acquired, which is
+    // the property being tested. If that ordering ever changes this cast will crash
+    // loudly rather than quietly write to a bus that is not there.
+    channel: () => ({}) as never,
+    gate: () => ({ safe: true, blockers: [], checks: [], charger: null }) as never,
+    latestSweep: async () => ({ snapshot: snapshotOf([]), report: table4102 }) as never,
+  });
+  const refusal = await runner.perform({
+    kind: "parameter",
+    name: "CELL_COUNT",
+    value: 1,
+    expectedCurrent: 0,
+  });
+  expect(!refusal.ok, "the runner must refuse CELL_COUNT on a 4102 bike");
+  expect(
+    !refusal.ok && refusal.reason.includes("RegenFade_0"),
+    `the runner's refusal must name what is really at that index; got ${refusal.ok ? "" : refusal.reason}`
+  );
+  // The "must NOT refuse what both tables agree about" half is asserted against
+  // writeTargetProblemIn directly, above. Driving it through the runner would push
+  // MAX_DC_CHG_CURRENT past the guard and into an actual bus write against a stub
+  // channel — noise, and work this test does not need to do to prove the guard
+  // discriminates rather than vetoing wholesale.
+}
+
+expect(CURATED_WRITE_TARGETS.length === 5, `5 parameters should be RESEARCHED, ${CURATED_WRITE_TARGETS.length} are`);
 expect(
-  writeTargetNames().join(",") === "MAX_DC_CHG_CURRENT,FCHG_CURRENT_GAIN,TORQUE_LIMIT,REGEN_TORQUE_LIMIT,VSM_CONFIG_1",
-  `the allowlist should be exactly the five parameters asked for, is ${writeTargetNames().join(",")}`
+  CURATED_WRITE_TARGETS.map(target => target.name).join(",") ===
+    "MAX_DC_CHG_CURRENT,FCHG_CURRENT_GAIN,TORQUE_LIMIT,REGEN_TORQUE_LIMIT,VSM_CONFIG_1",
+  `the researched five should be the ones asked for, are ${CURATED_WRITE_TARGETS.map(t => t.name).join(",")}`
 );
+
+// The list is the bike's whole table now, minus the names that appear twice. 277 rows,
+// 8 of them the duplicated VSM_DUMMY_WORD8…11 pairs, leaves 269. ⚠️ A write is
+// addressed by NAME, so a duplicated name has no unambiguous address; that is why they
+// are out, and the count is asserted so silently losing more than those eight fails.
+const allTargets = writeTargets();
+const tableNames = parameterTable().map(parameter => parameter.name.toUpperCase());
+const duplicated = new Set(tableNames.filter((name, index) => tableNames.indexOf(name) !== index));
+expect(duplicated.size === 4, `4 parameter names should be duplicated, ${duplicated.size} are`);
+expect(
+  allTargets.length === parameterTable().length - duplicated.size * 2,
+  `every non-duplicated parameter should be writable: expected ${parameterTable().length - duplicated.size * 2}, got ${allTargets.length}`
+);
+expect(
+  allTargets
+    .slice(0, 5)
+    .map(target => target.name)
+    .join(",") === "MAX_DC_CHG_CURRENT,FCHG_CURRENT_GAIN,TORQUE_LIMIT,REGEN_TORQUE_LIMIT,VSM_CONFIG_1",
+  "the researched five must come first, so the list does not bury them among 264 unresearched ones"
+);
+expect(
+  allTargets.every(target => target.name.trim().length > 0) &&
+    new Set(allTargets.map(target => target.name.toUpperCase())).size === allTargets.length,
+  "every writable name must be unique — an ambiguous name is an unaddressable write"
+);
+
+// ⚠️ THE BOUNDS MUST BE EXACTLY THE ENCODER'S RANGE. Advertising a value the encoder
+// refuses is a UI that offers what it cannot write; advertising one wider than the
+// record is worse. Nothing asserted this until 2026-08-21 — widening every unsigned
+// bound to 2**(bits+1)-1 left the suite green, because encodeRecord refuses later and
+// the failure only shows as a rejected write.
+for (const target of allTargets) {
+  if (target.control.kind !== "number") {
+    continue;
+  }
+  const { min, max } = target.control;
+  expect(planWrite(target.name, min, min === 0 ? 1 : 0).ok, `${target.name}: min ${min} must be writable`);
+  expect(planWrite(target.name, max, max === 0 ? 1 : 0).ok, `${target.name}: max ${max} must be writable`);
+  expect(!planWrite(target.name, min - 1, 0).ok, `${target.name}: ${min - 1} is below the record and must be refused`);
+  expect(!planWrite(target.name, max + 1, 0).ok, `${target.name}: ${max + 1} is above the record and must be refused`);
+}
+
+// ⚠️ THE EXCLUSION IS A PROPERTY OF THIS TABLE, NOT OF THE RULE. On table 20498 the
+// duplicated name is `CELL_COUNT` — a real parameter, silently unwritable there, refused
+// as though it did not exist. The rule itself generalises (it drops every copy of any
+// name seen more than once, multiplicity 3+ included); what does not generalise is the
+// reassurance that the casualties are padding words. Asserted here so the claim in the
+// docs cannot quietly become false for this bike.
+for (const name of writeTargetNames()) {
+  expect(!/^VSM_DUMMY_WORD(8|9|10|11)$/.test(name), `${name} is a duplicated name and must not be writable`);
+}
+const excluded = parameterTable()
+  .map(parameter => parameter.name)
+  .filter(name => !writeTargetNames().includes(name));
+expect(
+  excluded.every(name => /^VSM_DUMMY_WORD/.test(name)),
+  `on THIS table every excluded name should be a padding word; excluded: ${[...new Set(excluded)].join(", ")}`
+);
+
+// A generated target must ANNOUNCE that it is unresearched. This is the whole safety
+// property now that absence is no longer doing the work.
+for (const target of allTargets.slice(5)) {
+  expect(
+    target.warnings.some(warning => warning.includes("NOT researched")),
+    `${target.name} is generated and must say so in its warnings`
+  );
+  expect(target.verify === null, `${target.name} is generated and cannot claim a verification step`);
+}
+
+// And a curated one must NOT — otherwise the distinction the UI shows is meaningless.
+for (const target of CURATED_WRITE_TARGETS) {
+  expect(
+    !target.warnings.some(warning => warning.includes("NOT researched")),
+    `${target.name} is researched and must not carry the generated warning`
+  );
+}
 // Every entry must agree with params.ecf about what it is. The allowlist carries both
 // an index and a name so that a renumbered variant file is a startup error rather
 // than a write to whatever now sits at 258.
-for (const target of WRITE_TARGETS) {
+for (const target of writeTargets()) {
   const parameter = parameterAtIndex(target.index);
   expect(
     parameter?.name.toUpperCase() === target.name.toUpperCase(),
@@ -1548,9 +1710,13 @@ for (const target of WRITE_TARGETS) {
   );
 }
 
-// ⚠️ THE REJECTION. Anything not on the list is refused in the PURE LAYER, with a
-// reason, and never becomes a plan — so it can never become a frame. These are the
-// neighbours that would hurt most: a cell limit, a throttle map, the current limit.
+// ⚠️ THE REJECTION, and what it means now that the list is the whole table.
+//
+// These six used to be refused for not being on a five-name allowlist. They are
+// reachable now — the owner asked for that, and the argument for the short list was
+// about index typos on an interface that has never taken an index. What must still
+// hold is that each one arrives WITH the warning that nobody researched it, and that
+// a name which is not a parameter at all is still refused outright.
 for (const name of [
   "CELL_OVERVOLTAGE",
   "THROTTLE_MAX_TH",
@@ -1558,16 +1724,28 @@ for (const name of [
   "LIMP_MIN_CELL",
   "WATER_PUMP_MIN_CURR_TH",
   "SPEED_LIMIT",
-  "MODEL",
-  "NOT_A_PARAMETER_AT_ALL",
 ]) {
-  const refused = planWrite(name, 1, 0);
-  expect(!refused.ok, `${name} is not on the allowlist and must be refused`);
-  expect(!refused.ok && refused.reason.includes(name), `${name}'s refusal should name what was asked for`);
+  const target = writeTargetNamed(name);
+  expect(target !== null, `${name} should be reachable now that every parameter is`);
   expect(
-    !refused.ok && refused.reason.includes("MAX_DC_CHG_CURRENT"),
-    `${name}'s refusal should list what IS writable, so nobody goes hunting for identifiers`
+    target !== null && target.warnings.some(warning => warning.includes("NOT researched")),
+    `${name} must announce that nobody established a safe value for it`
   );
+  expect(
+    target !== null && target.control.kind === "number" && target.verify === null,
+    `${name} is generated, so it takes a number and can promise no verification step`
+  );
+  // And it must still PLAN, or "reachable" is a claim the write path does not honour.
+  const planned = planWrite(name, 1, 0);
+  expect(planned.ok, `${name} should now produce a plan, got: ${planned.ok ? "" : planned.reason}`);
+}
+
+// A name that is not a parameter is still refused, in the PURE LAYER, with a reason —
+// and so are the four duplicated names, which have no unambiguous address.
+for (const name of ["NOT_A_PARAMETER_AT_ALL", "VSM_DUMMY_WORD8", "VSM_DUMMY_WORD11"]) {
+  const refused = planWrite(name, 1, 0);
+  expect(!refused.ok, `${name} is not addressable and must be refused`);
+  expect(!refused.ok && refused.reason.includes(name), `${name}'s refusal should name what was asked for`);
 }
 // Case-insensitively, because a name arrives from a manual or a URL.
 expect(planWrite("max_dc_chg_current", 80, 75).ok, "the allowlist should match names case-insensitively");
@@ -1686,7 +1864,12 @@ expectThrows(
       tableType: confirmedTable,
       plan: {
         name: "CELL_OVERVOLTAGE",
-        index: 78,
+        // ⚠️ The INDEX is wrong for this name — 258 is MAX_DC_CHG_CURRENT. This used to
+        // be refused merely for CELL_OVERVOLTAGE not being on a five-name list; that
+        // list is now the whole table, so membership distinguishes nothing and the
+        // check has to be what it should always have been: does the plan's own
+        // name/index/identifier/micro agree with what this repo would build for it.
+        index: 258,
         micro: "A9",
         identifier: 0x104e,
         record: Uint8Array.from([0x10, 0xcc]),
@@ -1695,7 +1878,7 @@ expectThrows(
         description: "forged",
       },
     }),
-  "a hand-built plan for a parameter that is not on the allowlist must be refused by the codec"
+  "a hand-built plan whose index does not match its name must be refused by the codec"
 );
 expectThrows(
   () =>
@@ -1948,7 +2131,7 @@ expect(
   "…and nothing is outstanding — both micros answered, and the table they named is reported"
 );
 // ⚠️ The mechanism the fail-closed default rests on. The default itself is unreachable
-// from here — importing ./write-targets.ts (which this file does, for WRITE_TARGETS)
+// from here — importing ./write-targets.ts (which this file does, for writeTargets())
 // registers over it at module load — so what is asserted is the property it relies on:
 // a check that reports a problem BLOCKS, on a snapshot that is otherwise perfect. A
 // build where write-targets.ts never loaded gets the default's sentence through this
@@ -2092,8 +2275,8 @@ function sweepOf(outcomes: VcuReadOutcome[], complete = true): VcuParameterSnaps
   return { readAt: sweptAt, complete, micros: ["A9"], rows: outcomes.map(toParameterRow) };
 }
 
-const dcTarget = WRITE_TARGETS.find(target => target.name === "MAX_DC_CHG_CURRENT");
-const configTarget = WRITE_TARGETS.find(target => target.name === "VSM_CONFIG_1");
+const dcTarget = writeTargets().find(target => target.name === "MAX_DC_CHG_CURRENT");
+const configTarget = writeTargets().find(target => target.name === "VSM_CONFIG_1");
 if (!dcTarget || !configTarget) {
   throw new Error("the allowlist no longer carries the two parameters §14c is written against");
 }
@@ -2162,7 +2345,7 @@ expect(
   dcTarget.verify !== null && dcTarget.verify.includes("0x625"),
   "MAX_DC_CHG_CURRENT's free 0x625 b2 verification must survive as `verify`"
 );
-for (const target of WRITE_TARGETS) {
+for (const target of writeTargets()) {
   expect(
     target.verify === null || target.verify.trim().length > 0,
     `${target.name}: verify must be a sentence or an honest null, not an empty string`

@@ -284,18 +284,21 @@ function TableTypeNote() {
 function ParameterForm() {
   return div(
     div({ class: "probe-row" }, Field("Parameter", ParameterSelect)),
-    // Five, and that is the entire list. Without saying so the select looks like a
-    // filter that dropped the other 272 — src/vcu/write-targets.ts is an allowlist,
-    // and two identifiers away from these five sit CELL_OVERVOLTAGE, THROTTLE_MAX_TH
-    // and ACTIVE_CURRENT_LIMIT. All 277 stay READABLE; only these five can be written.
+    // The count comes from the same array the dropdown renders, so the sentence cannot
+    // disagree with the options above it. It reads 269 — every parameter in the bike's
+    // table except four duplicated names. The first five are the RESEARCHED ones; the
+    // rest carry the datatype's full range and a warning saying nobody established a
+    // safe value. That distinction is what the old five-name allowlist used to enforce
+    // by absence, and it is why `purpose` renders uncollapsed.
     div({ class: "action-note" }, () => {
       const count = state.val?.status.targets.length ?? 0;
       if (count === 0) {
         return "";
       }
       return (
-        `These ${count} are the only parameters this can write, by design. ` +
-        "Every one of the 277 stays readable — the full table is behind “Open the full parameter table”."
+        `These ${count} are the only parameters this can write. ` +
+        "Four names appear twice in the bike's table and so have no unambiguous address, which is why eight rows are missing. " +
+        "All 277 stay READABLE — the full table is behind “Open the full parameter table”."
       );
     }),
     TargetNote(),
