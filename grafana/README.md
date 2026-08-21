@@ -98,6 +98,29 @@ It was hand-maintained until 2026-08-16 and it had already gone stale: a change 
 
 Run every `rawQueryText` against `rides.db` with `$__from`/`$__to` and the template variables substituted, and confirm each returns rows. A panel that renders "No data" is indistinguishable from a broken bike, so it has to be ruled out at the query level first. Check `EXPLAIN QUERY PLAN` shows `SEARCH … USING INDEX idx_reading_sig_ts (signal_id=? AND ts>? AND ts<?)`: the only index on `reading` leads with `signal_id`, so a query filtered on `ts` alone scans. SQLite does flatten derived tables and push a `signal.key` predicate down through the join, so a subquery filtered only on `ts` is not automatically a scan — check the plan rather than assuming either way.
 
+## ⚠️ `rides.db` is in WAL mode, and that silently blanks panels
+
+Measured 2026-08-20, replaying a real DC session: a panel rendered **"No data in response"** with an error icon while its SQL, run directly, returned 10 rows. The datasource had come back with `{"error":"database is locked (5) (SQLITE_BUSY)"}` and Grafana surfaced it as an empty panel.
+
+The cause is SQLite's WAL journal read across a Docker bind mount. `docker-compose.yml` mounts the whole repo (`- .:/repo:rw`) and `rides.db` sits at its root, so this is the normal setup, not an exotic one. `PRAGMA journal_mode` on `rides.db` reads `wal` today.
+
+Measured, 17 panel queries × 5 concurrent rounds:
+
+| journal mode        | queries errored |
+| ------------------- | --------------- |
+| `wal`               | **3 of 85**     |
+| `delete` (rollback) | **0 of 85**     |
+
+So roughly **one panel per dashboard load** comes back blank, and a different one each time. Per this file's own argument in §"Every query has to be run" — _"a panel that renders 'No data' is indistinguishable from a broken bike"_ — that is the worst shape a failure can take here: it looks like a finding.
+
+`PRAGMA journal_mode=DELETE` on the database Grafana reads fixes it. The decrypt step that produces the file Grafana reads is the natural place to set it.
+
+⚠️ **Do that on the COPY, never on `rides.db`, and the reason is not the obvious one.** Switching journal mode takes an exclusive lock, which is a nuisance; the real problem is that DELETE serialises every reader against the writer. Measured on the same harness, 5 readers plus one live writer: the WAL copy errored **0 of 85**, the DELETE copy **53 of 85**. WAL exists precisely to prevent that, and `rides.db` has a logger appending to it. DELETE is right only for a static file nothing is writing.
+
+⚠️ **It is the datasource plugin's driver, not SQLite.** The same two databases over the same bind mount, read through CPython's `sqlite3` (SQLite 3.46.1): **0 of 85** at 5 concurrent readers, **0 of 1020** at 20 threads × 3 rounds, and **0 of 85** even with a live writer. This is a `frser-sqlite-datasource` problem, not a "WAL is broken on Docker Desktop" problem — worth stating, because the second conclusion is the tempting one and it is false.
+
+⚠️ **The rate is highly variable.** Six rounds of 17 queries × 5 concurrent gave 1, 32, 6, 1, 6 and 2 errors — 48 of 510 overall. "About one panel per load" is a central estimate, not a ceiling; a bad load can blank a third of the dashboard.
+
 ## Rows already in `rides.db` that this repo now decodes differently
 
 Two decoder fixes on 2026-08-16 changed what the code produces, but neither can change what is already stored: the sealed ride log holds the values the Pi decoded at the time, so re-running `decrypt-log.ts` reproduces them faithfully. Grafana reads those rows raw. Both are left as-is deliberately — this is the only copy of the data and correcting it in place is a one-way trip — but the queries below are here so the decision is yours and the SQL is not something you have to re-derive.
