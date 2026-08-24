@@ -63,14 +63,14 @@ export function Sheet() {
       // run of text to it. Levels start at 2 because the sheet is a section of a page
       // rather than a document of its own, and nothing renders differently — see
       // docs/dashboard-decisions.md §"The menu sheet".
-      h2({ class: "sheet-heading" }, "This session"),
-      TripStats(),
-      // The one preference this dashboard has. It sits here, above the stats it
-      // changes, rather than in the header — nothing about it is worth reaching for at
-      // speed, and the trip stats right above flip as you tap it so the effect is in
-      // view. Persisted in lib/units.js.
+      // The one preference this dashboard has, at the top of the sheet where it is the
+      // first thing found rather than buried below the stats — nothing about it is worth
+      // reaching for at speed, but when the sheet is open it is the control most likely
+      // wanted, and every number below flips as you tap it. Persisted in lib/units.js.
       h2({ class: "sheet-heading" }, "Units"),
       UnitsToggle(),
+      h2({ class: "sheet-heading" }, "This session"),
+      TripStats(),
       // No subtitle here, deliberately. Three sections carrying a one-line "what can
       // this do to the bike" was one sentence too many for a single bit of
       // information: both controls in this one are in the grey tier, which says the
