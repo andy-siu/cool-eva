@@ -1,6 +1,6 @@
 ================================================================================ Cool Eva — Raspberry Pi installation ================================================================================
 
-Telemetry service for a watercooled Energica Eva Ribelle. This installs the "thermometer" systemd service, which brings up can0, reads the MAX31865 coolant probes over SPI, decodes the bike's CAN/OBD-II telemetry, and serves the live phone dashboard on port 80. See README.md for what it does; this file is just how to get it running on the Pi.
+Telemetry service for a watercooled Energica Eva Ribelle. This installs the "cool-eva" systemd service, which brings up can0, reads the MAX31865 coolant probes over SPI, decodes the bike's CAN/OBD-II telemetry, and serves the live phone dashboard on port 80. See README.md for what it does; this file is just how to get it running on the Pi.
 
 Everything below runs ON THE PI unless a step says "on the laptop".
 
@@ -31,7 +31,7 @@ sudo raspi-config nonint do_spi 0
 
 # Confirm SPI came up after reboot — you want spidev0.0 and spidev0.1
 
-ls -l /dev/spidev0.\*
+ls -l /dev/spidev0.*
 
 # Confirm the Korlan shows up as a CAN interface once plugged in
 
@@ -61,9 +61,9 @@ sudo apt-get install -y build-essential python3 git
 
 ---
 
-Deploy convention is a git checkout at /home/pi/thermometer:
+Deploy convention is a git checkout at /home/pi/cool-eva:
 
-git clone <this-repo-url> /home/pi/thermometer cd /home/pi/thermometer
+git clone <this-repo-url> /home/pi/cool-eva; cd /home/pi/cool-eva
 
 ---
 
@@ -71,7 +71,7 @@ git clone <this-repo-url> /home/pi/thermometer cd /home/pi/thermometer
 
 ---
 
-cd /home/pi/thermometer rm -f package-lock.json # IMPORTANT — see note below npm install # builds better-sqlite3 + socketcan (~4 min)
+cd /home/pi/cool-eva; rm -f package-lock.json # IMPORTANT — see note below npm install # builds better-sqlite3 + socketcan (~4 min)
 
 # Verify the Linux-only native CAN module actually built:
 
@@ -95,7 +95,7 @@ node --experimental-strip-types scripts/generate-log-key.ts # writes both keys
 
 # ever decrypt the logs. Lose it and every logged ride is gone forever.
 
-scp ride-log-key.public.pem pi@cool-eva.local:/home/pi/thermometer/
+scp ride-log-key.public.pem pi@cool-eva.local:/home/pi/cool-eva/
 
 The service looks for ride-log-key.public.pem in the project dir by default (or set RIDE_LOG_PUBKEY). Without it, logging still runs but is not encrypted.
 
@@ -111,7 +111,7 @@ CAN_ENABLED=0 skip CAN entirely (coolant only) OBD_ENABLED=0 passive/listen-only
 
 The install script (next step) does NOT bake env vars into the unit. To set any, add a systemd drop-in AFTER installing the service:
 
-sudo systemctl edit thermometer
+sudo systemctl edit cool-eva
 
 # then add, e.g.:
 
@@ -119,7 +119,7 @@ sudo systemctl edit thermometer
 
 # Environment=CUSTOM_BMS_CONFIG=1
 
-sudo systemctl restart thermometer
+sudo systemctl restart cool-eva
 
 ---
 
@@ -127,11 +127,16 @@ sudo systemctl restart thermometer
 
 ---
 
-cd /home/pi/thermometer sudo node scripts/setup-service.ts
+cd /home/pi/cool-eva; sudo node scripts/setup-service.ts
 
-This writes /etc/systemd/system/thermometer.service (running as root, so it can bring up can0), then enables it at boot and starts it. Useful commands it prints:
+This writes /etc/systemd/system/cool-eva.service (running as root, so it can bring up can0), then enables it at boot and starts it. Useful commands it prints:
+if you see thermometer.service , rename it to cool-eva.service
 
-sudo systemctl status thermometer # check status sudo journalctl -u thermometer -f # follow logs sudo systemctl stop thermometer # stop sudo systemctl disable thermometer # remove from boot
+sudo systemctl status cool-eva
+# check status
+sudo journalctl -u cool-eva -f # follow logs
+sudo systemctl stop thermometer # stop
+sudo systemctl disable thermometer # remove from boot
 
 On a healthy start the logs show, roughly: can: can0 up @500k — ACTIVE (TX enabled) coolant: 2 MAX31865 probe(s) started (sensor-rate polling) ride-log: encrypting to … (only if the public key is present)
 
@@ -159,7 +164,7 @@ Endpoints: /dl (sealed ride-log download), /waypoint (Siri shortcut), /status, /
 
 ---
 
-cd /home/pi/thermometer git pull sudo systemctl restart thermometer
+cd /home/pi/cool-eva; git pull; sudo systemctl restart cool-eva
 
 # ONLY if a dependency changed: rm package-lock.json && npm install
 
@@ -173,7 +178,23 @@ Notes:
 
 ---
 
-10. Optional: Grafana on the laptop (post-ride analysis)
+
+10. Setting up config file for cool-eva
+On my raspberry pi
+vi /etc/environment
+COOLANT_ENABLED=0
+BLE_MAC=<mac address>
+SERVICE_WRITE_ENABLED=1
+CUSTOM_BMS_CONFIG=0
+
+11. QUICK TIPS on bringing can back online.  IF you are troubleshooting and rebooted the pi but the can0 interface looks down.  you need to bring it back up manually or reboot the bike.
+ip -details link show can0
+ip link set can0 type can bitrate 500000
+ip link set can0 up
+ip -details link show can0
+
+
+12. Optional: Grafana on the laptop (post-ride analysis)
 
 ---
 
