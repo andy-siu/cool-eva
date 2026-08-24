@@ -31,7 +31,7 @@ sudo raspi-config nonint do_spi 0
 
 # Confirm SPI came up after reboot — you want spidev0.0 and spidev0.1
 
-ls -l /dev/spidev0.*
+ls -l /dev/spidev0.\*
 
 # Confirm the Korlan shows up as a CAN interface once plugged in
 
@@ -129,14 +129,13 @@ sudo systemctl restart cool-eva
 
 cd /home/pi/cool-eva; sudo node scripts/setup-service.ts
 
-This writes /etc/systemd/system/cool-eva.service (running as root, so it can bring up can0), then enables it at boot and starts it. Useful commands it prints:
-if you see thermometer.service , rename it to cool-eva.service
+This writes /etc/systemd/system/cool-eva.service (running as root, so it can bring up can0), then enables it at boot and starts it. Useful commands it prints: if you see thermometer.service , rename it to cool-eva.service
 
 sudo systemctl status cool-eva
+
 # check status
-sudo journalctl -u cool-eva -f # follow logs
-sudo systemctl stop thermometer # stop
-sudo systemctl disable thermometer # remove from boot
+
+sudo journalctl -u cool-eva -f # follow logs sudo systemctl stop thermometer # stop sudo systemctl disable thermometer # remove from boot
 
 On a healthy start the logs show, roughly: can: can0 up @500k — ACTIVE (TX enabled) coolant: 2 MAX31865 probe(s) started (sensor-rate polling) ride-log: encrypting to … (only if the public key is present)
 
@@ -178,21 +177,9 @@ Notes:
 
 ---
 
+10. Setting up config file for cool-eva On my raspberry pi vi /etc/environment COOLANT_ENABLED=0 BLE_MAC=<mac address> SERVICE_WRITE_ENABLED=1 CUSTOM_BMS_CONFIG=0
 
-10. Setting up config file for cool-eva
-On my raspberry pi
-vi /etc/environment
-COOLANT_ENABLED=0
-BLE_MAC=<mac address>
-SERVICE_WRITE_ENABLED=1
-CUSTOM_BMS_CONFIG=0
-
-11. QUICK TIPS on bringing can back online.  IF you are troubleshooting and rebooted the pi but the can0 interface looks down.  you need to bring it back up manually or reboot the bike.
-ip -details link show can0
-ip link set can0 type can bitrate 500000
-ip link set can0 up
-ip -details link show can0
-
+11. QUICK TIPS on bringing can back online. IF you are troubleshooting and rebooted the pi but the can0 interface looks down. you need to bring it back up manually or reboot the bike. ip -details link show can0 ip link set can0 type can bitrate 500000 ip link set can0 up ip -details link show can0
 
 12. Optional: Grafana on the laptop (post-ride analysis)
 
