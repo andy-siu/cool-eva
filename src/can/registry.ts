@@ -19,6 +19,11 @@ export const SIGNALS: SignalDef[] = [
   { key: "coolant_in", unit: "°C", group: "coolant", source: "sensor", deadband: 0.05 },
   { key: "coolant_out", unit: "°C", group: "coolant", source: "sensor", deadband: 0.05 },
 
+  // The can0 interface's own up/down state, polled from `ip link` rather than decoded
+  // off the bus (src/can/link-status.ts). A 1/0 flag in `diag`, which bounds.js gates to
+  // [0, 1] as a BOOLEAN_GROUP — so no per-key bound is needed.
+  { key: "can_link", unit: "", group: "diag", source: "poll" },
+
   // 0x200 / 0x660 — BMS
   // batt_temp_lo/hi always mean the TRUE pack temperature, whichever frame supplies
   // them (see pack-temperature.ts), so the history stays one continuous series. That

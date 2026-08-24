@@ -20,6 +20,7 @@ import { CUTOFF_TIMER_S, dwellSeconds, secondsRemaining } from "../lib/dwell.js"
 import { Fact, Missing, SectionLabel, SignalTile } from "../lib/tiles.js";
 import { barStrip, meter, sparkline } from "../lib/svg.js";
 import * as colors from "../lib/colors.js";
+import * as units from "../lib/units.js";
 import { fixed, whole } from "../lib/format.js";
 
 const { div, span } = van.tags;
@@ -172,13 +173,13 @@ function ConsumptionTile() {
         chartTick.val;
         const rolling = rollingConsumption(monotonicNow());
         if (rolling.state === "measured") {
-          return rolling.whPerKm.toFixed(0);
+          return units.efficiency(rolling.whPerKm).toFixed(0);
         }
         // A descent puts energy back in; a dash is what "no reading" looks like, and
         // this is a reading.
         return rolling.state === "regenerating" ? "regen" : "–";
       },
-      span({ class: "unit" }, "Wh/km")
+      span({ class: "unit" }, units.efficiencyUnit)
     ),
     div({ class: "sub" }, () => {
       chartTick.val;
@@ -188,11 +189,12 @@ function ConsumptionTile() {
         return "needs ~200 m of riding";
       }
       if (rolling.state === "regenerating") {
-        return `putting charge back over the last ${rolling.km.toFixed(1)} km`;
+        return `putting charge back over the last ${units.distance(rolling.km).toFixed(1)} ${units.distanceUnit()}`;
       }
       const range = rollingRangeKm(now);
-      const rangeText = range == null ? "" : ` · ${Math.round(range)} km left at this rate`;
-      return `over the last ${rolling.km.toFixed(1)} km${rangeText}`;
+      const rangeText =
+        range == null ? "" : ` · ${Math.round(units.distance(range))} ${units.distanceUnit()} left at this rate`;
+      return `over the last ${units.distance(rolling.km).toFixed(1)} ${units.distanceUnit()}${rangeText}`;
     }),
     Fact("Remaining", () => {
       const energy = remainingWh();
@@ -201,11 +203,11 @@ function ConsumptionTile() {
     Fact("Bike's own figure", () => {
       chartTick.val;
       const bike = bikeConsumptionWhPerKm(monotonicNow());
-      return bike == null ? "–" : `${Math.round(bike)} Wh/km`;
+      return bike == null ? "–" : `${Math.round(units.efficiency(bike))} ${units.efficiencyUnit()}`;
     }),
     Fact("Bike's own range", () => {
       const range = valueOf("range_km");
-      return range == null ? "–" : `${Math.round(range)} km`;
+      return range == null ? "–" : `${Math.round(units.distance(range))} ${units.distanceUnit()}`;
     })
   );
 }

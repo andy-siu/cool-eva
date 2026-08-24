@@ -4,6 +4,7 @@ import van from "../vendor/van-1.6.1.js";
 import { chartTick, knownKeys, valueOf } from "../lib/store.js";
 import { averageMovingSpeedKmh, distanceKm, movingTimeSeconds, topSpeed } from "../lib/trip.js";
 import { bytes, compass, duration } from "../lib/format.js";
+import * as units from "../lib/units.js";
 import { saveWaypoint } from "../lib/waypoint.js";
 import { ServiceMode, refreshServiceMode } from "./service-mode.js";
 
@@ -16,6 +17,8 @@ const { button, div, h2 } = van.tags;
 // looking at at speed, and all of it is worth having when you stop.
 
 /** @typedef {import("../../src/http/status.ts").StatusPayload} StatusPayload */
+/** @typedef {import("../../src/http/can-restart.ts").CanRestartReply} CanRestartReply */
+/** @typedef {import("../../src/http/update.ts").UpdateReply} UpdateReply */
 
 export const sheetOpen = van.state(false);
 
@@ -62,16 +65,25 @@ export function Sheet() {
       // run of text to it. Levels start at 2 because the sheet is a section of a page
       // rather than a document of its own, and nothing renders differently — see
       // docs/dashboard-decisions.md §"The menu sheet".
+      // The one preference this dashboard has, at the top of the sheet where it is the
+      // first thing found rather than buried below the stats — nothing about it is worth
+      // reaching for at speed, but when the sheet is open it is the control most likely
+      // wanted, and every number below flips as you tap it. Persisted in lib/units.js.
+      h2({ class: "sheet-heading" }, "Units"),
+      UnitsToggle(),
       h2({ class: "sheet-heading" }, "This session"),
       TripStats(),
       // No subtitle here, deliberately. Three sections carrying a one-line "what can
       // this do to the bike" was one sentence too many for a single bit of
-      // information: both controls in this one are in the grey tier, which says the
+      // information: the controls in this one are in the grey tier, which says the
       // same thing without a sentence. The two that keep a subtitle are the two
-      // either side of the read/write boundary, where the bit is not obvious.
+      // either side of the read/write boundary, where the bit is not obvious. The CAN
+      // restart is grey-tier too: it re-ups the Pi's own interface, not the bike.
       h2({ class: "sheet-heading" }, "Actions"),
       WaypointButton(),
       DownloadButton(),
+      CanRestartButton(),
+      UpdateButton(),
       // Last of the doing-things sections and first of the reading-things ones,
       // because it is the only control here that causes traffic on the bike's bus
       // — worth a heading of its own rather than a third entry under "Actions".
@@ -111,8 +123,8 @@ function TripStats() {
     { class: "stats" },
     Stat("Distance", () => {
       chartTick.val;
-      const distance = distanceKm();
-      return distance == null ? "–" : `${distance.toFixed(1)} km`;
+      const travelledKm = distanceKm();
+      return travelledKm == null ? "–" : `${units.distance(travelledKm).toFixed(1)} ${units.distanceUnit()}`;
     }),
     Stat("Moving", () => {
       chartTick.val;
@@ -121,15 +133,15 @@ function TripStats() {
     Stat("Average", () => {
       chartTick.val;
       const average = averageMovingSpeedKmh();
-      return average == null ? "–" : `${average.toFixed(0)} km/h`;
+      return average == null ? "–" : `${units.speed(average).toFixed(0)} ${units.speedUnit()}`;
     }),
     Stat("Top", () => {
       chartTick.val;
-      return `${topSpeed().toFixed(0)} km/h`;
+      return `${units.speed(topSpeed()).toFixed(0)} ${units.speedUnit()}`;
     }),
     Stat("Altitude", () => {
-      const altitude = valueOf("gps_altitude_m");
-      return altitude == null ? "–" : `${Math.round(altitude)} m`;
+      const metres = valueOf("gps_altitude_m");
+      return metres == null ? "–" : `${Math.round(units.altitude(metres))} ${units.altitudeUnit()}`;
     }),
     Stat("Heading", () => compass(valueOf("gps_course_deg"))),
     Stat("Waypoints", () => {
@@ -211,9 +223,102 @@ function DownloadButton() {
   );
 }
 
+const canRestartMessage = van.state("");
+const canRestarting = van.state(false);
+
+/**
+ * Re-ups can0 when the CAN dot has gone red. POSTs to /can-restart, which runs the two
+ * `ip link` commands on the Pi; the result note reports what happened, since the bus
+ * coming back is not something this button can see from here — the CAN dot in the header
+ * is what confirms it a poll later.
+ */
+function CanRestartButton() {
+  return div(
+    button(
+      {
+        class: "action",
+        disabled: canRestarting,
+        onclick: async () => {
+          canRestarting.val = true;
+          canRestartMessage.val = "restarting…";
+          try {
+            const response = await fetch("/can-restart", { method: "POST" });
+            const reply = /** @type {CanRestartReply} */ (await response.json());
+            canRestartMessage.val = reply.message;
+          } catch (error) {
+            console.warn("can-restart: request failed", error);
+            canRestartMessage.val = "Restart request failed — is the Pi reachable?";
+          } finally {
+            canRestarting.val = false;
+          }
+        },
+      },
+      "🔄  CAN bus restart"
+    ),
+    () => (canRestartMessage.val ? div({ class: "action-note" }, canRestartMessage.val) : div())
+  );
+}
+
+const updateMessage = van.state("");
+const updating = van.state(false);
+
+/**
+ * Pulls the latest code on the Pi. POSTs to /update, which runs `git pull` and returns
+ * git's own output verbatim — that is the useful thing to show, since "Already up to
+ * date." and a summary of what changed are both worth reading. It then restarts the
+ * service so the new code takes effect, which drops this WebSocket; the store reconnects
+ * on its own once the service is back.
+ */
+function UpdateButton() {
+  return div(
+    button(
+      {
+        class: "action",
+        disabled: updating,
+        onclick: async () => {
+          updating.val = true;
+          updateMessage.val = "updating…";
+          try {
+            const response = await fetch("/update", { method: "POST" });
+            const reply = /** @type {UpdateReply} */ (await response.json());
+            updateMessage.val = reply.message;
+          } catch (error) {
+            console.warn("update: request failed", error);
+            updateMessage.val = "Update request failed — is the Pi reachable?";
+          } finally {
+            updating.val = false;
+          }
+        },
+      },
+      "⬆  Update"
+    ),
+    () => (updateMessage.val ? div({ class: "action-note" }, updateMessage.val) : div())
+  );
+}
+
 /** True while the bike is reporting at least one stored trouble code. */
 export function hasTroubleCodes() {
   return knownKeys.val.some(key => /^dtc_\d+_\d+$/.test(key) && (valueOf(key) ?? 0) > 0);
+}
+
+/**
+ * Metric/imperial as a two-button segmented control, reusing the same `.toggle-row`
+ * the charge screen's heatmap uses. `.on` tracks unitSystem, so it also reflects what
+ * a reload restored from localStorage.
+ */
+function UnitsToggle() {
+  return div(
+    { class: "toggle-row" },
+    .../** @type {const} */ (["metric", "imperial"]).map(system =>
+      button(
+        {
+          class: () => (units.unitSystem.val === system ? "on" : ""),
+          onclick: () => units.setUnitSystem(system),
+        },
+        system === "metric" ? "Metric · km, °C" : "Imperial · mi, °F"
+      )
+    )
+  );
 }
 
 /**

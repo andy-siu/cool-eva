@@ -5,6 +5,7 @@ import { chartTick, isStale, knownKeys, peek, valueOf } from "../lib/store.js";
 import { Fact, PairTile, STALE_MS, SectionLabel, SignalTile } from "../lib/tiles.js";
 import { heatmap, meter, ring } from "../lib/svg.js";
 import * as colors from "../lib/colors.js";
+import * as units from "../lib/units.js";
 import { power, whole } from "../lib/format.js";
 import { COOLANT_FLOW_LPH, coolantDelta, coolantHeatRemovedWatts, resistiveLossWatts } from "../lib/derive.js";
 import { chargeMode } from "../lib/charge-mode.js";
@@ -63,8 +64,8 @@ export function ChargeView() {
     PairTile({
       label: "Pack temp",
       keys: ["batt_temp_lo", "batt_temp_hi"],
-      format: value => value.toFixed(0),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(0),
+      unit: units.tempUnit,
       color: colors.temperature,
       caption: "min / max across the pack",
       chart: true,
@@ -73,8 +74,8 @@ export function ChargeView() {
     SignalTile({
       key: "coolant_out",
       label: "Coolant out",
-      format: value => value.toFixed(1),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(1),
+      unit: units.tempUnit,
       color: colors.temperature,
       chart: true,
       minSpan: 2,
@@ -377,9 +378,10 @@ function DerateTile() {
         if (left == null) {
           return "–";
         }
-        return left <= 0 ? "throttled" : `${left.toFixed(0)}`;
+        // Degrees remaining below the knee — a temperature difference, so tempDelta.
+        return left <= 0 ? "throttled" : `${units.tempDelta(left).toFixed(0)}`;
       },
-      () => span({ class: "unit" }, (headroom() ?? 1) <= 0 ? "" : "°C to go")
+      () => span({ class: "unit" }, (headroom() ?? 1) <= 0 ? "" : `${units.tempUnit()} to go`)
     ),
     () => {
       const hot = valueOf("batt_temp_hi");
@@ -391,10 +393,12 @@ function DerateTile() {
     },
     div({ class: "sub" }, () => {
       const hot = valueOf("batt_temp_hi");
+      const kneeText = `${Math.round(units.temp(DERATE_KNEE_C))} ${units.tempUnit()}`;
       if (hot == null) {
-        return `pack temperature not established yet · the VCU starts throttling at ${DERATE_KNEE_C} °C`;
+        return `pack temperature not established yet · the VCU starts throttling at ${kneeText}`;
       }
-      return `hottest cell ${hot.toFixed(0)} °C · BMS reports a flat 35 °C to the VCU until ${DERATE_KNEE_C} °C, then the truth`;
+      const flatText = `${Math.round(units.temp(35))} ${units.tempUnit()}`;
+      return `hottest cell ${units.temp(hot).toFixed(0)} ${units.tempUnit()} · BMS reports a flat ${flatText} to the VCU until ${kneeText}, then the truth`;
     })
   );
 }
@@ -441,7 +445,8 @@ function ThermalBalanceTile() {
     },
     div({ class: "sub" }, () => {
       const delta = coolantDelta();
-      const deltaText = delta == null ? "no coolant probes" : `coolant ΔT ${delta.toFixed(2)} °C`;
+      const deltaText =
+        delta == null ? "no coolant probes" : `coolant ΔT ${units.tempDelta(delta).toFixed(2)} ${units.tempUnit()}`;
       return `${deltaText} · out assumes the pump's rated ${COOLANT_FLOW_LPH} L/h`;
     })
   );

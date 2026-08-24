@@ -110,6 +110,15 @@ body {
 .dot.connecting {
   background: #facc15;
 }
+.dot.up {
+  background: var(--good);
+}
+.dot.down {
+  background: var(--bad);
+}
+.dot.unknown {
+  background: var(--label);
+}
 
 /* ---------- layout ---------- */
 

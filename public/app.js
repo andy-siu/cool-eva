@@ -88,10 +88,31 @@ function Header() {
     span({ class: "brand" }, "Cool Eva"),
     div(
       { class: "status" },
+      span({ class: () => `dot ${canDotState()}` }),
+      span("CAN"),
       span({ class: () => `dot ${connection.val}` }),
       span(() => (connection.val === "live" ? "live" : connection.val === "connecting" ? "connecting" : "offline"))
     )
   );
+}
+
+/**
+ * The CAN interface dot's state: green when can0 is up, red when it is down, grey when
+ * we can't say. "Can't say" is not only "no reading yet" — while the WebSocket is not
+ * live the `can_link` value is frozen at whatever last arrived, so the honest answer is
+ * unknown, the same way isStale() greys every tile out. The live dot beside this one is
+ * what reports the WebSocket itself.
+ * @returns {"up" | "down" | "unknown"}
+ */
+function canDotState() {
+  if (connection.val !== "live") {
+    return "unknown";
+  }
+  const reading = signalState("can_link").val;
+  if (!reading) {
+    return "unknown";
+  }
+  return reading.value === 1 ? "up" : "down";
 }
 
 function TabBar() {
