@@ -5,6 +5,8 @@ import { handleDownloadEndpoint } from "./http/download.ts";
 import { loadStaticFiles } from "./http/static.ts";
 import { handleWaypointEndpoint } from "./http/waypoint.ts";
 import { handleStatusEndpoint } from "./http/status.ts";
+import { handleCanRestartEndpoint } from "./http/can-restart.ts";
+import { handleUpdateEndpoint } from "./http/update.ts";
 import { handleDtcTableEndpoint } from "./http/dtc-table.ts";
 import { handleFaultInfokeysEndpoint } from "./http/fault-infokeys.ts";
 import { handleStoredDtcsEndpoint } from "./http/stored-dtcs.ts";
@@ -27,6 +29,7 @@ import { defineSignals, record } from "./can/signals.ts";
 import { SIGNALS } from "./can/registry.ts";
 import { startCoolantSensors } from "./sensors/max31865.ts";
 import { bringUpCan, openChannel } from "./can/socket.ts";
+import { startCanLinkMonitor } from "./can/link-status.ts";
 import { decodeFrame, STREAM_IDS } from "./can/decode.ts";
 import { configurePackTemperature, resolvePackTemperatures } from "./can/pack-temperature.ts";
 import { initObd, isObdResponse, handleResponse, startObdPoller } from "./can/obd.ts";
@@ -46,6 +49,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const PORT = 80;
 const CAN_IFACE = "can0";
+// Where the menu's "Update" button runs `git pull`: this checkout, wherever it is.
+// ROOT is derived from the running file's own path, so it is the right directory
+// whatever it is named — CLAUDE.md notes an existing Pi kept the pre-rename name.
+const UPDATE_DIR = process.env.UPDATE_DIR ?? ROOT;
 
 // Config (env overrides). README's Configuration section is the full table; this indexes it:
 //   COOLANT_ENABLED=0 → skip the MAX31865 probes (a bike with no watercooling loop)
@@ -331,6 +338,11 @@ if (CAN_ENABLED) {
   console.log("can: disabled (CAN_ENABLED=0)");
 }
 
+// Polled regardless of CAN_ENABLED: the dashboard's CAN dot should show the interface's
+// real state, and a bike running coolant-only still answers `ip link` (as down, or with
+// no such device — both surface as red).
+const canLinkMonitor = startCanLinkMonitor(CAN_IFACE);
+
 // --- Bluetooth: Connectivity Hub (torque/power, odometer, vehicle state, GPS) ---
 let bleClient: BleClient | undefined;
 
@@ -371,6 +383,18 @@ const server = createServer(async (req, res) => {
   }
   if (url.pathname === "/status") {
     await handleStatusEndpoint(res, RIDE_LOG_DIR, rideLogEnabled);
+    return;
+  }
+  // Re-up can0 after the link has dropped — the "CAN bus restart" recovery button on
+  // the menu sheet. Reconfigures the Pi's own interface; never touches the bike's bus.
+  if (url.pathname === "/can-restart") {
+    await handleCanRestartEndpoint(req, res, CAN_IFACE);
+    return;
+  }
+  // `git pull` the checkout on the Pi — the menu's "Update" button. Does not restart
+  // the service; new code lands on the next `systemctl restart cool-eva`.
+  if (url.pathname === "/update") {
+    await handleUpdateEndpoint(req, res, UPDATE_DIR);
     return;
   }
   if (url.pathname === "/dtc-table") {
@@ -455,6 +479,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true;
   console.log("\nShutting down…");
   stopObd?.();
+  canLinkMonitor.stop();
   void bleClient?.stop();
   // A sweep in flight is stopped rather than left to be killed with the process:
   // aborting settles the request in flight, stops the client transmitting, and

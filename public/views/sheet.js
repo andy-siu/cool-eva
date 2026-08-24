@@ -17,6 +17,8 @@ const { button, div, h2 } = van.tags;
 // looking at at speed, and all of it is worth having when you stop.
 
 /** @typedef {import("../../src/http/status.ts").StatusPayload} StatusPayload */
+/** @typedef {import("../../src/http/can-restart.ts").CanRestartReply} CanRestartReply */
+/** @typedef {import("../../src/http/update.ts").UpdateReply} UpdateReply */
 
 export const sheetOpen = van.state(false);
 
@@ -73,12 +75,15 @@ export function Sheet() {
       TripStats(),
       // No subtitle here, deliberately. Three sections carrying a one-line "what can
       // this do to the bike" was one sentence too many for a single bit of
-      // information: both controls in this one are in the grey tier, which says the
+      // information: the controls in this one are in the grey tier, which says the
       // same thing without a sentence. The two that keep a subtitle are the two
-      // either side of the read/write boundary, where the bit is not obvious.
+      // either side of the read/write boundary, where the bit is not obvious. The CAN
+      // restart is grey-tier too: it re-ups the Pi's own interface, not the bike.
       h2({ class: "sheet-heading" }, "Actions"),
       WaypointButton(),
       DownloadButton(),
+      CanRestartButton(),
+      UpdateButton(),
       // Last of the doing-things sections and first of the reading-things ones,
       // because it is the only control here that causes traffic on the bike's bus
       // — worth a heading of its own rather than a third entry under "Actions".
@@ -215,6 +220,78 @@ function DownloadButton() {
     // private key, but /dl authenticates nobody, so the ciphertext is pullable by
     // anyone on that wifi (src/http/download.ts, and README "What this does and
     // doesn't hide").
+  );
+}
+
+const canRestartMessage = van.state("");
+const canRestarting = van.state(false);
+
+/**
+ * Re-ups can0 when the CAN dot has gone red. POSTs to /can-restart, which runs the two
+ * `ip link` commands on the Pi; the result note reports what happened, since the bus
+ * coming back is not something this button can see from here — the CAN dot in the header
+ * is what confirms it a poll later.
+ */
+function CanRestartButton() {
+  return div(
+    button(
+      {
+        class: "action",
+        disabled: canRestarting,
+        onclick: async () => {
+          canRestarting.val = true;
+          canRestartMessage.val = "restarting…";
+          try {
+            const response = await fetch("/can-restart", { method: "POST" });
+            const reply = /** @type {CanRestartReply} */ (await response.json());
+            canRestartMessage.val = reply.message;
+          } catch (error) {
+            console.warn("can-restart: request failed", error);
+            canRestartMessage.val = "Restart request failed — is the Pi reachable?";
+          } finally {
+            canRestarting.val = false;
+          }
+        },
+      },
+      "🔄  CAN bus restart"
+    ),
+    () => (canRestartMessage.val ? div({ class: "action-note" }, canRestartMessage.val) : div())
+  );
+}
+
+const updateMessage = van.state("");
+const updating = van.state(false);
+
+/**
+ * Pulls the latest code on the Pi. POSTs to /update, which runs `git pull` and returns
+ * git's own output verbatim — that is the useful thing to show, since "Already up to
+ * date." and a summary of what changed are both worth reading. It does not restart the
+ * service; the new code takes effect on the next restart.
+ */
+function UpdateButton() {
+  return div(
+    button(
+      {
+        class: "action",
+        disabled: updating,
+        onclick: async () => {
+          updating.val = true;
+          updateMessage.val = "updating…";
+          try {
+            const response = await fetch("/update", { method: "POST" });
+            const reply = /** @type {UpdateReply} */ (await response.json());
+            updateMessage.val = reply.message;
+          } catch (error) {
+            console.warn("update: request failed", error);
+            updateMessage.val = "Update request failed — is the Pi reachable?";
+          } finally {
+            updating.val = false;
+          }
+        },
+      },
+      "⬆  Update"
+    ),
+    () => (updateMessage.val ? div({ class: "action-note" }, updateMessage.val) : div())
   );
 }
 
