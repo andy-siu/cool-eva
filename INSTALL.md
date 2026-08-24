@@ -177,9 +177,20 @@ Notes:
 
 ---
 
-10. Setting up config file for cool-eva On my raspberry pi vi /etc/environment COOLANT_ENABLED=0 BLE_MAC=<mac address> SERVICE_WRITE_ENABLED=1 CUSTOM_BMS_CONFIG=0
+10. Setting up config file for cool-eva 
+On my raspberry pi 
+vi /etc/environment 
+COOLANT_ENABLED=0 
+BLE_MAC=<mac address> 
+SERVICE_WRITE_ENABLED=1 
+CUSTOM_BMS_CONFIG=0
 
-11. QUICK TIPS on bringing can back online. IF you are troubleshooting and rebooted the pi but the can0 interface looks down. you need to bring it back up manually or reboot the bike. ip -details link show can0 ip link set can0 type can bitrate 500000 ip link set can0 up ip -details link show can0
+11. QUICK TIPS on bringing can back online. 
+IF you are troubleshooting and rebooted the pi but the can0 interface looks down. you need to bring it back up manually or reboot the bike. 
+ip -details link show can0 
+ip link set can0 type can bitrate 500000 
+ip link set can0 up 
+ip -details link show can0
 
 12. Optional: Grafana on the laptop (post-ride analysis)
 
