@@ -4,6 +4,7 @@ import van from "../vendor/van-1.6.1.js";
 import { chartTick, knownKeys, valueOf } from "../lib/store.js";
 import { averageMovingSpeedKmh, distanceKm, movingTimeSeconds, topSpeed } from "../lib/trip.js";
 import { bytes, compass, duration } from "../lib/format.js";
+import * as units from "../lib/units.js";
 import { saveWaypoint } from "../lib/waypoint.js";
 import { ServiceMode, refreshServiceMode } from "./service-mode.js";
 
@@ -64,6 +65,12 @@ export function Sheet() {
       // docs/dashboard-decisions.md §"The menu sheet".
       h2({ class: "sheet-heading" }, "This session"),
       TripStats(),
+      // The one preference this dashboard has. It sits here, above the stats it
+      // changes, rather than in the header — nothing about it is worth reaching for at
+      // speed, and the trip stats right above flip as you tap it so the effect is in
+      // view. Persisted in lib/units.js.
+      h2({ class: "sheet-heading" }, "Units"),
+      UnitsToggle(),
       // No subtitle here, deliberately. Three sections carrying a one-line "what can
       // this do to the bike" was one sentence too many for a single bit of
       // information: both controls in this one are in the grey tier, which says the
@@ -111,8 +118,8 @@ function TripStats() {
     { class: "stats" },
     Stat("Distance", () => {
       chartTick.val;
-      const distance = distanceKm();
-      return distance == null ? "–" : `${distance.toFixed(1)} km`;
+      const travelledKm = distanceKm();
+      return travelledKm == null ? "–" : `${units.distance(travelledKm).toFixed(1)} ${units.distanceUnit()}`;
     }),
     Stat("Moving", () => {
       chartTick.val;
@@ -121,15 +128,15 @@ function TripStats() {
     Stat("Average", () => {
       chartTick.val;
       const average = averageMovingSpeedKmh();
-      return average == null ? "–" : `${average.toFixed(0)} km/h`;
+      return average == null ? "–" : `${units.speed(average).toFixed(0)} ${units.speedUnit()}`;
     }),
     Stat("Top", () => {
       chartTick.val;
-      return `${topSpeed().toFixed(0)} km/h`;
+      return `${units.speed(topSpeed()).toFixed(0)} ${units.speedUnit()}`;
     }),
     Stat("Altitude", () => {
-      const altitude = valueOf("gps_altitude_m");
-      return altitude == null ? "–" : `${Math.round(altitude)} m`;
+      const metres = valueOf("gps_altitude_m");
+      return metres == null ? "–" : `${Math.round(units.altitude(metres))} ${units.altitudeUnit()}`;
     }),
     Stat("Heading", () => compass(valueOf("gps_course_deg"))),
     Stat("Waypoints", () => {
@@ -214,6 +221,26 @@ function DownloadButton() {
 /** True while the bike is reporting at least one stored trouble code. */
 export function hasTroubleCodes() {
   return knownKeys.val.some(key => /^dtc_\d+_\d+$/.test(key) && (valueOf(key) ?? 0) > 0);
+}
+
+/**
+ * Metric/imperial as a two-button segmented control, reusing the same `.toggle-row`
+ * the charge screen's heatmap uses. `.on` tracks unitSystem, so it also reflects what
+ * a reload restored from localStorage.
+ */
+function UnitsToggle() {
+  return div(
+    { class: "toggle-row" },
+    .../** @type {const} */ (["metric", "imperial"]).map(system =>
+      button(
+        {
+          class: () => (units.unitSystem.val === system ? "on" : ""),
+          onclick: () => units.setUnitSystem(system),
+        },
+        system === "metric" ? "Metric · km, °C" : "Imperial · mi, °F"
+      )
+    )
+  );
 }
 
 /**

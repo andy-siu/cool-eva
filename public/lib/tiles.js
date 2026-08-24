@@ -63,7 +63,8 @@ function trace(key, color, chartWindowMs, minSpan) {
  * @param {object} options
  * @param {string} options.label
  * @param {() => string} options.value
- * @param {string} [options.unit]
+ * @param {string | (() => string)} [options.unit] a bare label, or a function of it for
+ *   a unit that changes at runtime — the metric/imperial toggle passes the latter
  * @param {() => string} [options.sub]
  * @param {() => string} [options.color]
  * @param {string} [options.className]
@@ -90,7 +91,7 @@ export function Tile({ label, value, unit = "", sub, color, className = "", extr
  * @param {string} options.key
  * @param {string} options.label
  * @param {(value: number) => string} options.format
- * @param {string} [options.unit]
+ * @param {string | (() => string)} [options.unit]
  * @param {(value: number | null) => string} [options.color]
  * @param {() => string} [options.sub]
  * @param {string} [options.className]
@@ -166,7 +167,7 @@ export function SignalTile({
  * @param {string} options.label
  * @param {[string, string]} options.keys
  * @param {(value: number) => string} options.format
- * @param {string} [options.unit]
+ * @param {string | (() => string)} [options.unit]
  * @param {(value: number | null) => string} [options.color]
  * @param {string} [options.caption]
  * @param {string} [options.className]

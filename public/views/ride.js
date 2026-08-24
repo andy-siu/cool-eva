@@ -8,6 +8,7 @@ import { coolantDelta, remainingWh, resistiveLossPercent, resistiveLossWatts } f
 import { PairTile, SectionLabel, SignalTile, Tile } from "../lib/tiles.js";
 import { meter, sparkline, splitBar } from "../lib/svg.js";
 import * as colors from "../lib/colors.js";
+import * as units from "../lib/units.js";
 import { power, whole } from "../lib/format.js";
 
 const { div, span } = van.tags;
@@ -32,8 +33,8 @@ export function RideView() {
     PairTile({
       label: "Battery",
       keys: ["batt_temp_lo", "batt_temp_hi"],
-      format: value => value.toFixed(0),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(0),
+      unit: units.tempUnit,
       color: colors.temperature,
       caption: "min / max",
       className: "span2",
@@ -41,8 +42,8 @@ export function RideView() {
     PairTile({
       label: "Coolant",
       keys: ["coolant_in", "coolant_out"],
-      format: value => value.toFixed(1),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(1),
+      unit: units.tempUnit,
       color: colors.temperature,
       caption: "in / out",
       className: "span2",
@@ -50,8 +51,8 @@ export function RideView() {
     SignalTile({
       key: "bike_coolant_temp",
       label: "Motor",
-      format: value => value.toFixed(0),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(0),
+      unit: units.tempUnit,
       color: colors.temperature,
       chart: true,
       minSpan: 5,
@@ -59,8 +60,8 @@ export function RideView() {
     SignalTile({
       key: "ambient_temp",
       label: "Ambient",
-      format: value => value.toFixed(0),
-      unit: "°C",
+      format: value => units.temp(value).toFixed(0),
+      unit: units.tempUnit,
       color: colors.temperature,
     }),
     SectionLabel("Energy"),
@@ -68,8 +69,8 @@ export function RideView() {
     SignalTile({
       key: "range_km",
       label: "Range",
-      format: value => value.toFixed(0),
-      unit: "km",
+      format: value => units.distance(value).toFixed(0),
+      unit: units.distanceUnit,
       color: () => colors.CALM,
     })
   );
@@ -88,9 +89,9 @@ function SpeedHero() {
       { class: "hero-value" },
       () => {
         const gps = signalState("gps_speed_kmh").val;
-        return gps ? String(Math.round(gps.value)) : "–";
+        return gps ? String(Math.round(units.speed(gps.value))) : "–";
       },
-      span({ class: "hero-unit" }, "km/h")
+      span({ class: "hero-unit" }, units.speedUnit)
     ),
     div({ class: "sub" }, () => {
       // 0x104 at 0.5 km/h beats the OBD PID's whole km/h, and arrives whether or
@@ -101,11 +102,13 @@ function SpeedHero() {
         return "GPS · no wheel speed";
       }
       if (gps == null) {
-        return `wheel ${Math.round(wheel)} km/h · no GPS fix`;
+        return `wheel ${Math.round(units.speed(wheel))} ${units.speedUnit()} · no GPS fix`;
       }
-      const error = wheel - gps;
+      // The error is a difference of two speeds, so it converts by the same factor as a
+      // speed — no offset — and speed() applied to the difference gives exactly that.
+      const error = units.speed(wheel) - units.speed(gps);
       const sign = error >= 0 ? "+" : "−";
-      return `GPS · wheel reads ${Math.round(wheel)} (${sign}${Math.abs(error).toFixed(0)})`;
+      return `GPS · wheel reads ${Math.round(units.speed(wheel))} (${sign}${Math.abs(error).toFixed(0)})`;
     })
   );
 }
@@ -165,9 +168,9 @@ function CoolantDeltaTile() {
       { class: "value", style: () => `color:${deltaColor()}` },
       () => {
         const delta = coolantDelta();
-        return delta == null ? "–" : delta.toFixed(2);
+        return delta == null ? "–" : units.tempDelta(delta).toFixed(2);
       },
-      span({ class: "unit" }, "°C")
+      span({ class: "unit" }, units.tempUnit)
     ),
     () => {
       chartTick.val;
