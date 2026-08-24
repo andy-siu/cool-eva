@@ -439,7 +439,12 @@ const server = createServer(async (req, res) => {
 
 const ws = setupWs(server);
 
-server.listen(PORT, () => {
+// Bind the IPv4 wildcard explicitly. With the host omitted, Node binds the IPv6
+// wildcard `::`, and on the Pi that listens on tcp6 only (netstat shows `:::80`, no
+// `0.0.0.0:80`) — so the phone, which reaches the bike by its IPv4 wifi address, gets
+// no route in. IPv4 is the whole reachability story here (garage wifi, Grafana), so
+// bind it directly rather than relying on dual-stack, which is what left it tcp6-only.
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`HTTP + WebSocket server on http://0.0.0.0:${PORT}`);
 });
 
