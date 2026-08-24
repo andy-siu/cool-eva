@@ -391,8 +391,8 @@ const server = createServer(async (req, res) => {
     await handleCanRestartEndpoint(req, res, CAN_IFACE);
     return;
   }
-  // `git pull` the checkout on the Pi — the menu's "Update" button. Does not restart
-  // the service; new code lands on the next `systemctl restart cool-eva`.
+  // `git pull` the checkout on the Pi — the menu's "Update" button — then restart the
+  // service so the new code takes effect.
   if (url.pathname === "/update") {
     await handleUpdateEndpoint(req, res, UPDATE_DIR);
     return;

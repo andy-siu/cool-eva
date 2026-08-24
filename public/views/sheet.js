@@ -265,8 +265,9 @@ const updating = van.state(false);
 /**
  * Pulls the latest code on the Pi. POSTs to /update, which runs `git pull` and returns
  * git's own output verbatim — that is the useful thing to show, since "Already up to
- * date." and a summary of what changed are both worth reading. It does not restart the
- * service; the new code takes effect on the next restart.
+ * date." and a summary of what changed are both worth reading. It then restarts the
+ * service so the new code takes effect, which drops this WebSocket; the store reconnects
+ * on its own once the service is back.
  */
 function UpdateButton() {
   return div(

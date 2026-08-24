@@ -52,12 +52,21 @@ sudo apt-get install -y build-essential python3 git
 
 ## 3. Get the code
 
-Deploy convention is a git checkout at `/home/pi/cool-eva`:
+Deploy convention is a git checkout at `/home/pi/cool-eva`, owned by `pi`:
 
 ```sh
 git clone <this-repo-url> /home/pi/cool-eva
 cd /home/pi/cool-eva
 ```
+
+**SSH deploy key (needed for the dashboard's Update button).** With an SSH remote (`git@github.com:…`), a `git pull` needs a key GitHub accepts. The service runs as **root**, but the Update button pulls with `HOME=/home/pi` so it uses `pi`'s key, config and `known_hosts` — so put the deploy key in `pi`'s `~/.ssh` and confirm it works as `pi`:
+
+```sh
+# generate a key if there isn't one, add the .pub as a deploy key on GitHub, then:
+sudo -u pi git -C /home/pi/cool-eva ls-remote origin   # must succeed, not "Permission denied (publickey)"
+```
+
+(If you'd rather not use SSH, point `origin` at the HTTPS URL — only anonymous-friendly for a public repo.)
 
 ## 4. Install dependencies
 
@@ -160,6 +169,10 @@ Networking note (from README): the intended setup is the Pi joining a phone's ho
 Endpoints: `/dl` (sealed ride-log download), `/waypoint` (Siri shortcut), `/status`, `/vcu-params` + `/params.html` (last VCU-param snapshot, never touches bus).
 
 ## 9. Deploying updates later
+
+The dashboard menu's **Update** button does this for you: it runs `git pull` in `/home/pi/cool-eva` (as root, using `pi`'s SSH key — see §3), shows git's output, then restarts the service so the new code takes effect. The WebSocket drops on restart and the dashboard reconnects on its own. It does **not** run `npm install`, so use it only for code changes.
+
+By hand (or when a dependency changed):
 
 ```sh
 cd /home/pi/cool-eva
