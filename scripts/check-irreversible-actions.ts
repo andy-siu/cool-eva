@@ -188,6 +188,9 @@ const UNCONFIRMED: Record<string, URLSearchParams> = {
   // Complete: it carries the amps. Missing only the confirm, so the server refuses it
   // FOR the confirmation — which is what §3c reads off it.
   "charge-current": new URLSearchParams({ action: "charge-current", amps: "6" }),
+  // Complete on its own — stop takes no fields. Missing only the confirm, so it too is
+  // refused FOR the confirmation.
+  "charge-stop": new URLSearchParams({ action: "charge-stop" }),
 };
 
 const unknown = accepted.filter(action => UNCONFIRMED[action] === undefined);
@@ -237,7 +240,10 @@ const behindTheFold: string[] = IRREVERSIBLE.map(entry => entry.action);
 // weight of decision as adding to the fold: an action here is one a reviewer has agreed is
 // reversible. An action that is confirm-gated, absent from the fold AND absent here is
 // still the hard failure §3b was built to catch — the exemption is explicit, never a gap.
-const REVERSIBLE_CONFIRMED = new Set(["charge-current"]);
+// charge-stop joins for the same reason: it is confirm-gated (curl can reach the endpoint, so a
+// deliberate word is required), but ending a charge undoes itself — the rider simply re-plugs or
+// restarts the charge on the bike's own screen. Behind a "cannot be undone" fold that row would lie.
+const REVERSIBLE_CONFIRMED = new Set(["charge-current", "charge-stop"]);
 
 const gatedNotHidden = gated.filter(action => !behindTheFold.includes(action) && !REVERSIBLE_CONFIRMED.has(action));
 check(
@@ -289,6 +295,16 @@ check(
     ? "charge-current is accepted with confirm=charge-current-<amps>"
     : `charge-current is REFUSED with its own confirmation — ${chargeAnswer.reason}`,
   chargeAnswer.ok
+);
+
+const stopConfirmed = new URLSearchParams(UNCONFIRMED["charge-stop"]);
+stopConfirmed.set("confirm", "charge-stop");
+const stopAnswer = parseWriteRequest(stopConfirmed, NOW);
+check(
+  stopAnswer.ok
+    ? "charge-stop is accepted with confirm=charge-stop"
+    : `charge-stop is REFUSED with its own confirmation — ${stopAnswer.reason}`,
+  stopAnswer.ok
 );
 
 // --- 4. The confirmations the page really sends ------------------------------

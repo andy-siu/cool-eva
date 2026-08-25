@@ -1,9 +1,17 @@
 // @ts-check
 
 import van from "../vendor/van-1.6.1.js";
-import { isStale, valueOf } from "../lib/store.js";
 import { GOOD, MUTED, WARN, WATCH } from "../lib/colors.js";
 import { arm, armDwellElapsed, armed, refuseKeyRepeat } from "../lib/arming.js";
+import {
+  fetchChargeWriteStatus,
+  liveCeiling,
+  liveChargeType,
+  onChargeSessionEnd,
+  sessionLive,
+  writeStatus,
+  writesEnabled,
+} from "../lib/charge-write.js";
 
 const { button, div, input } = van.tags;
 
@@ -26,30 +34,6 @@ const { button, div, input } = van.tags;
 
 /** @typedef {import("../../src/http/vcu-write.ts").VcuWriteResponse} VcuWriteResponse */
 
-/**
- * How stale charge_manager_state may be before this treats the session as gone. Matches the
- * Pi's own CHARGE_SESSION_MAX_AGE_MS in src/vcu/write-runner.ts, so the control and the server
- * agree on when there is a live charge to command into.
- */
-const CHARGE_SESSION_MAX_AGE_MS = 5000;
-
-/**
- * charge_manager_state (0x610 b7) settled values: 0x02 AC, 0x23 DC. ⚠️ Session presence and the
- * AC/DC label ride on THIS, not charge_type — charge_type flaps 1↔0 within one plug-in as the
- * charger pauses delivery (docs/charge-manager.md), which is exactly what made this tile vanish
- * mid-session. charge_manager_state holds steady for the whole session.
- */
-const CHARGE_MANAGER_STATE_AC = 0x02;
-const CHARGE_MANAGER_STATE_DC = 0x23;
-
-/** The last /vcu-write status this control fetched — the gate, and whether writing is on at all. */
-const writeStatus = van.state(/** @type {VcuWriteResponse | null} */ (null));
-/**
- * Whether a charge session is live right now, driven off charge_manager_state by the derive
- * below. ⚠️ A van.state — NOT an isStale() call in the render — so the tile's visibility binding
- * does not subscribe to serverTime; were it to, it would re-run ~20 Hz and recreate the <input>.
- */
-const sessionLive = van.state(false);
 /** What the owner typed, as text so an empty box is distinct from a zero. */
 const amps = van.state("");
 const busy = van.state(false);
@@ -59,32 +43,10 @@ const message = van.state("");
 /** The last command's outcome, shown against the amps it was for. */
 const lastResult = van.state(/** @type {{ amps: number, succeeded: boolean } | null} */ (null));
 
-// The status fetch is lazy: nothing polls /vcu-write for a phone that is not charging, so the
-// read-only screen stays a pure WebSocket consumer. This derive tracks the live session off
-// charge_manager_state, fetches the gate once when a charge begins, and clears when it ends.
-//
-// ⚠️ This derive DELIBERATELY subscribes to serverTime (via liveChargeType → isStale), because
-// the cable coming out is a staleness event with no value change and nothing else would notice
-// it. It is the one place allowed to: it feeds the sessionLive STATE, and the tile's render reads
-// that state — so the render never subscribes to serverTime and the <input> is never recreated
-// under it. Cheap per tick (an equality check); the fetch fires only on the session edge.
-let lastLive = false;
-van.derive(() => {
-  const live = liveChargeType() !== null;
-  sessionLive.val = live;
-  if (live === lastLive) {
-    return;
-  }
-  lastLive = live;
-  if (live) {
-    void fetchChargeWriteStatus();
-  } else {
-    // A charge that ended tells us nothing about the next one's gate, and a stale "enabled"
-    // left on screen would render the control against a session that is over.
-    writeStatus.val = null;
-    forgetCommand();
-  }
-});
+// The form clears when the charge ends — a new session starts blank. Session tracking, the lazy
+// status fetch and the live AC/DC/ceiling reads all live in ../lib/charge-write.js, shared with
+// the stop control.
+onChargeSessionEnd(forgetCommand);
 
 export const ARMED_KEY = "charge-current";
 
@@ -255,39 +217,11 @@ function Outcome() {
 function commandable() {
   // Writes on for this Pi, plus a live session with a known ceiling. ⚠️ NOT gate.safe — the
   // stationary service gate does not apply to a charging operation (see the file header).
-  if (writeStatus.val?.status?.enabled !== true) {
+  if (!writesEnabled()) {
     return false;
   }
   const type = liveChargeType();
   return type !== null && liveCeiling(type) !== null;
-}
-
-/**
- * The charge source right now, or null when there is no settled session to command into.
- *
- * ⚠️ Reads charge_manager_state (0x610 b7: 0x02 AC, 0x23 DC), NOT charge_type — charge_type flaps
- * 1↔0 mid-session as current pauses (docs/charge-manager.md). charge_manager_state is the cleanest
- * AC/DC discriminator and holds steady across the pauses. Staleness-checked the same way the Pi
- * does, so a page open during a charge that has since ended will not command into a gone session.
- * @returns {"ac" | "dc" | null}
- */
-function liveChargeType() {
-  if (isStale("charge_manager_state", CHARGE_SESSION_MAX_AGE_MS)) {
-    return null;
-  }
-  const state = valueOf("charge_manager_state");
-  return state === CHARGE_MANAGER_STATE_AC ? "ac" : state === CHARGE_MANAGER_STATE_DC ? "dc" : null;
-}
-
-/**
- * The ceiling the command's b4 will carry, from the same live signal the Pi echoes: the
- * dash's own last AC ceiling, or the always-broadcast DC maximum.
- * @param {"ac" | "dc"} type
- * @returns {number | null}
- */
-function liveCeiling(type) {
-  const ceiling = valueOf(type === "ac" ? "ac_charge_ceiling_a" : "fast_dc_limit_max_a");
-  return ceiling == null ? null : ceiling;
 }
 
 /** The typed amps as a whole number in range, or null. The Pi validates again against the live ceiling. */
@@ -378,20 +312,4 @@ async function performChargeCurrent() {
     return;
   }
   lastResult.val = { amps: value, succeeded: payload.result.succeeded };
-}
-
-/** GETs the enabled flag (and the rest of the status). Read-only; touches nothing on the bike. */
-async function fetchChargeWriteStatus() {
-  try {
-    const response = await fetch("/vcu-write", { cache: "no-store" });
-    const payload = /** @type {VcuWriteResponse} */ (await response.json());
-    // Disarmed before the new status lands: writes switched off across the refresh must not
-    // leave a primed button behind.
-    armed.val = "";
-    writeStatus.val = payload;
-  } catch (error) {
-    // Loud, but not fatal to the read-only screen: a failed status fetch simply leaves the
-    // control hidden (its render requires enabled === true), which is the safe direction.
-    console.warn("charge-current: status fetch failed", error);
-  }
 }

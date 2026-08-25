@@ -29,6 +29,8 @@ export type AuditAction =
   | "rtc-sync"
   /** A charge-current-limit command on 0x121. Fire-and-forget, so recorded like rtc-sync. */
   | "charge-current"
+  /** A stop-charging command — the 0x120 + 0x121 Mode-stop pair. Fire-and-forget, recorded like charge-current. */
+  | "charge-stop"
   /** Reading the last-service block. Read-only, but recorded because it is the before-picture of the routine. */
   | "read-service-stamp";
 

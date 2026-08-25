@@ -26,6 +26,7 @@ import type { ServiceWriteRequest, ServiceWriteResult, VcuWriteRunner, VcuWriteS
 //   clear-dtcs         confirm=clear-dtcs
 //   sync-clock         confirm=<the UTC minute the caller displayed, ISO>
 //   charge-current     amps=<whole amps>  confirm=charge-current-<amps>
+//   charge-stop        confirm=charge-stop
 //
 // The clock one is not ceremony — it is the server-side half of "Is it <date and
 // time>?", so a page left open since this morning cannot sync this morning's time.
@@ -202,10 +203,20 @@ export function parseWriteRequest(
       }
       return { ok: true, request: { kind: "charge-current", amps } };
     }
+    case "charge-stop":
+      // Stopping actuates the bike's charging (the benign direction — it ends a charge), so it
+      // carries the same one-word confirm the two-tap UI sends but curl must state deliberately.
+      if (params.get("confirm") !== "charge-stop") {
+        return {
+          ok: false,
+          reason: "Stopping the charge actuates the bike's charging. Pass confirm=charge-stop.",
+        };
+      }
+      return { ok: true, request: { kind: "charge-stop" } };
     default:
       return {
         ok: false,
-        reason: `action must be one of parameter, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs, charge-current — not ${action ?? "(nothing)"}`,
+        reason: `action must be one of parameter, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs, charge-current, charge-stop — not ${action ?? "(nothing)"}`,
       };
   }
 }

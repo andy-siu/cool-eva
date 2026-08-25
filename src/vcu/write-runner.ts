@@ -13,6 +13,7 @@ import {
   clearStoredDtcs,
   readServiceStamp,
   sendChargeCommand,
+  sendChargeStopCommand,
   setServicePoint,
   syncBikeClock,
   writeParameter,
@@ -74,7 +75,13 @@ export type ServiceWriteRequest =
    * chosen from the LIVE charge type here, not by the caller — so a stale page cannot frame a
    * DC command into an AC session. Transient and rider-overridable; refused unless charging.
    */
-  | { kind: "charge-current"; amps: number };
+  | { kind: "charge-current"; amps: number }
+  /**
+   * Stop an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+   * Source-agnostic — the same pair ends AC and DC — so it carries no fields; the only
+   * precondition is a live session, checked off charge_manager_state like charge-current.
+   */
+  | { kind: "charge-stop" };
 
 /** How an action came out, in the shape the page renders. */
 export interface ServiceWriteResult {
@@ -393,16 +400,18 @@ async function checkPreconditions(
         "the bus is listen-only (OBD_ENABLED=0) — nothing can be transmitted, so a write would silently do nothing",
     };
   }
-  // ⚠️ charge-current is EXEMPT from the stationary gate, and this is a deliberate exemption,
-  // not a hole. That gate refuses PARAMETER writes while the bike could move or its drive is
-  // live — but a charging bike is energized by definition and tethered by definition (it cannot
-  // be ridden away while plugged in, the same argument service-gate.ts's CHARGE_EVIDENCE rests
-  // on), and commanding its charge current is a charging operation. Worse, the gate only excuses
-  // `energized` while it sees fresh charger frames, and those flap with the trickle, so applying
-  // it here refuses a legitimate command mid-charge. charge-current's real precondition — a live,
-  // established session — is checked off charge_manager_state in performChargeCurrent. So this
-  // Pi's own switches (enabled/CAN/bus, above) still gate it; the bike-state gate does not.
-  if (request.kind !== "charge-current") {
+  // ⚠️ charge-current AND charge-stop are EXEMPT from the stationary gate, and this is a
+  // deliberate exemption, not a hole. That gate refuses PARAMETER writes while the bike could move
+  // or its drive is live — but a charging bike is energized by definition and tethered by
+  // definition (it cannot be ridden away while plugged in, the same argument service-gate.ts's
+  // CHARGE_EVIDENCE rests on), and commanding its charge current — or stopping the charge — is a
+  // charging operation. Worse, the gate only excuses `energized` while it sees fresh charger
+  // frames, and those flap with the trickle, so applying it here refuses a legitimate command
+  // mid-charge. Their real precondition — a live, established session — is checked off
+  // charge_manager_state in performChargeCurrent / performChargeStop. So this Pi's own switches
+  // (enabled/CAN/bus, above) still gate them; the bike-state gate does not. Stopping is the benign
+  // direction regardless: worst case the charge halts, which is the whole point of the button.
+  if (request.kind !== "charge-current" && request.kind !== "charge-stop") {
     const verdict = context.gate();
     if (!verdict.safe) {
       return { ok: false, reason: `the bike is not safe to service — ${verdict.blockers.join("; ")}` };
@@ -498,6 +507,8 @@ async function performOnBus(
       return await performClearDtcs(context, channel);
     case "charge-current":
       return await performChargeCurrent(context, request, channel);
+    case "charge-stop":
+      return await performChargeStop(context, channel);
   }
 }
 
@@ -863,6 +874,70 @@ async function performChargeCurrent(
         "⚠️ This is an event frame with no reply — watch the dash's set value and charge_limit_a to see it take. " +
         "A full battery caps the current that actually flows regardless. The setting is transient (unplugging resets it) " +
         "and you can override it on the bike's own screen.",
+      succeeded: true,
+    },
+  };
+}
+
+/**
+ * Stops an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+ *
+ * Source-agnostic — the same pair ends AC and DC — so it takes no fields and, unlike
+ * performChargeCurrent, needs no opcode/ceiling lookup. The one precondition is the same live
+ * session: charge_manager_state present, fresh, and a settled AC (0x02) / DC (0x23) — refused
+ * otherwise, since there is no charge to stop. ⚠️ NOT charge_type, which flaps mid-session.
+ *
+ * Fire-and-forget like charge-current: 0x121/0x120 are event frames with no reply, so "sent" is
+ * the strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
+ * following seconds as the bike's "interruption in progress" countdown runs. Audited with after:null.
+ */
+async function performChargeStop(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
+  const chargeState = latestValue("charge_manager_state");
+  const chargeStateAge = ageMs("charge_manager_state");
+  if (chargeState === null || chargeStateAge === null || chargeStateAge > CHARGE_SESSION_MAX_AGE_MS) {
+    return {
+      ok: false,
+      reason:
+        "not charging — charge_manager_state is absent or stale, so there is no live session to stop. Nothing to do.",
+    };
+  }
+  if (chargeState !== CHARGE_MANAGER_STATE_AC && chargeState !== CHARGE_MANAGER_STATE_DC) {
+    return {
+      ok: false,
+      reason: `charge_manager_state reads 0x${chargeState.toString(16)}, not a settled AC (0x02) or DC (0x23) session — the charge handshake may still be in progress. Retry in a moment.`,
+    };
+  }
+
+  const mode = chargeState === CHARGE_MANAGER_STATE_AC ? "AC" : "DC";
+  console.warn(`vcu-write: about to stop the ${mode} charge — replaying the 0x120 + 0x121 Mode-stop pair`);
+  const outcome = await sendChargeStopCommand(channel);
+  await appendAuditRecord(context.directory, {
+    at: Date.now(),
+    clockTrustworthy: readPiClock().trustworthy,
+    action: "charge-stop",
+    status: outcome.status,
+    // No synchronous read-back: the stop pair has no reply. The effect surfaces as the charge
+    // tearing down (mains_v → 0, charger_enabled → 0) over the next several seconds.
+    after: null,
+    rawHex: outcome.status === "sent" ? outcome.hex : undefined,
+    note:
+      outcome.status === "sent"
+        ? `${mode} stop pair on 0x120 + 0x121; event frames with no reply — confirm by the charge winding down`
+        : outcome.reason,
+  });
+  if (outcome.status !== "sent") {
+    return { ok: false, reason: outcome.reason };
+  }
+  return {
+    ok: true,
+    result: {
+      action: "charge-stop",
+      status: "sent",
+      message:
+        `Sent the stop-charging command (${outcome.hex}). ` +
+        "⚠️ These are event frames with no reply — the charge winds down over the next several seconds " +
+        "as the bike's own 'interruption in progress' countdown runs; watch mains voltage and charger_enabled fall. " +
+        "You may need to unplug the cable when the bike prompts you.",
       succeeded: true,
     },
   };

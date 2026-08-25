@@ -879,3 +879,19 @@ The runner reads `charge_manager_state` live to pick the opcode (`0x02` → AC, 
 ### Confirm-gated but reversible — NOT behind the irreversible fold
 
 `charge-current` needs `confirm=charge-current-<amps>` because `curl` can reach `/vcu-write` and a page showing 6 A must not be able to POST 30 — the number is the owner's to say out loud. But it is transient (unplugging resets it), VCU-clamped, and overridable on the bike's own screen, so it is the amber/reversible tier, not one of the three "cannot be undone" actions. `scripts/check-irreversible-actions.ts` was taught this third category (`REVERSIBLE_CONFIRMED`) so the fold's promise stays exactly the three irreversible actions while the check still catches any confirm-gated action that is neither behind the fold nor named reversible.
+
+## Stopping a charge from the charge tab — `views/charge-stop.js`
+
+The second bus-writing control on the charge tab (added 2026-08-25), sitting beside the set-current one. It ends an active charge by replaying the two-frame Mode-button stop the dash emits — `0x120: 96 ff 01 …` then `0x121: 16 ff 01 …`, cracked and proven on-bike (see `docs/can-0x121-charge-command.md` § "CRACKED"). It carries the same safety model as set-current: `POST /vcu-write?action=charge-stop`, `SERVICE_WRITE_ENABLED` + audit journal, the shared two-tap dwell, hidden unless writes are on AND a charge is live, and exempt from the stationary service gate (a charging bike is energized+tethered; the benign direction regardless — worst case a charge halts).
+
+### Two taps, not press-and-hold — even though the bike's gesture is a hold
+
+The rider stops a charge on the bike with two Mode presses (unlock, then interrupt), and the second is described as a ~1.5 s hold. It is tempting to mirror that with a press-and-hold button. We don't, because the real command on the bus is a **discrete pair of frames sent once**, not a sustained stream — a hold would only re-send the same two frames. So the dashboard uses the same arm-then-fire two-tap as every other write here: the first tap arms, the second (after the dwell) fires the pair once. One shared arming rule for the whole dashboard beats a second gesture that would exist only to imitate the bike's UI rather than the bus.
+
+### Source-agnostic, so no opcode or ceiling to choose
+
+Unlike set-current, stop takes no fields and makes no AC/DC decision: the same pair ends both. The runner (`performChargeStop`) needs only a live session — `charge_manager_state` present, fresh, and a settled AC (`0x02`) / DC (`0x23`) — and the page's `commandable()` is just "writes on and a charge is live". `confirm=charge-stop` is a fixed word (no value to embed), gated only because `curl` can reach the endpoint.
+
+### Shared machinery — `lib/charge-write.js`
+
+Adding a second charge-tab write control was the moment to lift the session/status machinery out of `charge-current.js` (which was at the ~400-line split line) into `lib/charge-write.js`: the `writeStatus`/`sessionLive` states, the one lazy `serverTime`-subscribing session derive, `liveChargeType()`/`liveCeiling()`, `fetchChargeWriteStatus()`, and an `onChargeSessionEnd()` hook each control registers to clear its own form. One derive, one status fetch, one definition of "a charge is live" — so the two controls cannot disagree about when a command may be offered.

@@ -14,11 +14,18 @@
 // hardcode one; a wrong b4 makes the VCU reject the value and fall back to a ~10 A default.
 // The DC ceiling stays the static 75 (fast_dc_limit_max_a). See docs/can-0x121-charge-command.md.
 //
-// The stop-charging command is deliberately NOT here. charge-setpoint.ts records that stop is a
-// DIFFERENT opcode (b3 = 0 belongs to 0x02/0x1D/0x1E/0x2C, not to 0x18/0x1A), so a "stop" is not
-// this frame with a flag cleared and must not be faked as one.
+// Stopping a charge is a DIFFERENT command, cracked 2026-08-25 by a whole-bus capture of the
+// rider's two-press Mode stop: it is a PAIR of frames sent once each — 0x120 `96 ff 01 …` AND
+// 0x121 `16 ff 01 …` (note 0x96 = 0x16 | 0x80, the 0x120 request-twin carrying the same opcode
+// with the high bit set). Injecting the pair is PROVEN to end the charge on-bike; injecting only
+// the 0x121 half armed the "interruption in progress" prompt but never completed. So stop is not
+// a current-limit frame with a flag cleared — it is opcode 0x16, and it takes both ids. See
+// buildChargeStopCommand below and docs/can-0x121-charge-command.md § "CRACKED".
 
 export const CHARGE_COMMAND_CAN_ID = 0x121;
+
+/** The request-twin id of 0x121. The captured two-press stop put a frame on BOTH at once. */
+export const CHARGE_REQUEST_CAN_ID = 0x120;
 
 /** b0 opcodes that carry a current in b2. See charge-setpoint.ts for the other seven on this id. */
 const DC_CURRENT_LIMIT_OPCODE = 0x18;
@@ -30,7 +37,21 @@ const SEPARATOR_BYTE = 0xff;
 /** b3 = 1 means "a limit is in force"; only the two current-limit opcodes ever set it. */
 const LIMIT_IN_FORCE = 1;
 
+/**
+ * The stop-charging opcode (b0). On 0x121 it is `0x16`; the 0x120 request-twin carries the same
+ * opcode ORed with 0x80 (`0x96`). b2 = 1, b1 = 0xFF, b3 = 0 (NOT a limit-in-force frame), tail zero.
+ */
+const STOP_OPCODE = 0x16;
+const STOP_REQUEST_TWIN_BIT = 0x80;
+const STOP_ARG_BYTE = 1;
+
 export type ChargeMode = "ac" | "dc";
+
+/** One frame of a multi-frame command: the id it rides on and its 8 payload bytes. */
+export interface ChargeFrame {
+  id: number;
+  data: Uint8Array;
+}
 
 /**
  * Packs a charge-current-limit command into the 8-byte 0x121 frame. Pure.
@@ -61,6 +82,30 @@ export function buildChargeCurrentCommand(mode: ChargeMode, selectedAmps: number
   frame[4] = ceilingAmps;
   // b5-7 stay zero: a tail in use marks a different opcode's layout (charge-setpoint.ts).
   return frame;
+}
+
+/**
+ * Builds the two frames that stop an active charge, in the order the dash puts them on the bus.
+ * Pure. Source-agnostic — the SAME pair ends both AC and DC sessions (it emulates the Mode
+ * button, which does not care how the bike is charging).
+ *
+ * The pair is `0x120: 96 ff 01 …` then `0x121: 16 ff 01 …`, exactly as captured 2026-08-25 and
+ * proven to complete the stop on-bike. Injecting only the 0x121 half arms the "interruption in
+ * progress" prompt but never finishes; the 0x120 companion is the missing commit, so both must go.
+ */
+export function buildChargeStopCommand(): ChargeFrame[] {
+  const request = new Uint8Array(8);
+  request[0] = STOP_OPCODE | STOP_REQUEST_TWIN_BIT;
+  request[1] = SEPARATOR_BYTE;
+  request[2] = STOP_ARG_BYTE;
+  const command = new Uint8Array(8);
+  command[0] = STOP_OPCODE;
+  command[1] = SEPARATOR_BYTE;
+  command[2] = STOP_ARG_BYTE;
+  return [
+    { id: CHARGE_REQUEST_CAN_ID, data: request },
+    { id: CHARGE_COMMAND_CAN_ID, data: command },
+  ];
 }
 
 export interface DecodedChargeCommand {
