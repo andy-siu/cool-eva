@@ -25,6 +25,8 @@ import type { ServiceWriteRequest, ServiceWriteResult, VcuWriteRunner, VcuWriteS
 //   set-service-point  confirm=set-service-point
 //   clear-dtcs         confirm=clear-dtcs
 //   sync-clock         confirm=<the UTC minute the caller displayed, ISO>
+//   charge-current     amps=<whole amps>  confirm=charge-current-<amps>
+//   charge-stop        confirm=charge-stop
 //
 // The clock one is not ceremony — it is the server-side half of "Is it <date and
 // time>?", so a page left open since this morning cannot sync this morning's time.
@@ -186,10 +188,35 @@ export function parseWriteRequest(
       }
       return { ok: true, request: { kind: "sync-clock" } };
     }
+    case "charge-current": {
+      const amps = parseNumber(params.get("amps"));
+      if (amps === null) {
+        return { ok: false, reason: `amps must be a whole number, not ${params.get("amps") ?? "(nothing)"}` };
+      }
+      // The confirm carries the amps, so a page showing one value cannot POST another — the
+      // AC/DC choice and the ceiling are the live bus's to make, but the number is the owner's.
+      if (params.get("confirm") !== `charge-current-${amps}`) {
+        return {
+          ok: false,
+          reason: `Commanding the charge current actuates the bike's charging. Pass confirm=charge-current-${amps} to confirm ${amps} A.`,
+        };
+      }
+      return { ok: true, request: { kind: "charge-current", amps } };
+    }
+    case "charge-stop":
+      // Stopping actuates the bike's charging (the benign direction — it ends a charge), so it
+      // carries the same one-word confirm the two-tap UI sends but curl must state deliberately.
+      if (params.get("confirm") !== "charge-stop") {
+        return {
+          ok: false,
+          reason: "Stopping the charge actuates the bike's charging. Pass confirm=charge-stop.",
+        };
+      }
+      return { ok: true, request: { kind: "charge-stop" } };
     default:
       return {
         ok: false,
-        reason: `action must be one of parameter, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs — not ${action ?? "(nothing)"}`,
+        reason: `action must be one of parameter, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs, charge-current, charge-stop — not ${action ?? "(nothing)"}`,
       };
   }
 }

@@ -238,6 +238,11 @@ export const SIGNALS: SignalDef[] = [
   // waypoint_seq escapes this by being a monotonic counter; a setting cannot. A deadband
   // here would make it strictly worse, which is why there is none.
   { key: "dc_charge_limit_selected_a", unit: "A", group: "charge", source: "stream" },
+  // 0x121 opcode 0x1A b4 — the AC charge ceiling the dash pairs with the AC setpoint. Decoded
+  // (charge-setpoint.ts) because it is the ONLY source for the b4 a dashboard-sent AC charge
+  // command must echo; an event like its DC sibling, so it too greys out and can be absent.
+  // docs/can-0x121-charge-command.md.
+  { key: "ac_charge_ceiling_a", unit: "A", group: "charge", source: "stream" },
   // 0x605 / 0x610 / 0x615 / 0x620 / 0x625 — the charge manager (src/can/charge-manager.ts),
   // added 2026-08-19 from 29 charge sessions and reconciled against Energica's factory DBC on
   // 2026-08-20. Present only while a cable is live, EXCEPT the four off 0x625 — that frame

@@ -119,6 +119,10 @@ const BY_KEY = {
   "fast_dc_limit_a": [0, 127],
   "fast_dc_limit_max_a": [0, 127],
   "ac_supply_limit_a": [0, 80],
+  // The AC charge ceiling (0x121 b4) the dash echoes — the cable/pilot rating, observed
+  // 15 A on our lead. Bounded like ac_supply_limit_a rather than left on BY_UNIT's "A"
+  // fallback of [-1000, 1000], which would draw a misread opcode byte as a plausible amp.
+  "ac_charge_ceiling_a": [0, 80],
   // The two DC voltages the VCU sends the charge manager, 0x615 b0-1 and 0x625 b0-1. Both are
   // 16-bit with the high byte gated to 0x01, so each can only emit 256…511 V, and the "V"
   // fallback of [-50, 900] would draw the top of that as a measurement.
