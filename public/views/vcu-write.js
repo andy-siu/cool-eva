@@ -3,6 +3,7 @@
 import van from "../vendor/van-1.6.1.js";
 import { BAD, GOOD, MUTED, WARN, WATCH } from "../lib/colors.js";
 import { ageInWords } from "../lib/format.js";
+import { arm, armDwellElapsed, armed, refuseKeyRepeat } from "../lib/arming.js";
 
 const { button, div, h2, h3, input, option, select, span } = van.tags;
 
@@ -48,32 +49,9 @@ const selected = van.state("");
  */
 const reading = van.state(/** @type {{ name: string, value: number, rawHex: string | null } | null} */ (null));
 const wanted = van.state("");
-/** Which control is armed, by a key like `write` or `action:clear-dtcs`. Empty means none. */
-const armed = van.state("");
-/**
- * ⚠️ LOAD-BEARING, and not a debounce: the minimum separation that makes two taps two
- * taps, and the whole of what stops a double-tap running `31 FC`. Measured 2026-08-19 at
- * 390x844, two synchronous clicks on "Say a service was performed NOW" POSTed it for real.
- *
- * ⚠️ The parameter write and the clock sync passed that same test BY ACCIDENT: armWrite()
- * and armClockSync() `await fetchStatus()` between arming and firing, which raises `busy`
- * and disables the button. Making that refresh faster, cached, conditional or optional
- * would remove the protection from two of the three irreversible controls without touching
- * a line that looks like a guard. All three now hold this dwell deliberately.
- *
- * ⚠️ A tap inside the dwell is IGNORED, never a disarm: the caption still says "Tap again"
- * and still means it. Why 400 ms, and why a dwell rather than a dblclick guard, a disabled
- * beat or press-and-hold: docs/dashboard-decisions.md §`ARM_DWELL_MS` = 400 ms.
- */
-const ARM_DWELL_MS = 400;
-/**
- * When the armed control armed itself.
- *
- * `performance.now()`, never `Date.now()`: this page has a button on it that STEPS A
- * CLOCK, and a wall clock that jumps backwards mid-gesture hands out a dwell that never
- * elapses. Deliberately not a van.state — nothing renders from it.
- */
-let armedAt = 0;
+// The two-tap arm/dwell (`armed`, `arm`, `armDwellElapsed`, `refuseKeyRepeat`) lives in
+// ../lib/arming.js now, shared with the charge tab's charge-current control so there is one
+// dwell rule for the whole dashboard. What was measured and why 400 ms: see that file.
 /** Whether the selected parameter's warnings are unfolded. Collapsed by default — see TargetNote. */
 const warningsOpen = van.state(false);
 /**
@@ -140,54 +118,6 @@ export function VcuWrite() {
  */
 function hasControls() {
   return state.val?.status.enabled === true;
-}
-
-/**
- * Arms one control, and stamps when.
- *
- * ⚠️ The ONLY way `armed` is set to a non-empty key. All three arming sites go through
- * here — ActionButton's own onclick, armWrite() and armClockSync() — so no control can
- * be armed without also being subject to the dwell. Disarming stays a plain
- * `armed.val = ""` and needs no stamp: every firing site tests `armed.val` first, and
- * an empty key matches none of them.
- *
- * @param {string} key
- */
-function arm(key) {
-  armed.val = key;
-  armedAt = performance.now();
-}
-
-/**
- * Whether the armed control may fire yet — whether the tap now arriving is a second
- * gesture rather than the tail of the one that armed it.
- *
- * ⚠️ Checked at every site that acts on a second tap, and it is the whole of what stops
- * a double-tap running `31 FC`. See ARM_DWELL_MS for what was measured and why this is
- * not something to fold back into `disabled:`.
- */
-function armDwellElapsed() {
-  return performance.now() - armedAt >= ARM_DWELL_MS;
-}
-
-/**
- * Refuses a key AUTO-REPEAT, so one sustained keypress cannot arm and then fire.
- *
- * ⚠️ The one hole ARM_DWELL_MS does not close, and it does not close it by arithmetic:
- * macOS repeats a held key at about 500 ms, on the far side of the 400 ms dwell, so
- * Enter held down on an armed button would arm on the first event and fire on the
- * repeat. `event.repeat` is the browser saying "this is the same press continuing", so
- * the guard is exact where a longer dwell would be a race against a per-machine setting
- * — docs/dashboard-decisions.md §"Why `event.repeat` rather than a longer dwell".
- *
- * @param {KeyboardEvent} event
- */
-function refuseKeyRepeat(event) {
-  // Qualified by key, or this cancels every held key on these five buttons — a held
-  // ArrowDown, PageDown or Tab would stop scrolling dead after one line.
-  if (event.repeat && event.key === "Enter") {
-    event.preventDefault();
-  }
 }
 
 /**

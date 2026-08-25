@@ -23,6 +23,12 @@ import {
 } from "./write-codec.ts";
 import { parameterAtIndex } from "./param-table.ts";
 import {
+  buildChargeCurrentCommand,
+  buildChargeStopCommand,
+  CHARGE_COMMAND_CAN_ID,
+  type ChargeMode,
+} from "../can/charge-command.ts";
+import {
   SERVICE_STAMP_IDENTIFIERS,
   SERVICE_STAMP_MICRO,
   RTC_SYNC_CAN_ID,
@@ -116,6 +122,9 @@ const RESPONSE_TIMEOUT_MS = 300;
 
 /** Gap after every exchange, so this is polite to a bus shared with the ABS and the BMS at 20 Hz. */
 const PACE_MS = 10;
+
+/** Gap between the two charge-stop frames, matching the ~20 ms the dash left between them. */
+const STOP_FRAME_GAP_MS = 20;
 
 /**
  * How long after an authenticated operation another one may start.
@@ -561,6 +570,77 @@ export function syncBikeClock(
   return { status: "sent", hex: toHex(frame) };
 }
 
+/**
+ * Commands the charge-current limit onto CAN 0x121 — the same frame the dash sends when the
+ * rider moves the charge dial (charge-command.ts / charge-setpoint.ts).
+ *
+ * ⚠️ FIRE AND FORGET, and — like the RTC sync — that is the mechanism, not a shortcut: 0x121
+ * is an event channel with no reply and no session. So "sent" is the strongest claim here.
+ * The read-back is not synchronous: it shows up on the dash's set display and, current
+ * permitting, on charge_limit_a. The setting is transient (unplugging resets it) and the
+ * rider can override it on the bike's own screen, which is the safety floor under this.
+ *
+ * `ceilingAmps` MUST be the ceiling this charge type really uses — 75 for DC
+ * (fast_dc_limit_max_a), and for AC the b4 the dash last broadcast (ac_charge_ceiling_a),
+ * NOT a guess: a wrong b4 makes the VCU reject the value and fall back to a ~10 A default.
+ * The caller validates amps against it; the pure builder re-checks 1 ≤ amps ≤ ceiling.
+ */
+export function sendChargeCommand(
+  channel: RawChannel,
+  mode: ChargeMode,
+  selectedAmps: number,
+  ceilingAmps: number
+): { status: "sent"; hex: string } | { status: "failed"; reason: string } {
+  let frame: Uint8Array;
+  try {
+    frame = buildChargeCurrentCommand(mode, selectedAmps, ceilingAmps);
+  } catch (err) {
+    // The builder refused a request that should have been range-checked upstream — surfaced,
+    // not swallowed, because a silently-dropped command looks identical to one the bike ignored.
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    channel.send({ id: CHARGE_COMMAND_CAN_ID, ext: false, rtr: false, data: Buffer.from(frame) });
+  } catch (err) {
+    console.error("vcu-write: could not transmit the charge-current command", err);
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  console.warn(
+    `vcu-write: sent ${mode.toUpperCase()} charge current ${selectedAmps} A (ceiling ${ceilingAmps} A) on 0x121 — ${toHex(frame)}`
+  );
+  return { status: "sent", hex: toHex(frame) };
+}
+
+/**
+ * Stops an active charge by replaying the two-frame Mode-button stop the dash emits — 0x120
+ * `96 ff 01 …` then 0x121 `16 ff 01 …` (charge-command.ts). Source-agnostic: the same pair ends
+ * both AC and DC.
+ *
+ * ⚠️ FIRE AND FORGET like sendChargeCommand — these are event frames with no reply. "sent" means
+ * both hit the bus; the read-back is the charge tearing down (mains_v collapsing, charger_enabled
+ * → 0), which arrives over the following seconds as the bike's own "interruption in progress"
+ * countdown runs. Both frames MUST go, in this order: injecting only the 0x121 half arms the
+ * prompt but never completes the stop. A 20 ms gap between them matches the captured cadence.
+ */
+export async function sendChargeStopCommand(
+  channel: RawChannel
+): Promise<{ status: "sent"; hex: string } | { status: "failed"; reason: string }> {
+  const frames = buildChargeStopCommand();
+  const sentHex: string[] = [];
+  for (const frame of frames) {
+    try {
+      channel.send({ id: frame.id, ext: false, rtr: false, data: Buffer.from(frame.data) });
+    } catch (err) {
+      console.error(`vcu-write: could not transmit the charge-stop frame on 0x${frame.id.toString(16)}`, err);
+      return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+    }
+    sentHex.push(`0x${frame.id.toString(16)} ${toHex(frame.data)}`);
+    await delay(STOP_FRAME_GAP_MS);
+  }
+  console.warn(`vcu-write: sent the charge-stop pair — ${sentHex.join(" / ")}`);
+  return { status: "sent", hex: sentHex.join(" / ") };
+}
+
 // ── The machinery below: one request in flight, one reply window, paced ─────
 //
 // Structurally the same as ./kwp-client.ts's exchange loop, and deliberately a
@@ -883,4 +963,8 @@ function describeWriteReply(reply: { kind: string; expected?: number; received?:
     return `the micro acknowledged identifier 0x${reply.received?.toString(16)}, not the 0x${reply.expected?.toString(16)} we wrote — nothing here can say what was changed`;
   }
   return reply.reason ?? reply.kind;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
 }

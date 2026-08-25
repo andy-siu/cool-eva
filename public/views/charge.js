@@ -9,6 +9,8 @@ import * as units from "../lib/units.js";
 import { power, whole } from "../lib/format.js";
 import { COOLANT_FLOW_LPH, coolantDelta, coolantHeatRemovedWatts, resistiveLossWatts } from "../lib/derive.js";
 import { chargeMode } from "../lib/charge-mode.js";
+import { ChargeCurrentControl } from "./charge-current.js";
+import { ChargeStopControl } from "./charge-stop.js";
 import {
   CELL_COUNT,
   CELL_VOLTAGE_PATTERN,
@@ -57,6 +59,11 @@ export function ChargeView() {
           return NotCharging();
       }
     },
+    // Renders nothing unless this Pi has writes enabled and a charge is live — on an ordinary
+    // phone both are invisible and Charge stays read-only. See ./charge-current.js and
+    // ./charge-stop.js; both share the session/status machinery in ../lib/charge-write.js.
+    ChargeCurrentControl(),
+    ChargeStopControl(),
     SectionLabel("Pack"),
     DerateTile(),
     ThermalBalanceTile(),
