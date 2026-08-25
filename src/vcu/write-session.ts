@@ -22,6 +22,7 @@ import {
   type ServiceRoutineName,
 } from "./write-codec.ts";
 import { parameterAtIndex } from "./param-table.ts";
+import { buildChargeCurrentCommand, CHARGE_COMMAND_CAN_ID, type ChargeMode } from "../can/charge-command.ts";
 import {
   SERVICE_STAMP_IDENTIFIERS,
   SERVICE_STAMP_MICRO,
@@ -558,6 +559,47 @@ export function syncBikeClock(
   // Logged with the bytes, because this is the one action with no read-back at all
   // and the journal line is the only evidence it ever happened.
   console.warn(`vcu-write: broadcast the clock on 0x120 as ${when.toISOString()} — ${toHex(frame)}`);
+  return { status: "sent", hex: toHex(frame) };
+}
+
+/**
+ * Commands the charge-current limit onto CAN 0x121 — the same frame the dash sends when the
+ * rider moves the charge dial (charge-command.ts / charge-setpoint.ts).
+ *
+ * ⚠️ FIRE AND FORGET, and — like the RTC sync — that is the mechanism, not a shortcut: 0x121
+ * is an event channel with no reply and no session. So "sent" is the strongest claim here.
+ * The read-back is not synchronous: it shows up on the dash's set display and, current
+ * permitting, on charge_limit_a. The setting is transient (unplugging resets it) and the
+ * rider can override it on the bike's own screen, which is the safety floor under this.
+ *
+ * `ceilingAmps` MUST be the ceiling this charge type really uses — 75 for DC
+ * (fast_dc_limit_max_a), and for AC the b4 the dash last broadcast (ac_charge_ceiling_a),
+ * NOT a guess: a wrong b4 makes the VCU reject the value and fall back to a ~10 A default.
+ * The caller validates amps against it; the pure builder re-checks 1 ≤ amps ≤ ceiling.
+ */
+export function sendChargeCommand(
+  channel: RawChannel,
+  mode: ChargeMode,
+  selectedAmps: number,
+  ceilingAmps: number
+): { status: "sent"; hex: string } | { status: "failed"; reason: string } {
+  let frame: Uint8Array;
+  try {
+    frame = buildChargeCurrentCommand(mode, selectedAmps, ceilingAmps);
+  } catch (err) {
+    // The builder refused a request that should have been range-checked upstream — surfaced,
+    // not swallowed, because a silently-dropped command looks identical to one the bike ignored.
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    channel.send({ id: CHARGE_COMMAND_CAN_ID, ext: false, rtr: false, data: Buffer.from(frame) });
+  } catch (err) {
+    console.error("vcu-write: could not transmit the charge-current command", err);
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  console.warn(
+    `vcu-write: sent ${mode.toUpperCase()} charge current ${selectedAmps} A (ceiling ${ceilingAmps} A) on 0x121 — ${toHex(frame)}`
+  );
   return { status: "sent", hex: toHex(frame) };
 }
 

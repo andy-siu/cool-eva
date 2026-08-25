@@ -8,6 +8,7 @@ import * as colors from "../lib/colors.js";
 import { power, whole } from "../lib/format.js";
 import { COOLANT_FLOW_LPH, coolantDelta, coolantHeatRemovedWatts, resistiveLossWatts } from "../lib/derive.js";
 import { chargeMode } from "../lib/charge-mode.js";
+import { ChargeCurrentControl } from "./charge-current.js";
 import {
   CELL_COUNT,
   CELL_VOLTAGE_PATTERN,
@@ -56,6 +57,9 @@ export function ChargeView() {
           return NotCharging();
       }
     },
+    // Renders nothing unless this Pi has writes enabled and the safety gate is open — on an
+    // ordinary phone this is invisible and Charge stays read-only. See ./charge-current.js.
+    ChargeCurrentControl(),
     SectionLabel("Pack"),
     DerateTile(),
     ThermalBalanceTile(),

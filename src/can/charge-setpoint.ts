@@ -15,8 +15,9 @@
 // 9 of 9, and across 53 268 samples on the following plateaus the delivered current never
 // once exceeded it. Dialling UP is NOT obeyed — set 75 and it stops at 36-73 depending on
 // the session — which is precisely why the signal is worth having: it answers "did I cap it
-// myself?". The AC twin emits nothing (charge_limit_a already carries it off 0x10A b7 ÷ 7,
-// a scale these very events confirm to the amp).
+// myself?". The AC twin (0x1A) is decoded too now, but ONLY for its ceiling (b4): charge_limit_a
+// already carries the AC setpoint off 0x10A b7 ÷ 7, whereas nothing else on the bus states the
+// AC ceiling a charge-current command must echo. docs/can-0x121-charge-command.md.
 //
 // ⚠️ THIS FRAME IS AN EVENT — it fires when the dial moves and at no other time; 5 of 10
 // captured DC sessions contain none at all. So the value is the LAST SETTING SEEN, not a
@@ -34,11 +35,14 @@ export const CHARGE_SETPOINT_CAN_ID = 0x121;
 /** Opcode for "the DC charge-current limit changed". See the table above. */
 const DC_CURRENT_LIMIT_OPCODE = 0x18;
 
+/** Opcode for "the AC charge-current limit changed" — the twin of the DC one, same layout. */
+const AC_CURRENT_LIMIT_OPCODE = 0x1a;
+
 /**
- * Decodes one 0x121 frame, emitting only for the DC current-limit opcode. Pure.
+ * Decodes one 0x121 frame, emitting for the two current-limit opcodes. Pure.
  *
- * Returns nothing for the other eight opcodes on this id, which is the normal case:
- * they outnumber this one roughly 16 to 1.
+ * Returns nothing for the other seven opcodes on this id, which is the normal case:
+ * they outnumber these two roughly 16 to 1.
  */
 export function decodeChargeSetpointFrame(data: Buffer): DecodedValue[] {
   // ALL SIX structural invariants from the header are gated, not a subset, because this
@@ -55,7 +59,8 @@ export function decodeChargeSetpointFrame(data: Buffer): DecodedValue[] {
     return [];
   }
   // b1 is 0xFF in all 596 captured frames of both ids, opcode regardless — a separator.
-  if (data[0] !== DC_CURRENT_LIMIT_OPCODE || data[1] !== 0xff) {
+  const opcode = data[0];
+  if ((opcode !== DC_CURRENT_LIMIT_OPCODE && opcode !== AC_CURRENT_LIMIT_OPCODE) || data[1] !== 0xff) {
     return [];
   }
   // b3 = 1 means "a limit is in force", and ONLY the two limit-change opcodes ever set
@@ -74,9 +79,17 @@ export function decodeChargeSetpointFrame(data: Buffer): DecodedValue[] {
   if (selected < 1 || selected > ceiling) {
     return [];
   }
-  // b4 is deliberately NOT emitted, only used as the guard above. It is the same number
-  // as 0x625 b2, which the charge manager broadcasts at 10 Hz for the whole time the bike
-  // is awake — a strictly better source for a value that never changes, where this one
-  // arrives only when the dial moves. See the "ceiling" note at the top.
-  return [{ key: "dc_charge_limit_selected_a", value: selected }];
+  if (opcode === DC_CURRENT_LIMIT_OPCODE) {
+    // b4 is deliberately NOT emitted for DC, only used as the guard above. It is the same
+    // number as 0x625 b2, which the charge manager broadcasts at 10 Hz for the whole time the
+    // bike is awake — a strictly better source for a value that never changes, where this one
+    // arrives only when the dial moves. See the "ceiling" note at the top.
+    return [{ key: "dc_charge_limit_selected_a", value: selected }];
+  }
+  // AC is the opposite case for b4: NOTHING else on the bus states the AC ceiling (it is the
+  // pilot/cable rating, not ac_supply_limit_a), and a Pi-sent charge-current command must carry
+  // the exact b4 the dash uses or the VCU rejects it and falls back to a ~10 A default. So the
+  // ceiling IS emitted here — the one source there is. The AC setpoint (b2) is not: charge_limit_a
+  // already carries it off 0x10A. docs/can-0x121-charge-command.md.
+  return [{ key: "ac_charge_ceiling_a", value: ceiling }];
 }

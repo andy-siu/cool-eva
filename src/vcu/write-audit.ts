@@ -27,6 +27,8 @@ export type AuditAction =
   | "set-service-point"
   | "clear-dtcs"
   | "rtc-sync"
+  /** A charge-current-limit command on 0x121. Fire-and-forget, so recorded like rtc-sync. */
+  | "charge-current"
   /** Reading the last-service block. Read-only, but recorded because it is the before-picture of the routine. */
   | "read-service-stamp";
 
