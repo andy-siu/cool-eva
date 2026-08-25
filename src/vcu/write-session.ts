@@ -123,7 +123,7 @@ const RESPONSE_TIMEOUT_MS = 300;
 /** Gap after every exchange, so this is polite to a bus shared with the ABS and the BMS at 20 Hz. */
 const PACE_MS = 10;
 
-/** Gap between the two charge-stop frames, matching the ~20 ms the dash left between them. */
+/** Gap between charge-stop frames if more than one is ever sent; today the stop is a single frame. */
 const STOP_FRAME_GAP_MS = 20;
 
 /**
@@ -612,15 +612,14 @@ export function sendChargeCommand(
 }
 
 /**
- * Stops an active charge by replaying the two-frame Mode-button stop the dash emits — 0x120
- * `96 ff 01 …` then 0x121 `16 ff 01 …` (charge-command.ts). Source-agnostic: the same pair ends
- * both AC and DC.
+ * Stops an active charge by injecting the single 0x120 request-twin `96 ff 01 …` (charge-command.ts).
+ * The dash pairs it with a 0x121 `16 ff 01 …`, but an on-bike isolation test proved 0x120 alone
+ * commits the stop. Source-agnostic: the same frame ends both AC and DC.
  *
- * ⚠️ FIRE AND FORGET like sendChargeCommand — these are event frames with no reply. "sent" means
- * both hit the bus; the read-back is the charge tearing down (mains_v collapsing, charger_enabled
- * → 0), which arrives over the following seconds as the bike's own "interruption in progress"
- * countdown runs. Both frames MUST go, in this order: injecting only the 0x121 half arms the
- * prompt but never completes the stop. A 20 ms gap between them matches the captured cadence.
+ * ⚠️ FIRE AND FORGET like sendChargeCommand — this is an event frame with no reply. "sent" means it
+ * hit the bus; the read-back is the charge tearing down (mains_v collapsing, charger_enabled → 0),
+ * which arrives over the following seconds as the bike's own "interruption in progress" countdown
+ * runs. The loop stays multi-frame in case a future gesture needs a companion, but today it is one.
  */
 export async function sendChargeStopCommand(
   channel: RawChannel
@@ -637,7 +636,7 @@ export async function sendChargeStopCommand(
     sentHex.push(`0x${frame.id.toString(16)} ${toHex(frame.data)}`);
     await delay(STOP_FRAME_GAP_MS);
   }
-  console.warn(`vcu-write: sent the charge-stop pair — ${sentHex.join(" / ")}`);
+  console.warn(`vcu-write: sent the charge-stop command — ${sentHex.join(" / ")}`);
   return { status: "sent", hex: sentHex.join(" / ") };
 }
 

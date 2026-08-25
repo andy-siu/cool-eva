@@ -95,3 +95,9 @@ Injecting the pair with `probe-charge-stop.ts --pair --send` during a live AC ch
 - The `charge-stop` write action (`src/vcu/write-runner.ts` `performChargeStop`) requires only a fresh `charge_manager_state` (a live session, AC 0x02 / DC 0x23) and is EXEMPT from the stationary service gate, like charge-current.
 - `POST /vcu-write?action=charge-stop&confirm=charge-stop` (header `X-Cool-Eva: service-write`).
 - UI: a two-tap "Stop charging" button (`public/views/charge-stop.js`) — **not** press-and-hold, because the command is a discrete pair sent once, not a sustained stream. Shares session/status machinery with the set-current control via `public/lib/charge-write.js`.
+
+### 0x120 ALONE commits the stop — the 0x121 half is redundant — 2026-08-25
+
+An isolation test (`probe-charge-stop.ts --request-only --send`, which injects only `0x120: 96 ff 01 …` with no 0x121) **stopped a live AC charge on-bike** — the teardown broadcasts followed on cue. This is the mirror of the earlier 0x121-only test, which only armed the "interruption in progress" prompt and never completed. So of the pair the dash emits, **the commit rides on the 0x120 request-twin; the 0x121 companion does nothing on its own and adds nothing to the 0x120.**
+
+`buildChargeStopCommand()` now emits the **single 0x120 frame** (still an array of one, so `sendChargeStopCommand`'s transmit loop is unchanged). Why the dash sends both anyway is unknown — likely the 0x121 is the dash echoing its own display state, not a required command — but we do not need to reproduce it. `--pair` is kept in the probe for reference.

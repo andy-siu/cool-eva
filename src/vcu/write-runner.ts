@@ -77,9 +77,10 @@ export type ServiceWriteRequest =
    */
   | { kind: "charge-current"; amps: number }
   /**
-   * Stop an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
-   * Source-agnostic — the same pair ends AC and DC — so it carries no fields; the only
-   * precondition is a live session, checked off charge_manager_state like charge-current.
+   * Stop an active charge by injecting the 0x120 request-twin `96 ff 01 …` — the half of the
+   * dash's Mode-stop that alone commits (2026-08-25 on-bike). Source-agnostic — the same frame
+   * ends AC and DC — so it carries no fields; the only precondition is a live session, checked
+   * off charge_manager_state like charge-current.
    */
   | { kind: "charge-stop" };
 
@@ -880,15 +881,16 @@ async function performChargeCurrent(
 }
 
 /**
- * Stops an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+ * Stops an active charge by injecting the 0x120 request-twin `96 ff 01 …` — the half of the dash's
+ * Mode-stop that alone commits (2026-08-25 on-bike).
  *
- * Source-agnostic — the same pair ends AC and DC — so it takes no fields and, unlike
+ * Source-agnostic — the same frame ends AC and DC — so it takes no fields and, unlike
  * performChargeCurrent, needs no opcode/ceiling lookup. The one precondition is the same live
  * session: charge_manager_state present, fresh, and a settled AC (0x02) / DC (0x23) — refused
  * otherwise, since there is no charge to stop. ⚠️ NOT charge_type, which flaps mid-session.
  *
- * Fire-and-forget like charge-current: 0x121/0x120 are event frames with no reply, so "sent" is
- * the strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
+ * Fire-and-forget like charge-current: 0x120 is an event frame with no reply, so "sent" is the
+ * strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
  * following seconds as the bike's "interruption in progress" countdown runs. Audited with after:null.
  */
 async function performChargeStop(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
@@ -909,20 +911,20 @@ async function performChargeStop(context: WriteContext, channel: RawChannel): Pr
   }
 
   const mode = chargeState === CHARGE_MANAGER_STATE_AC ? "AC" : "DC";
-  console.warn(`vcu-write: about to stop the ${mode} charge — replaying the 0x120 + 0x121 Mode-stop pair`);
+  console.warn(`vcu-write: about to stop the ${mode} charge — injecting the 0x120 Mode-stop request-twin`);
   const outcome = await sendChargeStopCommand(channel);
   await appendAuditRecord(context.directory, {
     at: Date.now(),
     clockTrustworthy: readPiClock().trustworthy,
     action: "charge-stop",
     status: outcome.status,
-    // No synchronous read-back: the stop pair has no reply. The effect surfaces as the charge
+    // No synchronous read-back: the stop frame has no reply. The effect surfaces as the charge
     // tearing down (mains_v → 0, charger_enabled → 0) over the next several seconds.
     after: null,
     rawHex: outcome.status === "sent" ? outcome.hex : undefined,
     note:
       outcome.status === "sent"
-        ? `${mode} stop pair on 0x120 + 0x121; event frames with no reply — confirm by the charge winding down`
+        ? `${mode} stop on 0x120; event frame with no reply — confirm by the charge winding down`
         : outcome.reason,
   });
   if (outcome.status !== "sent") {

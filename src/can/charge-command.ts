@@ -15,12 +15,13 @@
 // The DC ceiling stays the static 75 (fast_dc_limit_max_a). See docs/can-0x121-charge-command.md.
 //
 // Stopping a charge is a DIFFERENT command, cracked 2026-08-25 by a whole-bus capture of the
-// rider's two-press Mode stop: it is a PAIR of frames sent once each — 0x120 `96 ff 01 …` AND
-// 0x121 `16 ff 01 …` (note 0x96 = 0x16 | 0x80, the 0x120 request-twin carrying the same opcode
-// with the high bit set). Injecting the pair is PROVEN to end the charge on-bike; injecting only
-// the 0x121 half armed the "interruption in progress" prompt but never completed. So stop is not
-// a current-limit frame with a flag cleared — it is opcode 0x16, and it takes both ids. See
-// buildChargeStopCommand below and docs/can-0x121-charge-command.md § "CRACKED".
+// rider's two-press Mode stop: the dash puts a PAIR on the bus — 0x120 `96 ff 01 …` AND 0x121
+// `16 ff 01 …` (0x96 = 0x16 | 0x80, the 0x120 request-twin carrying the same opcode with the
+// high bit set). But an isolation test that same day settled which half commits: injecting ONLY
+// the 0x120 request-twin ENDS the charge on-bike, while injecting only the 0x121 half merely
+// armed the "interruption in progress" prompt and never completed. So the commit rides on 0x120;
+// the 0x121 companion is redundant, and buildChargeStopCommand emits the single 0x120 frame. See
+// docs/can-0x121-charge-command.md § "0x120 ALONE commits".
 
 export const CHARGE_COMMAND_CAN_ID = 0x121;
 
@@ -38,8 +39,9 @@ const SEPARATOR_BYTE = 0xff;
 const LIMIT_IN_FORCE = 1;
 
 /**
- * The stop-charging opcode (b0). On 0x121 it is `0x16`; the 0x120 request-twin carries the same
- * opcode ORed with 0x80 (`0x96`). b2 = 1, b1 = 0xFF, b3 = 0 (NOT a limit-in-force frame), tail zero.
+ * The stop-charging opcode (b0) as it rides on the 0x120 request-twin: the base `0x16` ORed with
+ * the request-twin high bit (`0x96`). b2 = 1, b1 = 0xFF, b3 = 0 (NOT a limit-in-force frame), tail
+ * zero. The 0x121 twin (`0x16`) is what the dash pairs with it, but 0x120 alone commits the stop.
  */
 const STOP_OPCODE = 0x16;
 const STOP_REQUEST_TWIN_BIT = 0x80;
@@ -85,27 +87,20 @@ export function buildChargeCurrentCommand(mode: ChargeMode, selectedAmps: number
 }
 
 /**
- * Builds the two frames that stop an active charge, in the order the dash puts them on the bus.
- * Pure. Source-agnostic — the SAME pair ends both AC and DC sessions (it emulates the Mode
- * button, which does not care how the bike is charging).
+ * Builds the frame that stops an active charge. Pure. Source-agnostic — the SAME frame ends both
+ * AC and DC sessions (it emulates the Mode button, which does not care how the bike is charging).
  *
- * The pair is `0x120: 96 ff 01 …` then `0x121: 16 ff 01 …`, exactly as captured 2026-08-25 and
- * proven to complete the stop on-bike. Injecting only the 0x121 half arms the "interruption in
- * progress" prompt but never finishes; the 0x120 companion is the missing commit, so both must go.
+ * It is the single 0x120 request-twin `96 ff 01 …`. The dash pairs it with a 0x121 `16 ff 01 …`,
+ * but an on-bike isolation test (2026-08-25) proved the 0x120 half ALONE completes the stop, while
+ * 0x121 alone only armed the "interruption in progress" prompt — so the commit is the 0x120 frame.
+ * Returns an array of one to match sendChargeStopCommand's multi-frame transmit loop.
  */
 export function buildChargeStopCommand(): ChargeFrame[] {
   const request = new Uint8Array(8);
   request[0] = STOP_OPCODE | STOP_REQUEST_TWIN_BIT;
   request[1] = SEPARATOR_BYTE;
   request[2] = STOP_ARG_BYTE;
-  const command = new Uint8Array(8);
-  command[0] = STOP_OPCODE;
-  command[1] = SEPARATOR_BYTE;
-  command[2] = STOP_ARG_BYTE;
-  return [
-    { id: CHARGE_REQUEST_CAN_ID, data: request },
-    { id: CHARGE_COMMAND_CAN_ID, data: command },
-  ];
+  return [{ id: CHARGE_REQUEST_CAN_ID, data: request }];
 }
 
 export interface DecodedChargeCommand {

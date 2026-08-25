@@ -21,6 +21,8 @@ import { CHARGE_COMMAND_CAN_ID } from "../src/can/charge-command.ts";
 //                       edge (frames start→stop→start), which a continuous --hold stream never is.
 //     --pair            replay the EXACT captured stop: 0x120 `96 ff 01…` then 0x121 `16 ff 01…`,
 //                       once each. This is what the dash actually put on the bus (see 2026-08-25).
+//     --request-only    send ONLY the 0x120 half `96 ff 01…`, no 0x121 — the mirror of the earlier
+//                       0x121-only test. Tells us whether the request-twin alone commits the stop.
 //     --watch S         seconds to watch before and after the send (default 20)
 //
 // 2026-08-25 CRACKED by whole-bus capture of the two-press stop: the dash emits a PAIR of frames,
@@ -114,6 +116,10 @@ if (options.pair) {
   for (const item of STOP_PAIR) {
     console.log(`  0x${item.id.toString(16)}  ${hex(Uint8Array.from(item.bytes))}`);
   }
+} else if (options.requestOnly) {
+  console.log(
+    `\nsending ONLY the 0x120 request-twin: ${hex(Uint8Array.from(STOP_PAIR[0].bytes))}  — no 0x121 companion`
+  );
 } else {
   console.log(`\ncrafted 0x121 stop candidate: ${hex(frame)}  — ${options.why}`);
 }
@@ -153,6 +159,16 @@ if (options.pair) {
       await sleep(20);
     }
     console.log(`  pair ${sent + 1}/${options.repeat} sent  ${snapshot()}`);
+    await sleep(500);
+  }
+} else if (options.requestOnly) {
+  // Send ONLY the 0x120 request-twin, no 0x121 — the mirror of the earlier 0x121-only test that
+  // armed the prompt but never completed. If this alone stops the charge, 0x120 carries the commit.
+  const request = STOP_PAIR[0];
+  console.log(`\n→ sending the 0x120 request-twin ONLY ${options.repeat}×…`);
+  for (let sent = 0; sent < options.repeat; sent += 1) {
+    sendFrame(request.id, Uint8Array.from(request.bytes));
+    console.log(`  send ${sent + 1}/${options.repeat}  ${snapshot()}`);
     await sleep(500);
   }
 } else if (options.taps > 0) {
@@ -202,7 +218,7 @@ if (options.pair) {
 }
 
 await watchWindow("AFTER", options.watchSeconds);
-printVerdict(before, latest);
+printVerdict(before, latest, sentDescription(options));
 process.exit(0);
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -227,7 +243,19 @@ function snapshot(): string {
   return WATCHED_KEYS.map(key => (latest.has(key) ? `${key}=${latest.get(key)}` : `${key}=—`)).join("  ");
 }
 
-function printVerdict(before: Map<string, number>, after: Map<string, number>): void {
+// What was actually put on the bus, for the verdict line — the single 0x121 candidate, the
+// captured pair, or (for --request-only) just the 0x120 request-twin.
+function sentDescription(options: Options): string {
+  if (options.pair) {
+    return STOP_PAIR.map(item => `0x${item.id.toString(16)} ${hex(Uint8Array.from(item.bytes))}`).join(" then ");
+  }
+  if (options.requestOnly) {
+    return `0x120 ${hex(Uint8Array.from(STOP_PAIR[0].bytes))} (request-twin only)`;
+  }
+  return `0x121 ${hex(frame)}`;
+}
+
+function printVerdict(before: Map<string, number>, after: Map<string, number>, sent: string): void {
   const stopped = STOP_INDICATOR_KEYS.some(key => (before.get(key) ?? 0) > 0 && (after.get(key) ?? 0) === 0);
   const mainsBefore = before.get("mains_v") ?? 0;
   const mainsAfter = after.get("mains_v") ?? 0;
@@ -236,7 +264,7 @@ function printVerdict(before: Map<string, number>, after: Map<string, number>): 
   console.log("\n" + "=".repeat(60));
   if (stopped || mainsCollapsed) {
     console.log("VERDICT: the charge STOPPED after the send — this candidate is a stop command.");
-    console.log(`  ${hex(frame)}   record it in docs/can-0x121-charge-command.md and build the button.`);
+    console.log(`  ${sent}   record it in docs/can-0x121-charge-command.md and build the button.`);
   } else {
     console.log("VERDICT: nothing stopped — the VCU ignored this candidate, or the charge was");
     console.log("  already idle. Confirm the bike was charging BEFORE, then try the next candidate.");
@@ -261,6 +289,7 @@ interface Options {
   incrementByte: number | null;
   taps: number;
   pair: boolean;
+  requestOnly: boolean;
   watchSeconds: number;
 }
 
@@ -273,6 +302,7 @@ function parseArguments(argv: string[]): Options {
   let incrementByte: number | null = null;
   let taps = 0;
   let pair = false;
+  let requestOnly = false;
   let watchSeconds = 20;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -306,6 +336,8 @@ function parseArguments(argv: string[]): Options {
       }
     } else if (flag === "--pair") {
       pair = true;
+    } else if (flag === "--request-only") {
+      requestOnly = true;
     } else if (flag === "--watch") {
       watchSeconds = Number(argv[++index]);
     } else {
@@ -313,13 +345,14 @@ function parseArguments(argv: string[]): Options {
     }
   }
 
-  // --pair carries its own two frames (STOP_PAIR), so a candidate/bytes is not required with it.
-  if (bytes === null && !pair) {
+  // --pair and --request-only carry their own frames (STOP_PAIR), so a candidate/bytes is not
+  // required with either.
+  if (bytes === null && !pair && !requestOnly) {
     throw new Error(
-      `required: --candidate NAME (one of ${Object.keys(CANDIDATES).join(", ")}), --bytes "…", or --pair.`
+      `required: --candidate NAME (one of ${Object.keys(CANDIDATES).join(", ")}), --bytes "…", --pair, or --request-only.`
     );
   }
-  return { bytes: bytes ?? [], why, send, repeat, holdSeconds, incrementByte, taps, pair, watchSeconds };
+  return { bytes: bytes ?? [], why, send, repeat, holdSeconds, incrementByte, taps, pair, requestOnly, watchSeconds };
 }
 
 function parseBytes(text: string | undefined): number[] {
