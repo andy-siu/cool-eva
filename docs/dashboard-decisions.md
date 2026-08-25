@@ -655,7 +655,9 @@ Why a dwell and not one of the obvious alternatives:
 
 `armedAt` is `performance.now()`, never `Date.now()`, for the reason CLAUDE.md gives for `monotonicNow()` on the Pi: this page has a button on it that STEPS A CLOCK, and the Pi steps its own from GPS. A wall clock that jumps backwards mid-gesture hands out a dwell that never elapses; one that jumps forwards hands out none at all. It is deliberately not a `van.state` — nothing renders from it, and making it one would re-run every caption binding on each arm to no visible effect.
 
-`arm()` is the ONLY way `armed` is set to a non-empty key. All three arming sites go through it — `ActionButton`'s own `onclick`, `armWrite()` and `armClockSync()` — so no control can be armed without also being subject to the dwell. Disarming stays a plain `armed.val = ""` and needs no stamp: every firing site tests `armed.val` first, and an empty key matches none of them.
+`arm()` is the ONLY way `armed` is set to a non-empty key. Every arming site goes through it — `ActionButton`'s own `onclick`, `armWrite()`, `armClockSync()`, and `armChargeCurrent()` in the charge tab — so no control can be armed without also being subject to the dwell. Disarming stays a plain `armed.val = ""` and needs no stamp: every firing site tests `armed.val` first, and an empty key matches none of them.
+
+`arm()`, `armDwellElapsed()`, `refuseKeyRepeat()`, `ARM_DWELL_MS` and the `armed` state moved to `public/lib/arming.js` on 2026-08-24, when the charge tab grew a bus-writing control of its own. They are shared so there is ONE dwell rule for the whole dashboard rather than a second copy that could drift; both surfaces are only ever visible one at a time, so a single shared `armed` key across them is right — arming anything disarms everything.
 
 ### Why `event.repeat` rather than a longer dwell — `refuseKeyRepeat()`
 
@@ -843,3 +845,53 @@ The no-undo line is rendered through `NoUndoLine`, not hand-rolled: rendering th
 `refreshVcuWrite()` is called by `views/service-mode.js` whenever the sheet opens: it refreshes, disarms and re-folds everything. Re-folding is not in `forgetSelection()`, which also runs when the PARAMETER changes — the irreversible actions have nothing to do with which parameter is selected. The `dangerOpen` reset belongs to the sheet-opening reset alone, for the same reason `armed` is cleared there: the state a sheet opens in is the state a thumb finds when it is reaching for something else, and that state must not contain `31 FC`.
 
 `fetchStatus()` is kept apart from `refreshVcuWrite()` because arming the clock sync needs a fresh `clock.iso` and must not wipe a parameter reading somebody took thirty seconds ago.
+
+## Commanding charge current from the charge tab — `views/charge-current.js`
+
+The one control that changes the bike from OUTSIDE the service-mode sheet (added 2026-08-24). It commands the charge-current limit on `0x121` while a charge is live — see `docs/can-0x121-charge-command.md` for the frame and how the injection was proven.
+
+### It carries the sheet's whole safety model into the charge tab
+
+The command still goes through `POST /vcu-write?action=charge-current` — so `SERVICE_WRITE_ENABLED` and the audit journal apply exactly as they do to a parameter write, and the runner (`performChargeCurrent` in `src/vcu/write-runner.ts`) makes every real decision. The control reuses the shared two-tap dwell (`lib/arming.js`), and `armChargeCurrent()` refreshes the status before it arms — whether writes are still enabled and the session still live must be the Pi's answer now.
+
+⚠️ **One thing does NOT carry over: the stationary service gate.** That gate (`speed=0`, drive down, not energized) is right for a parameter write and wrong for a charging operation — a charging bike is energized by definition and tethered by definition, and the gate only excuses `energized` while it sees fresh charger frames, which flap with the trickle, so applying it refuses a legitimate command mid-charge. `write-runner.ts` exempts `charge-current` from it (its real precondition, a live session, is checked off `charge_manager_state`), and the control does the same — `commandable()` and visibility never read `gate.safe`.
+
+### Session presence rides on `charge_manager_state`, NOT `charge_type`
+
+⚠️ The signal that says "there is a live charge to command into" is `charge_manager_state` (`0x610` b7: `0x02` AC, `0x23` DC), the cleanest AC/DC discriminator on the bus (`docs/charge-manager.md`). It is emphatically **not** `charge_type` (`0x605` b2), which the first cut used and which made the tile vanish mid-charge: `charge_type` tracks whether AC current is flowing _at this instant_, not whether a session exists, so it flaps 1↔0 as the charger pauses delivery — measured on 2026-08-25 dropping to 0 for an 8-minute stretch mid-trickle while mains were still ~210 V/1.5 A. Each flip fired the old `charge_type`-keyed derive's "session ended" branch and removed the tile. `charge_manager_state` held a steady `0x02` for the whole two-hour plug-in. `0x610` broadcasts continuously, so `isStale(charge_manager_state, 5000)` catches only a real unplug.
+
+### Hidden, not merely disabled — but once shown, it stays put
+
+`ChargeCurrentControl()` returns an empty node unless a session is live (`sessionLive`) AND `GET /vcu-write` reports `enabled === true`. `enabled` is what keeps it off a normal phone: the charge tab is the one screen a phone on the garage wifi sits on unattended, and a bus-writing control there by default is wrong. Once it has appeared for a live charge it stays put across a current pause (the button just disables while the ceiling/session is momentarily unresolved), rather than vanishing — a tile that disappears reads as "it broke". Visibility is `sessionLive && enabled` — two plain `van.state`s, deliberately no `serverTime`.
+
+### The status fetch is lazy, and `sessionLive` is a state so the render stays off `serverTime`
+
+Nothing polls `/vcu-write` for a phone that is not charging; the read-only screen stays a pure WebSocket consumer. A module-level `van.derive` fetches once when a charge appears and clears when it ends. ⚠️ Unlike the first cut, this derive DOES subscribe to `serverTime` (through `liveChargeType() → isStale`), on purpose: the cable coming out is a staleness event with _no value change_, and nothing else would notice it. It is allowed to because it writes the result into the `sessionLive` STATE, and the tile's visibility binding reads that state — so the render never subscribes to `serverTime` and cannot recreate the `<input>` under the cursor. The derive is one equality check per tick; the fetch fires only on the session edge.
+
+### The `<input>` is created once, so a live signal cannot eat the cursor
+
+The amps box is built directly, not inside a binding — its `placeholder` and `disabled` are reactive ATTRIBUTE thunks, which VanJS updates in place. A binding that re-ran on `fast_dc_limit_max_a` (a 10 Hz broadcast) or on `serverTime` would REPLACE the `<input>` element mid-keystroke and take the cursor and focus with it. The service-mode write form dodges this only because its input's bindings key on `selected`/`state`, which do not tick; this control is next to signals that do, so the element has to be stable by construction.
+
+### The AC/DC label and ceiling are echoed, not decided
+
+The runner reads `charge_manager_state` live to pick the opcode (`0x02` → AC, `0x23` → DC) and the ceiling byte (`b4`) itself — DC from the always-broadcast `fast_dc_limit_max_a`, AC from `ac_charge_ceiling_a`, the dash's own last-observed ceiling (an EVENT, only broadcast when the dial moves). The page shows the same signals so the button says what the Pi will do, but it decides nothing: a wrong `b4` on an AC command makes the VCU ignore the value and settle on a ~10 A default, so AC is refused — on the page and again on the Pi — until that ceiling has been seen this session, with the remedy ("nudge the dial") shown where it is actionable rather than after a 409.
+
+### Confirm-gated but reversible — NOT behind the irreversible fold
+
+`charge-current` needs `confirm=charge-current-<amps>` because `curl` can reach `/vcu-write` and a page showing 6 A must not be able to POST 30 — the number is the owner's to say out loud. But it is transient (unplugging resets it), VCU-clamped, and overridable on the bike's own screen, so it is the amber/reversible tier, not one of the three "cannot be undone" actions. `scripts/check-irreversible-actions.ts` was taught this third category (`REVERSIBLE_CONFIRMED`) so the fold's promise stays exactly the three irreversible actions while the check still catches any confirm-gated action that is neither behind the fold nor named reversible.
+
+## Stopping a charge from the charge tab — `views/charge-stop.js`
+
+The second bus-writing control on the charge tab (added 2026-08-25), sitting beside the set-current one. It ends an active charge by replaying the two-frame Mode-button stop the dash emits — `0x120: 96 ff 01 …` then `0x121: 16 ff 01 …`, cracked and proven on-bike (see `docs/can-0x121-charge-command.md` § "CRACKED"). It carries the same safety model as set-current: `POST /vcu-write?action=charge-stop`, `SERVICE_WRITE_ENABLED` + audit journal, the shared two-tap dwell, hidden unless writes are on AND a charge is live, and exempt from the stationary service gate (a charging bike is energized+tethered; the benign direction regardless — worst case a charge halts).
+
+### Two taps, not press-and-hold — even though the bike's gesture is a hold
+
+The rider stops a charge on the bike with two Mode presses (unlock, then interrupt), and the second is described as a ~1.5 s hold. It is tempting to mirror that with a press-and-hold button. We don't, because the real command on the bus is a **discrete pair of frames sent once**, not a sustained stream — a hold would only re-send the same two frames. So the dashboard uses the same arm-then-fire two-tap as every other write here: the first tap arms, the second (after the dwell) fires the pair once. One shared arming rule for the whole dashboard beats a second gesture that would exist only to imitate the bike's UI rather than the bus.
+
+### Source-agnostic, so no opcode or ceiling to choose
+
+Unlike set-current, stop takes no fields and makes no AC/DC decision: the same pair ends both. The runner (`performChargeStop`) needs only a live session — `charge_manager_state` present, fresh, and a settled AC (`0x02`) / DC (`0x23`) — and the page's `commandable()` is just "writes on and a charge is live". `confirm=charge-stop` is a fixed word (no value to embed), gated only because `curl` can reach the endpoint.
+
+### Shared machinery — `lib/charge-write.js`
+
+Adding a second charge-tab write control was the moment to lift the session/status machinery out of `charge-current.js` (which was at the ~400-line split line) into `lib/charge-write.js`: the `writeStatus`/`sessionLive` states, the one lazy `serverTime`-subscribing session derive, `liveChargeType()`/`liveCeiling()`, `fetchChargeWriteStatus()`, and an `onChargeSessionEnd()` hook each control registers to clear its own form. One derive, one status fetch, one definition of "a charge is live" — so the two controls cannot disagree about when a command may be offered.

@@ -185,6 +185,12 @@ const UNCONFIRMED: Record<string, URLSearchParams> = {
   "set-service-point": new URLSearchParams({ action: "set-service-point" }),
   "sync-clock": new URLSearchParams({ action: "sync-clock" }),
   "clear-dtcs": new URLSearchParams({ action: "clear-dtcs" }),
+  // Complete: it carries the amps. Missing only the confirm, so the server refuses it
+  // FOR the confirmation — which is what §3c reads off it.
+  "charge-current": new URLSearchParams({ action: "charge-current", amps: "6" }),
+  // Complete on its own — stop takes no fields. Missing only the confirm, so it too is
+  // refused FOR the confirmation.
+  "charge-stop": new URLSearchParams({ action: "charge-stop" }),
 };
 
 const unknown = accepted.filter(action => UNCONFIRMED[action] === undefined);
@@ -220,11 +226,30 @@ console.log(`\n3b. the Pi refuses ${gated.length} of those without a confirmatio
 // pre-agree with the thing this check exists to test.
 const behindTheFold: string[] = IRREVERSIBLE.map(entry => entry.action);
 
-const gatedNotHidden = gated.filter(action => !behindTheFold.includes(action));
+// ⚠️ THE THIRD CATEGORY, added when charge-current arrived: confirm-gated but REVERSIBLE.
+//
+// The fold's promise is "cannot be undone", and until now that was the same set as "needs
+// a confirm=". charge-current breaks the tie. It is gated because `curl` can reach the
+// endpoint and a page showing 6 A must not be able to POST 30 — the number is the owner's
+// to say out loud — but it undoes itself: the setpoint is transient (unplugging the
+// charger clears it), the VCU clamps anything above the cable's ceiling, and the rider
+// overrides it on the bike's own screen. Behind a fold that says "cannot be undone" that
+// row would lie, so the control lives in the charge menu, not the red drawer.
+//
+// This set is the ONE place that exemption is written down, and adding to it is the same
+// weight of decision as adding to the fold: an action here is one a reviewer has agreed is
+// reversible. An action that is confirm-gated, absent from the fold AND absent here is
+// still the hard failure §3b was built to catch — the exemption is explicit, never a gap.
+// charge-stop joins for the same reason: it is confirm-gated (curl can reach the endpoint, so a
+// deliberate word is required), but ending a charge undoes itself — the rider simply re-plugs or
+// restarts the charge on the bike's own screen. Behind a "cannot be undone" fold that row would lie.
+const REVERSIBLE_CONFIRMED = new Set(["charge-current", "charge-stop"]);
+
+const gatedNotHidden = gated.filter(action => !behindTheFold.includes(action) && !REVERSIBLE_CONFIRMED.has(action));
 check(
   gatedNotHidden.length === 0
-    ? "every action the Pi confirm-gates is behind the fold"
-    : `the Pi confirm-gates ${gatedNotHidden.join(", ")}, which the fold does not hold — ` +
+    ? "every action the Pi confirm-gates is behind the fold or named reversible"
+    : `the Pi confirm-gates ${gatedNotHidden.join(", ")}, which the fold does not hold and REVERSIBLE_CONFIRMED does not name — ` +
         "a destructive control is sitting in the open list with the read-only ones",
   gatedNotHidden.length === 0
 );
@@ -243,6 +268,43 @@ check(
 check(
   "read-service-stamp needs no confirmation and is NOT behind the fold",
   parseWriteRequest(UNCONFIRMED["read-service-stamp"], NOW).ok && !behindTheFold.includes("read-service-stamp")
+);
+
+// --- 3c. The reversible-confirmed actions earn their exemption -----------------
+//
+// The exemption above is only honest if each action it names is actually gated (so it is
+// not smuggling an ungated write past §3b), actually out of the fold (so the drawer's
+// count stays true), and actually accepted once the confirmation the owner's page will
+// send is attached. The confirm token is charge-current-<amps>, built here inline only
+// because the charge-menu control that will send it does not exist yet — when it does,
+// this should call that builder the way §4 calls confirmationFor, not restate the format.
+
+console.log("\n3c. confirm-gated but reversible, so out in the open on purpose");
+
+for (const action of REVERSIBLE_CONFIRMED) {
+  check(`${action} has a fixture to reason about`, UNCONFIRMED[action] !== undefined);
+  check(`${action} is confirm-gated — refused without confirm=`, gated.includes(action));
+  check(`${action} is NOT behind the fold`, !behindTheFold.includes(action));
+}
+
+const chargeConfirmed = new URLSearchParams(UNCONFIRMED["charge-current"]);
+chargeConfirmed.set("confirm", `charge-current-${chargeConfirmed.get("amps")}`);
+const chargeAnswer = parseWriteRequest(chargeConfirmed, NOW);
+check(
+  chargeAnswer.ok
+    ? "charge-current is accepted with confirm=charge-current-<amps>"
+    : `charge-current is REFUSED with its own confirmation — ${chargeAnswer.reason}`,
+  chargeAnswer.ok
+);
+
+const stopConfirmed = new URLSearchParams(UNCONFIRMED["charge-stop"]);
+stopConfirmed.set("confirm", "charge-stop");
+const stopAnswer = parseWriteRequest(stopConfirmed, NOW);
+check(
+  stopAnswer.ok
+    ? "charge-stop is accepted with confirm=charge-stop"
+    : `charge-stop is REFUSED with its own confirmation — ${stopAnswer.reason}`,
+  stopAnswer.ok
 );
 
 // --- 4. The confirmations the page really sends ------------------------------

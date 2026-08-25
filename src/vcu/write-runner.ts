@@ -8,9 +8,12 @@ import type { LatestSweep } from "./snapshot-store.ts";
 import type { TableTypeReport, VcuParameterSnapshot } from "./snapshot.ts";
 import { evaluateTableGate, type TableGateVerdict } from "./table-gate.ts";
 import { appendAuditRecord, recentAuditRecords, type AuditAction, type AuditRecord } from "./write-audit.ts";
+import type { ChargeMode } from "../can/charge-command.ts";
 import {
   clearStoredDtcs,
   readServiceStamp,
+  sendChargeCommand,
+  sendChargeStopCommand,
   setServicePoint,
   syncBikeClock,
   writeParameter,
@@ -66,7 +69,19 @@ export type ServiceWriteRequest =
   /** Broadcast this Pi's UTC on 0x120, setting the bike's clock. Refused if the Pi's clock is not trustworthy. */
   | { kind: "sync-clock" }
   /** ⚠️ IRREVERSIBLE. OBD Mode 04 — erases the stored trouble codes and the freeze frame. */
-  | { kind: "clear-dtcs" };
+  | { kind: "clear-dtcs" }
+  /**
+   * Command the charge-current limit on 0x121. The opcode (AC/DC) and the ceiling to echo are
+   * chosen from the LIVE charge type here, not by the caller — so a stale page cannot frame a
+   * DC command into an AC session. Transient and rider-overridable; refused unless charging.
+   */
+  | { kind: "charge-current"; amps: number }
+  /**
+   * Stop an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+   * Source-agnostic — the same pair ends AC and DC — so it carries no fields; the only
+   * precondition is a live session, checked off charge_manager_state like charge-current.
+   */
+  | { kind: "charge-stop" };
 
 /** How an action came out, in the shape the page renders. */
 export interface ServiceWriteResult {
@@ -219,6 +234,21 @@ const GATE_WATCH_INTERVAL_MS = 200;
 /** How many journal lines the page shows. Enough to see the last session's work. */
 const RECENT_AUDIT_LINES = 12;
 
+/**
+ * How fresh charge_manager_state must be before a charge-current command is honoured.
+ *
+ * ⚠️ charge_manager_state (0x610 b7), NOT charge_type (0x605 b2). charge_type names "AC current
+ * flowing right now", not "a session exists" — it flaps 1↔0 within one plug-in as the charger
+ * pauses delivery (measured 8 min at 0 mid-trickle, 2026-08-25; docs/charge-manager.md §charge_type
+ * flaps). charge_manager_state holds 0x02 (AC) / 0x23 (DC) steady for the whole session, and 0x610
+ * broadcasts continuously, so a stale reading means the cable came out — exactly when to refuse.
+ */
+const CHARGE_SESSION_MAX_AGE_MS = 5000;
+
+/** charge_manager_state (0x610 b7) settled values — the cleanest AC/DC discriminator. docs/charge-manager.md. */
+const CHARGE_MANAGER_STATE_AC = 0x02;
+const CHARGE_MANAGER_STATE_DC = 0x23;
+
 interface WriteContext extends VcuWriteRunnerOptions {
   running: RunningWriteSession | null;
 }
@@ -370,9 +400,22 @@ async function checkPreconditions(
         "the bus is listen-only (OBD_ENABLED=0) — nothing can be transmitted, so a write would silently do nothing",
     };
   }
-  const verdict = context.gate();
-  if (!verdict.safe) {
-    return { ok: false, reason: `the bike is not safe to service — ${verdict.blockers.join("; ")}` };
+  // ⚠️ charge-current AND charge-stop are EXEMPT from the stationary gate, and this is a
+  // deliberate exemption, not a hole. That gate refuses PARAMETER writes while the bike could move
+  // or its drive is live — but a charging bike is energized by definition and tethered by
+  // definition (it cannot be ridden away while plugged in, the same argument service-gate.ts's
+  // CHARGE_EVIDENCE rests on), and commanding its charge current — or stopping the charge — is a
+  // charging operation. Worse, the gate only excuses `energized` while it sees fresh charger
+  // frames, and those flap with the trickle, so applying it here refuses a legitimate command
+  // mid-charge. Their real precondition — a live, established session — is checked off
+  // charge_manager_state in performChargeCurrent / performChargeStop. So this Pi's own switches
+  // (enabled/CAN/bus, above) still gate them; the bike-state gate does not. Stopping is the benign
+  // direction regardless: worst case the charge halts, which is the whole point of the button.
+  if (request.kind !== "charge-current" && request.kind !== "charge-stop") {
+    const verdict = context.gate();
+    if (!verdict.safe) {
+      return { ok: false, reason: `the bike is not safe to service — ${verdict.blockers.join("; ")}` };
+    }
   }
   // Sampled ONLY for the actions that thread it, which is the invariant worth keeping:
   // the report this refusal is decided from is the same object ./write-codec.ts
@@ -462,6 +505,10 @@ async function performOnBus(
       return await performClockSync(context, channel);
     case "clear-dtcs":
       return await performClearDtcs(context, channel);
+    case "charge-current":
+      return await performChargeCurrent(context, request, channel);
+    case "charge-stop":
+      return await performChargeStop(context, channel);
   }
 }
 
@@ -731,6 +778,169 @@ function describeClear(outcome: ClearDtcsOutcome): string {
     case "failed":
       return `Nothing confirmed: ${outcome.reason}`;
   }
+}
+
+/**
+ * Commands the charge current, choosing the opcode and ceiling from the LIVE session state.
+ *
+ * ⚠️ The mode is read off charge_manager_state here rather than trusted from the caller: the two
+ * frames are otherwise identical, and a DC-framed command sent into an AC session (or vice versa)
+ * is silently ignored by the VCU, so a page that opened during a DC charge must not be able to
+ * command DC into the AC charge that replaced it. For the same reason the command is refused
+ * outright unless a session is established — charge_manager_state present, fresh, and one of
+ * AC (0x02) / DC (0x23). ⚠️ NOT charge_type: it flaps 1↔0 mid-session (see CHARGE_SESSION_MAX_AGE_MS).
+ *
+ * The ceiling (b4) is not a guess: DC uses fast_dc_limit_max_a (a 10 Hz broadcast, always
+ * present awake), AC uses ac_charge_ceiling_a (the dash's own last b4, an EVENT). If the AC
+ * ceiling has not been seen this session the command is refused with the remedy, because a
+ * wrong b4 makes the VCU reject the value and settle on a ~10 A default — the exact silent
+ * mis-command this whole feature exists to avoid. docs/can-0x121-charge-command.md.
+ */
+async function performChargeCurrent(
+  context: WriteContext,
+  request: Extract<ServiceWriteRequest, { kind: "charge-current" }>,
+  channel: RawChannel
+): Promise<ServiceWriteAnswer> {
+  const chargeState = latestValue("charge_manager_state");
+  const chargeStateAge = ageMs("charge_manager_state");
+  if (chargeState === null || chargeStateAge === null || chargeStateAge > CHARGE_SESSION_MAX_AGE_MS) {
+    return {
+      ok: false,
+      reason:
+        "not charging — charge_manager_state is absent or stale, so there is no live session to command a current into. Plug the bike in first.",
+    };
+  }
+  let mode: ChargeMode;
+  let ceilingKey: string;
+  if (chargeState === CHARGE_MANAGER_STATE_AC) {
+    mode = "ac";
+    ceilingKey = "ac_charge_ceiling_a";
+  } else if (chargeState === CHARGE_MANAGER_STATE_DC) {
+    mode = "dc";
+    ceilingKey = "fast_dc_limit_max_a";
+  } else {
+    return {
+      ok: false,
+      reason: `charge_manager_state reads 0x${chargeState.toString(16)}, not a settled AC (0x02) or DC (0x23) session — the charge handshake may still be in progress. Retry in a moment.`,
+    };
+  }
+
+  const ceiling = latestValue(ceilingKey);
+  if (ceiling === null) {
+    return {
+      ok: false,
+      reason:
+        mode === "ac"
+          ? "the AC charge ceiling has not been seen this session — nudge the charge-current dial once on the bike's own screen so the dash broadcasts it, then retry. Sending an AC command with the wrong ceiling byte makes the VCU ignore it and default to ~10 A."
+          : "the DC charge ceiling (fast_dc_limit_max_a) has not arrived — it broadcasts whenever the bike is awake, so this means CAN is not being received. Not commanding blind.",
+    };
+  }
+  if (!Number.isInteger(request.amps) || request.amps < 1 || request.amps > ceiling) {
+    return {
+      ok: false,
+      reason: `${request.amps} A must be a whole number between 1 and the live ${mode.toUpperCase()} ceiling of ${ceiling} A`,
+    };
+  }
+
+  console.warn(
+    `vcu-write: about to command ${mode.toUpperCase()} charge current ${request.amps} A (ceiling ${ceiling} A) on 0x121`
+  );
+  const outcome = sendChargeCommand(channel, mode, request.amps, ceiling);
+  await appendAuditRecord(context.directory, {
+    at: Date.now(),
+    clockTrustworthy: readPiClock().trustworthy,
+    action: "charge-current",
+    status: outcome.status,
+    requested: request.amps,
+    // No synchronous read-back: 0x121 has no reply. The effect surfaces on the dash's set
+    // display and, current permitting, on charge_limit_a — neither is available in-band here.
+    after: null,
+    rawHex: outcome.status === "sent" ? outcome.hex : undefined,
+    note:
+      outcome.status === "sent"
+        ? `${mode.toUpperCase()} ${request.amps} A, ceiling ${ceiling} A, on 0x121; event frame with no reply — confirm on the dash / charge_limit_a`
+        : outcome.reason,
+  });
+  if (outcome.status !== "sent") {
+    return { ok: false, reason: outcome.reason };
+  }
+  return {
+    ok: true,
+    result: {
+      action: "charge-current",
+      status: "sent",
+      message:
+        `Commanded ${mode.toUpperCase()} charge current ${request.amps} A on 0x121 (${outcome.hex}). ` +
+        "⚠️ This is an event frame with no reply — watch the dash's set value and charge_limit_a to see it take. " +
+        "A full battery caps the current that actually flows regardless. The setting is transient (unplugging resets it) " +
+        "and you can override it on the bike's own screen.",
+      succeeded: true,
+    },
+  };
+}
+
+/**
+ * Stops an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+ *
+ * Source-agnostic — the same pair ends AC and DC — so it takes no fields and, unlike
+ * performChargeCurrent, needs no opcode/ceiling lookup. The one precondition is the same live
+ * session: charge_manager_state present, fresh, and a settled AC (0x02) / DC (0x23) — refused
+ * otherwise, since there is no charge to stop. ⚠️ NOT charge_type, which flaps mid-session.
+ *
+ * Fire-and-forget like charge-current: 0x121/0x120 are event frames with no reply, so "sent" is
+ * the strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
+ * following seconds as the bike's "interruption in progress" countdown runs. Audited with after:null.
+ */
+async function performChargeStop(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
+  const chargeState = latestValue("charge_manager_state");
+  const chargeStateAge = ageMs("charge_manager_state");
+  if (chargeState === null || chargeStateAge === null || chargeStateAge > CHARGE_SESSION_MAX_AGE_MS) {
+    return {
+      ok: false,
+      reason:
+        "not charging — charge_manager_state is absent or stale, so there is no live session to stop. Nothing to do.",
+    };
+  }
+  if (chargeState !== CHARGE_MANAGER_STATE_AC && chargeState !== CHARGE_MANAGER_STATE_DC) {
+    return {
+      ok: false,
+      reason: `charge_manager_state reads 0x${chargeState.toString(16)}, not a settled AC (0x02) or DC (0x23) session — the charge handshake may still be in progress. Retry in a moment.`,
+    };
+  }
+
+  const mode = chargeState === CHARGE_MANAGER_STATE_AC ? "AC" : "DC";
+  console.warn(`vcu-write: about to stop the ${mode} charge — replaying the 0x120 + 0x121 Mode-stop pair`);
+  const outcome = await sendChargeStopCommand(channel);
+  await appendAuditRecord(context.directory, {
+    at: Date.now(),
+    clockTrustworthy: readPiClock().trustworthy,
+    action: "charge-stop",
+    status: outcome.status,
+    // No synchronous read-back: the stop pair has no reply. The effect surfaces as the charge
+    // tearing down (mains_v → 0, charger_enabled → 0) over the next several seconds.
+    after: null,
+    rawHex: outcome.status === "sent" ? outcome.hex : undefined,
+    note:
+      outcome.status === "sent"
+        ? `${mode} stop pair on 0x120 + 0x121; event frames with no reply — confirm by the charge winding down`
+        : outcome.reason,
+  });
+  if (outcome.status !== "sent") {
+    return { ok: false, reason: outcome.reason };
+  }
+  return {
+    ok: true,
+    result: {
+      action: "charge-stop",
+      status: "sent",
+      message:
+        `Sent the stop-charging command (${outcome.hex}). ` +
+        "⚠️ These are event frames with no reply — the charge winds down over the next several seconds " +
+        "as the bike's own 'interruption in progress' countdown runs; watch mains voltage and charger_enabled fall. " +
+        "You may need to unplug the cable when the bike prompts you.",
+      succeeded: true,
+    },
+  };
 }
 
 /**
