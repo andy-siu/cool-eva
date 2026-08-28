@@ -135,7 +135,8 @@ export function VcuWrite() {
     // that did not exist. `.failure`, not `.action-note`, and Availability() stands its
     // ellipsis down beside it — docs/dashboard-decisions.md §"The section heading".
     () => (!hasControls() && message.val ? div({ class: "action-note failure" }, message.val) : div()),
-    () => (hasControls() ? div(ParameterForm(), HeadlightSection(), ServiceActions(), Journal()) : div())
+    () =>
+      hasControls() ? div(ParameterForm(), HeadlightSection(), ResetVcuSection(), ServiceActions(), Journal()) : div()
   );
 }
 
@@ -706,6 +707,34 @@ function HeadlightSection() {
 }
 
 /**
+ * Reset the VCU — restarts both micros with ECUReset (11 02), a key-cycle restart.
+ *
+ * Placed right under the headlight restore because that is the reason it exists: a
+ * parameter change like the headlight one above comes up OFF/ON only at the next
+ * key-cycle, and this is the key-cycle without walking to the bike.
+ *
+ * ⚠️ Reversible — the bike reboots and comes back — so it is the plain tier, NOT behind
+ * the irreversible fold. It is still gated: the server refuses it mid-charge and, through
+ * the shared safety gate, while the bike could move. Both nodes always restart together;
+ * resetting one alone latches a fault on its partner.
+ */
+function ResetVcuSection() {
+  return div(
+    h3({ class: "sheet-title" }, "Reset VCU"),
+    ActionButton("reset-vcu", () => "🔄  Reset the VCU (restart both processors)", {
+      confirm: "RESTART both VCU processors now",
+      does:
+        "Sends ECUReset 11 02 to both VCU micros (Control 0xA9 and Safety 0xA8), back-to-back — a key-cycle " +
+        "restart. Nothing is erased and no setting reverts. It is how a parameter change (like the headlight above) " +
+        "takes effect without walking to the bike to key it off and on.",
+      caution:
+        "⚠️ The bike drops off the bus for a second or two while both micros reboot; the dash reconnects on its own. " +
+        "Refused if charging or moving. If a fault stays latched afterwards, key off for 30 s and on.",
+    })
+  );
+}
+
+/**
  * One of the two headlight buttons. `off` picks which: the amber “writes” tier for
  * disabling (it changes the bike), the plain tier for restoring.
  *
@@ -1007,7 +1036,7 @@ function ClockAction() {
  */
 
 /**
- * @param {"read-service-stamp" | "set-service-point" | "clear-dtcs"} action
+ * @param {"read-service-stamp" | "set-service-point" | "clear-dtcs" | "reset-vcu"} action
  * @param {() => string} caption
  * @param {ConfirmableAction} notes
  */
