@@ -1,7 +1,7 @@
 import { canIdsFor, parseResponseFrame } from "../src/vcu/param-codec.ts";
 
 // Probes — and, with a force flag, exercises — the UDS InputOutputControl (0x2F) route that
-// EMSuite uses to drive the VCU's body outputs (headlight, indicators, horn, …). See
+// the manufacturer's service tool uses to drive the VCU's body outputs (headlight, indicators, horn, …). See
 // docs/headlight-diagnostic-control.md. This is the general io_set/io_get harness the on-bike RE
 // needs; --off/--on are just the headlight preset (control 17).
 //
@@ -41,7 +41,7 @@ const NEGATIVE_RESPONSE = 0x7f;
 const SECURITY_REQUEST_SEED = 0x01;
 const SECURITY_SEND_KEY = 0x02;
 
-// IOControl sub-commands (UDS 0x2F), as EMSuite uses them.
+// IOControl sub-commands (UDS 0x2F), as the service tool uses them.
 const IO_SET = 0x07; // shortTermAdjustment
 const IO_GET_OUTPUT = 0x00; // commanded output state
 const IO_GET_READING = 0x01; // live current sense
@@ -53,7 +53,7 @@ const IO_GET_READING = 0x01; // live current sense
 // proven-steady value (the strobe→steady threshold is somewhere between 5 and 40 ms).
 const DEFAULT_REASSERT_MS = 5;
 
-// Headlight preset: EMSuite's LIGHTS table (from a model's specialControls.json, which is NOT in
+// Headlight preset: the service tool's LIGHTS table (from a model's specialControls.json, which is NOT in
 // the em-diagnostics repo — so these ids may not match this Eva Ribelle; that is what we're testing).
 const BEAM_OUTPUT_CONTROL = 17; // "Low + high beam"
 const BEAM_SENSE_CONTROL = 18; // its current sense
@@ -366,7 +366,7 @@ function controlBytes(control: number): number[] {
 }
 
 /**
- * The value from a 0x6F IOControl reply, decoded exactly as EMSuite does (emdiag_vcu._io_value):
+ * The value from a 0x6F IOControl reply, decoded exactly as the service tool does (emdiag_vcu._io_value):
  * the reply echoes the identifier first, so the value is the trailing byte(s). Our payload keeps
  * the leading service byte, so measure the post-service length: ≥5 → a signed 16-bit reading,
  * else the trailing single byte (an output command). This is why a get-output shows 0/255 and a

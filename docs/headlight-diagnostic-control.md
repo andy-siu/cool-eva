@@ -2,14 +2,14 @@
 
 > There are **two** confirmed diagnostic ways to switch the beam off. This file covers the immediate-but-decaying io_set force. The other — a **persistent** write to the beam current threshold — is in [headlight-beam-threshold.md](headlight-beam-threshold.md), and is the better match for a rider seeing the light off after a restart with a beam-fault on the dash.
 
-The headlight _can_ be switched off over the bus, just not by any broadcast frame. It is a UDS **InputOutputControlByLocalID (`0x2F`)** command to the **VCU-Safety** node, the same channel Energica's own service tool (EMSuite) uses in its guided actuator tests. This corrects the general claim in [headlight-charge-interlock.md](headlight-charge-interlock.md) — that "there is no CAN message whose assertion turns the headlights off." That is true of the charge frames and the `0x102` status bits (which are read-only telemetry the VCU broadcasts), and false of the diagnostic channel.
+The headlight _can_ be switched off over the bus, just not by any broadcast frame. It is a UDS **InputOutputControlByLocalID (`0x2F`)** command to the **VCU-Safety** node, the same channel the manufacturer's own service tool uses in its guided actuator tests. This corrects the general claim in [headlight-charge-interlock.md](headlight-charge-interlock.md) — that "there is no CAN message whose assertion turns the headlights off." That is true of the charge frames and the `0x102` status bits (which are read-only telemetry the VCU broadcasts), and false of the diagnostic channel.
 
 ## Provenance
 
-Reverse-engineered from `../em-diagnostics` (a working reimplementation of EMSuite 1.3.0, decompiled July 2024), cross-checked two ways that agree:
+Reverse-engineered from `../em-diagnostics` (a working reimplementation of the manufacturer's service tool v1.3.0, decompiled July 2024), cross-checked two ways that agree:
 
 - Its **Lights page** (`qt/pages/lights.py`, `qt/wiring.py::_lights_force`), which drives each output by hand.
-- Energica's **own `LOW_BEAM` guided test** in the decompiled test tables (`tests_data.py`), i.e. what EMSuite itself sends. The two match on control id, node, and the 255/0 values, so the recipe is the vendor's, not a guess.
+- Energica's **own `LOW_BEAM` guided test** in the decompiled test tables (`tests_data.py`), i.e. what the service tool itself sends. The two match on control id, node, and the 255/0 values, so the recipe is the vendor's, not a guess.
 
 ## The recipe
 
@@ -26,7 +26,7 @@ Frame layout is `[node][pci][sid][data…]`. `io_set` builds the data as `<id_hi
 
 ### Preconditions — a held diagnostic session
 
-IO-control is refused without SecurityAccess, even for a read. The full sequence EMSuite runs:
+IO-control is refused without SecurityAccess, even for a read. The full sequence the service tool runs:
 
 1. **StartDiagnosticSession** `0x10` type `0x81` → `7C0: A8 02 10 81 …`
 2. **SecurityAccess `0x27`** — request seed (`A8 02 27 01`), compute the key, send it (`A8 06 27 02 <key>`). VCU-Safety's key is `calc_key`, a 4-byte exchange: swap adjacent bits of the seed, then subtract `0x3E5F4542` (≡ add `0xC1A0BABE`). Fixed per module — no firmware version in the decision, and no per-device constant table for the VCU family (only PSU/BMS use the separate generator).
@@ -50,7 +50,7 @@ Run from the Pi with `scripts/headlight-off.ts` (a scratch probe that speaks `0x
 
 So the earlier reading of this — "`0` = release to normal, and normal is on, so force-off can't work" — was **wrong**, an artifact of re-asserting too slowly (150 ms) and reading the recovery blips. `0` genuinely forces the output off.
 
-**Actuation confirmed independently on the brake light too.** Forcing an output that is normally _off_ — the brake, out 11 / sense 12 (0 mA at rest) — to `255` drove `sense 12` to 73–74 mA, inside EMSuite's `BRAKE_LIGHT` active window (50–100 mA). Same pulse behaviour: at a 150 ms re-assert it alternated 73 mA / 0. So `io_set` drives outputs in both directions; the only trick is out-running the decay.
+**Actuation confirmed independently on the brake light too.** Forcing an output that is normally _off_ — the brake, out 11 / sense 12 (0 mA at rest) — to `255` drove `sense 12` to 73–74 mA, inside the service tool's `BRAKE_LIGHT` active window (50–100 mA). Same pulse behaviour: at a 150 ms re-assert it alternated 73 mA / 0. So `io_set` drives outputs in both directions; the only trick is out-running the decay.
 
 The get-output register interpretation still holds: a read-only sweep of ids 1–48 (`--sweep`) shows **every output's commanded state reads `0`** whether the load is on or off, so sub `0x00` is the _diagnostic-override register_ (0 = "not overridden"), **not** the physical output state. Physical state is read from the current _sense_ (sub `0x01`), not the commanded value.
 

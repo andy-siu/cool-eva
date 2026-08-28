@@ -26,8 +26,8 @@ import { canIdsFor, identifierForIndex, parseResponseFrame, toHex } from "../src
 // scripts/headlight-off.ts. It reuses param-codec's PROVEN framing helpers but builds the write
 // frame itself, because the shipped codec cannot.
 //
-// ⚠️ A write here is PERSISTENT. It stores a DTC the VCU keeps until cleared (EMSuite / the
-// em-diagnostics DTC page). --restore puts the factory thresholds back but does NOT clear the DTC.
+// ⚠️ A write here is PERSISTENT. It stores a DTC the VCU keeps until cleared (the manufacturer's
+// service tool / the em-diagnostics DTC page). --restore puts the factory thresholds back but does NOT clear the DTC.
 //
 // PRECONDITIONS for a write: bike on its stand, key ON, headlight on, clear of moving parts, not ridden.
 
@@ -277,7 +277,7 @@ async function writeParam(key: BeamParamKey, value: number): Promise<boolean> {
   return true;
 }
 
-/** Live beam current via io_get (0x2F sub 0x01). Signed 16-bit trailing, per EMSuite's decode. */
+/** Live beam current via io_get (0x2F sub 0x01). Signed 16-bit trailing, per the service tool's decode. */
 async function readSense(): Promise<number | null> {
   const reply = await transact([
     SERVICE_IO_CONTROL,
