@@ -80,6 +80,35 @@ const busy = van.state(false);
 const writing = van.state(false);
 const message = van.state("");
 
+/**
+ * The headlight-off control's fixed parameter and its two fixed values.
+ *
+ * ⚠️ NOT a new action. This is the ordinary allowlisted parameter write — a fresh read,
+ * the compare-and-swap, the read-back — on ONE parameter and two fixed values, wrapped
+ * in two buttons so nobody has to know the name or the number. The mechanism and its
+ * on-bike proof are in docs/headlight-beam-threshold.md: the beam's over-current
+ * threshold, written below the beam's real draw, makes the VCU fault the beam OPEN
+ * CIRCUIT at its next initialisation and bring it up dark. Persistent, and reversible by
+ * writing the threshold back to factory.
+ *
+ * ⚠️ The off value is FIXED, not measured. The proven route reads the live beam sense
+ * (control 18) and writes half of it — but that read is on the banned 0x2F diagnostic
+ * path, so this ships a constant below any real beam draw instead. 1810 mA sits well
+ * under this bike's ~3600 mA beam and above zero; a beam drawing less than 1810 mA would
+ * not fault, which is the one case where the button does nothing.
+ */
+const BEAM_MAX_PARAM = "BEAM_MAX_CURR_TH";
+const BEAM_MAX_OFF_MA = 1810;
+/** params.ecf's factory value for BEAM_MAX_CURR_TH — what “restore” puts back. */
+const BEAM_MAX_FACTORY_MA = 7500;
+
+/**
+ * The BEAM_MAX_CURR_TH value the first tap read off the bike, held for the second tap to
+ * send as `expected=`. Cleared on every sheet open and after every attempt, so a value
+ * read for one gesture can never be sent as the precondition of a later one.
+ */
+const headlightExpected = van.state(/** @type {number | null} */ (null));
+
 export function VcuWrite() {
   return div(
     // The only amber heading: the line the sheet's read half ends at.
@@ -106,7 +135,7 @@ export function VcuWrite() {
     // that did not exist. `.failure`, not `.action-note`, and Availability() stands its
     // ellipsis down beside it — docs/dashboard-decisions.md §"The section heading".
     () => (!hasControls() && message.val ? div({ class: "action-note failure" }, message.val) : div()),
-    () => (hasControls() ? div(ParameterForm(), ServiceActions(), Journal()) : div())
+    () => (hasControls() ? div(ParameterForm(), HeadlightSection(), ServiceActions(), Journal()) : div())
   );
 }
 
@@ -623,6 +652,111 @@ function Outcome() {
       verify ? div({ style: `color:${WATCH}`, class: "action-note" }, `🔍  ${verify}`) : div()
     );
   });
+}
+
+/**
+ * Two buttons that turn the headlight off and back on, over the bus.
+ *
+ * ⚠️ Nothing here is a new lever on the bike. Both buttons POST the SAME
+ * `action=parameter` write the form above sends, on `BEAM_MAX_CURR_TH` and a fixed
+ * value — so the allowlist, the compare-and-swap, the read-back, the table gate and the
+ * audit journal all apply exactly as they do to any other parameter write. What this
+ * adds is the fixed parameter, the two fixed values, and the caveat a person needs.
+ *
+ * ⚠️ Hidden entirely when the bike's table has no BEAM_MAX_CURR_TH — a parameter write
+ * by index against a bike that does not carry it is exactly what the table gate exists
+ * to refuse, so the page does not offer the button.
+ */
+function HeadlightSection() {
+  return div(() => {
+    if (!beamTarget()) {
+      return div();
+    }
+    return div(
+      h3({ class: "sheet-title" }, "Headlight"),
+      div(
+        { class: "action-note", style: `color:${MUTED}` },
+        `Writes ${BEAM_MAX_PARAM} below what the beam actually draws, so the VCU brings the beam up OFF at the next ` +
+          "power-on and stores a beam-fault (the “low circuit amps” warning on the dash). It is an ordinary parameter " +
+          "write — read off the bike first, then read back — and reversible."
+      ),
+      div(
+        { class: "action-block" },
+        // ⚠️ Above the button, on the way to the thumb: this is the one thing about it a
+        // person will not expect. It is NOT a live switch — the light stays on until the
+        // bike is keyed off and on again.
+        div(
+          { class: "action-note caution" },
+          "⚠️ Not immediate. The beam stays on for the rest of THIS power-on; it comes up dark only at the next " +
+            "key-cycle, with a beam-fault showing on the dash until you restore it."
+        ),
+        HeadlightButton(true)
+      ),
+      div(
+        { class: "action-block" },
+        div(
+          { class: "action-note" },
+          `Puts ${BEAM_MAX_PARAM} back to the factory ${BEAM_MAX_FACTORY_MA} mA. The beam returns at the next ` +
+            "key-cycle and the beam-fault clears itself."
+        ),
+        HeadlightButton(false)
+      )
+    );
+  });
+}
+
+/**
+ * One of the two headlight buttons. `off` picks which: the amber “writes” tier for
+ * disabling (it changes the bike), the plain tier for restoring.
+ *
+ * The first tap READS BEAM_MAX_CURR_TH off the bike and arms; the second, after the
+ * shared dwell, writes the fixed value with that reading as `expected=`. Same two-tap
+ * shape, same dwell and same key-repeat guard as the parameter write above.
+ *
+ * @param {boolean} off
+ */
+function HeadlightButton(off) {
+  const key = off ? "headlight-off" : "headlight-restore";
+  return button(
+    {
+      class: off ? "action writes" : "action",
+      // One held Enter must not arm and then fire. See refuseKeyRepeat.
+      onkeydown: refuseKeyRepeat,
+      // Same gate as the parameter write — it IS a parameter write by index, so the
+      // table gate applies. The server enforces all of it regardless.
+      disabled: () => busy.val || !canWrite() || !beamTarget(),
+      onclick: () => {
+        if (armed.val !== key) {
+          void armHeadlight(key);
+          return;
+        }
+        if (!armDwellElapsed()) {
+          return;
+        }
+        armed.val = "";
+        void performHeadlight(off);
+      },
+    },
+    () => {
+      if (writing.val) {
+        return "⏳  Writing…";
+      }
+      if (busy.val) {
+        return "⏳  Reading the beam threshold…";
+      }
+      const table = state.val?.status.tableGate;
+      if (table && !table.writesAllowed) {
+        // The short form; the full sentence and remedy are in TableTypeNote() above.
+        return table.noReadWillHelp
+          ? "🚨  Blocked — this bike's parameter table is not one this software can write against"
+          : "⚠️  Blocked until a sweep has recorded the A8's TABLE_TYPE (277) — see above";
+      }
+      if (off) {
+        return armed.val === key ? "⚠️  Tap again to disable the headlight" : "🌑  Disable the headlight";
+      }
+      return armed.val === key ? "⚠️  Tap again to restore the headlight" : "💡  Restore the headlight";
+    }
+  );
 }
 
 /**
@@ -1279,6 +1413,95 @@ async function performWrite() {
   wanted.val = "";
 }
 
+/** The allowlist entry for BEAM_MAX_CURR_TH on this bike's table, or null when it has none. */
+function beamTarget() {
+  return state.val?.status.targets.find(target => target.name === BEAM_MAX_PARAM) ?? null;
+}
+
+/**
+ * Reads BEAM_MAX_CURR_TH off the bike through the read path's probe — the same endpoint,
+ * header and typing readCurrent() uses. Returns the TYPED value (never the unsigned
+ * reading), which is the number the write is compared against.
+ *
+ * @returns {Promise<{ ok: true, value: number } | { ok: false, reason: string }>}
+ */
+async function readBeamMax() {
+  const target = beamTarget();
+  if (!target) {
+    return { ok: false, reason: `${BEAM_MAX_PARAM} is not in this bike's parameter table` };
+  }
+  try {
+    const query = new URLSearchParams({ target: target.micro, bank: "1", index: String(target.index) });
+    const response = await fetch(`/vcu-probe?${query}`, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "X-Cool-Eva": "service-mode" },
+    });
+    const payload = /** @type {VcuProbeResponse} */ (await response.json());
+    const answer = payload.reading;
+    if (!answer || answer.status !== "read" || answer.value === null) {
+      return { ok: false, reason: answer?.note ?? payload.message ?? "no answer" };
+    }
+    return { ok: true, value: answer.value };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * The first tap: read BEAM_MAX_CURR_TH off the bike, then arm — so the second tap's
+ * compare-and-swap is against a value read seconds ago, not the sweep's older one. Only
+ * arms if the read succeeded and writing is still allowed.
+ *
+ * @param {string} key
+ */
+async function armHeadlight(key) {
+  busy.val = true;
+  message.val = "";
+  try {
+    const read = await readBeamMax();
+    if (!read.ok) {
+      message.val = `Could not read ${BEAM_MAX_PARAM}: ${read.reason}`;
+      return;
+    }
+    headlightExpected.val = read.value;
+  } finally {
+    busy.val = false;
+  }
+  if (canWrite() && beamTarget()) {
+    arm(key);
+  }
+}
+
+/**
+ * The second tap: write the fixed value with the first tap's reading as `expected=`,
+ * through the very same POST the parameter form uses. The server re-reads, compares,
+ * writes and reads back; `send()` sets the shared message and refreshes the journal.
+ *
+ * @param {boolean} off
+ */
+async function performHeadlight(off) {
+  const target = beamTarget();
+  const expected = headlightExpected.val;
+  if (!target || expected === null) {
+    return;
+  }
+  const query = new URLSearchParams({
+    action: "parameter",
+    name: BEAM_MAX_PARAM,
+    value: String(off ? BEAM_MAX_OFF_MA : BEAM_MAX_FACTORY_MA),
+    expected: String(expected),
+  });
+  writing.val = true;
+  try {
+    await send(query);
+  } finally {
+    writing.val = false;
+  }
+  armed.val = "";
+  headlightExpected.val = null;
+}
+
 /**
  * @param {string} action
  * @param {string} confirmation
@@ -1338,10 +1561,12 @@ function Field(label, control) {
 /** Called by ./service-mode.js whenever the sheet opens. Refreshes, disarms and re-folds everything. */
 export async function refreshVcuWrite() {
   armed.val = "";
-  // Not in forgetSelection(): that also runs when the PARAMETER changes, and the
-  // irreversible actions have nothing to do with which parameter is selected. This is
-  // the sheet-opening reset, and re-folding belongs to it alone.
+  // Not in forgetSelection(): that also runs when the PARAMETER changes, and neither the
+  // irreversible actions nor the headlight buttons have anything to do with which
+  // parameter is selected. This is the sheet-opening reset, and re-folding — and dropping
+  // any beam reading a half-finished headlight gesture left behind — belongs to it alone.
   dangerOpen.val = false;
+  headlightExpected.val = null;
   forgetSelection();
   await fetchStatus();
 }
