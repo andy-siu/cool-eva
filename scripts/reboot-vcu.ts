@@ -4,7 +4,7 @@ import { decodeFrame } from "../src/can/decode.ts";
 import { CHARGE_BMS_COMMAND_CAN_ID, CHARGE_STATE_CAN_ID } from "../src/can/charge-manager.ts";
 
 // Reboots the two VCU micros with UDS ECUReset (service 0x11, sub-function 0x02 = keyOffOnReset) —
-// the same key-cycle restart the manufacturer's EMSuite performs between installation steps. Nothing
+// the same key-cycle restart the manufacturer's service tool performs between installation steps. Nothing
 // is erased and no setting is reverted; the ECUs simply drop off the bus for a second or two and come
 // back. Proven in the em-diagnostics tool (emdiag_vcu.py ecu_reset / ResetVCU); this is its port.
 //
@@ -13,7 +13,7 @@ import { CHARGE_BMS_COMMAND_CAN_ID, CHARGE_STATE_CAN_ID } from "../src/can/charg
 //   sudo node --experimental-strip-types scripts/reboot-vcu.ts --yes      # skip the interactive confirm
 //
 // ⚠️ BOTH nodes are always restarted, back-to-back, and sessions are opened on both BEFORE the first
-// reset — exactly as EMSuite's ResetVCU does. The two processors watch each other: restart one alone
+// reset — exactly as the service tool's ResetVCU does. The two processors watch each other: restart one alone
 // and its partner sees it drop off the bus and latches a fault (a U1000). That is how "restart the
 // selected node" on 0xA9 once put a bike into error, so there is deliberately no single-node mode here.
 //
@@ -42,7 +42,7 @@ type Node = (typeof NODES)[number];
 const SERVICE_START_SESSION = 0x10;
 const STANDARD_SESSION = 0x81;
 const SERVICE_ECU_RESET = 0x11;
-const RESET_KEY_OFF_ON = 0x02; // keyOffOnReset — the only mode EMSuite uses on the bike (a restart, not a factory reset)
+const RESET_KEY_OFF_ON = 0x02; // keyOffOnReset — the only mode the service tool uses on the bike (a restart, not a factory reset)
 const NEGATIVE_RESPONSE = 0x7f;
 
 // How long to sample the broadcast bus for the safety interlock before touching anything.
@@ -136,7 +136,7 @@ async function runSequence(): Promise<void> {
     return;
   }
 
-  // Open a session on EVERY node BEFORE the first reset, like EMSuite's ResetVCU: opening the second
+  // Open a session on EVERY node BEFORE the first reset, like the service tool's ResetVCU: opening the second
   // node's session after the first is already down is one more round trip during which the partner
   // sees it gone and stores a fault.
   for (const node of NODES) {
