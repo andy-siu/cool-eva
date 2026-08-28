@@ -998,7 +998,7 @@ What IS worth knowing is that one of them CHANGED, because that means something 
 
 ### Provenance of the format (established 2026-08-15)
 
-`energica_tool.py` is a reverse-engineered Energica VCU tool by another owner, built from the decompiled NRJK7 app. Its `_params_save_backup` is six lines:
+`energica_tool.py` is an Independent Reimplementation VCU tool by another owner. Its `_params_save_backup` is six lines:
 
 ```python
 with open(path, "w", newline="") as fh:

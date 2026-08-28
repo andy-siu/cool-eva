@@ -27,7 +27,7 @@ import { canIdsFor, parseResponseFrame } from "../src/vcu/param-codec.ts";
 //
 // PRECONDITIONS for a force: motorcycle on its stand, key ON, clear of moving parts, not ridden.
 
-const DEFAULT_NODE = "A8"; // VCU-Safety — the micro that drives the body outputs (ecu 168 in tests_data.py)
+const DEFAULT_NODE = "A8"; // VCU-Safety — the micro that drives the body outputs (ecu 168 in the guided-test tables)
 const TARGET_ADDRESS = { A8: 0xa8, A9: 0xa9 } as const;
 
 const SERVICE_START_SESSION = 0x10;
@@ -53,8 +53,8 @@ const IO_GET_READING = 0x01; // live current sense
 // proven-steady value (the strobe→steady threshold is somewhere between 5 and 40 ms).
 const DEFAULT_REASSERT_MS = 5;
 
-// Headlight preset: the service tool's LIGHTS table (from a model's specialControls.json, which is NOT in
-// the em-diagnostics repo — so these ids may not match this Eva Ribelle; that is what we're testing).
+// Headlight preset: the service tool's LIGHTS table (from a model's controls definition, which is NOT in
+// the decompiled analysis — so these ids may not match this Eva Ribelle; that is what we're testing).
 const BEAM_OUTPUT_CONTROL = 17; // "Low + high beam"
 const BEAM_SENSE_CONTROL = 18; // its current sense
 
@@ -366,7 +366,7 @@ function controlBytes(control: number): number[] {
 }
 
 /**
- * The value from a 0x6F IOControl reply, decoded exactly as the service tool does (emdiag_vcu._io_value):
+ * The value from a 0x6F IOControl reply, decoded exactly as the service tool does:
  * the reply echoes the identifier first, so the value is the trailing byte(s). Our payload keeps
  * the leading service byte, so measure the post-service length: ≥5 → a signed 16-bit reading,
  * else the trailing single byte (an output command). This is why a get-output shows 0/255 and a

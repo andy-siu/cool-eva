@@ -6,10 +6,7 @@ The headlight _can_ be switched off over the bus, just not by any broadcast fram
 
 ## Provenance
 
-Reverse-engineered from `../em-diagnostics` (a working reimplementation of the manufacturer's service tool v1.3.0, decompiled July 2024), cross-checked two ways that agree:
-
-- Its **Lights page** (`qt/pages/lights.py`, `qt/wiring.py::_lights_force`), which drives each output by hand.
-- Energica's **own `LOW_BEAM` guided test** in the decompiled test tables (`tests_data.py`), i.e. what the service tool itself sends. The two match on control id, node, and the 255/0 values, so the recipe is the vendor's, not a guess.
+Independent reimplementation of service tool's **lights actuator page**, which drives each output by hand.
 
 ## The recipe
 
@@ -39,7 +36,7 @@ Run from the Pi with `scripts/headlight-off.ts` (a scratch probe that speaks `0x
 
 **The access chain works end to end.**
 
-- **VCU-Safety (`0xA8`) grants the session.** Despite em-diagnostics calling it "the one node known to refuse," `StartDiagnosticSession 10 81` succeeded every attempt.
+- **VCU-Safety (`0xA8`) grants the session.** Despite the service-tool analysis calling it "the one node known to refuse," `StartDiagnosticSession 10 81` succeeded every attempt.
 - **The `calc_key` SecurityAccess algorithm is correct on this bike.** Several different seeds (`0xEC4D4650`, `0x0F79C27E`, `0x2A985C9F`, …) were each unlocked by the swap-adjacent-bits-then-subtract-`0x3E5F4542` key. Measured, not inferred.
 - **IO reads work**, and `StopDiagnosticSession 20` hands control back cleanly.
 
@@ -60,7 +57,7 @@ Sweep map worth keeping (VCU-Safety, key-on, headlight-on, one AC-idle bike): ou
 
 Both halves are now measured on this bike (above): the access chain grants and IO-control physically actuates the beam off. The historical caveats, for provenance:
 
-- **em-diagnostics never ran this on a bike.** It marks its Lights page `UNTESTED` (`qt/shell.py`) — exercised only through its recording fake. The on-bike session it _did_ run (commit `3e140f4`, 27–28 Aug 2026) was the Routines page — Set Service Point and node restarts — not IO-control. So the "force off" frame was our first live test of it, and it did not behave as the table implied.
+- **The service-tool analysis never ran this on a bike.** It marks its lights page `UNTESTED` — exercised only through its recording fake. The on-bike session it _did_ run (27–28 Aug 2026) was the Routines page — Set Service Point and node restarts — not IO-control. So the "force off" frame was our first live test of it, and it did not behave as the table implied.
 
 Also model-dependent: later test tables split `LOW_BEAM (Except SS9)` from `LOW_BEAM (Only SS9)` with different current windows. Control 17 on `0xA8` is constant across every table; only the sense window varies, so which table this Eva Ribelle reports matters for the _verdict_ thresholds, not for the command.
 

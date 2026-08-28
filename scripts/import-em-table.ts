@@ -12,29 +12,29 @@ import {
   type ExtractedTable,
 } from "./table-delta-build.ts";
 
-// Adds a VCU parameter table to src/vcu/table-catalog.data.ts from an em-diagnostics
-// `data/vcu_params/<TABLE_TYPE>.json` file, for a table this bike REPORTS but the
+// Adds a VCU parameter table to src/vcu/table-catalog.data.ts from a service-tool-analysis
+// `<TABLE_TYPE>.json` parameter file, for a table this bike REPORTS but the
 // manufacturer's binary we extracted from did not carry.
 //
-//     node --experimental-strip-types scripts/import-em-table.ts <em vcu_params dir> <TABLE_TYPE>...
+//     node --experimental-strip-types scripts/import-em-table.ts <param JSON dir> <TABLE_TYPE>...
 //
 // ⚠️ SECOND-HAND PROVENANCE, AND THAT IS THE ONE DIFFERENCE FROM extract-vcu-tables.ts.
 // That script reads Energica's own executable and fingerprints each table from the bundle
-// bytes Energica shipped. em-diagnostics' JSON is itself a decompiled extraction one step
-// removed from that binary — so the fingerprint here is taken over em-diagnostics' records,
-// not an Energica ZIP, and the `exportStamp` is set to "em-diagnostics" rather than the
+// bytes Energica shipped. The service-tool analysis's JSON is itself a decompiled extraction one step
+// removed from that binary — so the fingerprint here is taken over the analysis's records,
+// not an Energica ZIP, and the `exportStamp` is set to "service-tool-analysis" rather than the
 // `yyyyMMddHHmm` the binary path recovers. Both are visible in the committed catalogue on
 // purpose: a reader can tell which tables came first-party and which did not. Everything
 // downstream of the records — the delta arithmetic, the invariant checks, the fingerprint
 // round-trip, the merge that refuses on a content conflict — is the SAME code path
-// (./table-delta-build.ts), so an em-diagnostics table that disagrees with one we already
+// (./table-delta-build.ts), so an imported table that disagrees with one we already
 // carry still stops the run.
 //
 // The delta format, why it is a delta and not 33 whole tables, and what the fingerprint
 // proves and does not: src/vcu/table-catalog.ts and docs/vcu-parameters.md §3.
 
-/** Marks a table as extracted from em-diagnostics rather than from Energica's binary. */
-const EM_EXPORT_STAMP = "em-diagnostics";
+/** Marks a table as extracted from the service-tool analysis rather than from Energica's binary. */
+const EM_EXPORT_STAMP = "service-tool-analysis";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = join(HERE, "..", "src", "vcu", "table-catalog.data.ts");
@@ -43,11 +43,11 @@ const emParamsDir = process.argv[2];
 const tableTypeArgs = process.argv.slice(3).filter(argument => !argument.startsWith("--"));
 if (!emParamsDir || tableTypeArgs.length === 0) {
   console.error(
-    "usage: node --experimental-strip-types scripts/import-em-table.ts <em vcu_params dir> <TABLE_TYPE>... " +
+    "usage: node --experimental-strip-types scripts/import-em-table.ts <param JSON dir> <TABLE_TYPE>... " +
       "[--stdout] [--replace]"
   );
   console.error("");
-  console.error("Point it at em-diagnostics' data/vcu_params directory and name the TABLE_TYPE(s) to import — the");
+  console.error("Point it at the analysis's parameter-JSON directory and name the TABLE_TYPE(s) to import — the");
   console.error("decimal number the bike reports at parameter 277, which is also the JSON filename. Import only the");
   console.error("table(s) you have verified your bike is on; this is not a bulk sync.");
   process.exit(1);
@@ -95,7 +95,7 @@ if (process.argv.includes("--stdout")) {
 }
 
 /**
- * Reads and validates one em-diagnostics parameter table into bundle records.
+ * Reads and validates one service-tool-analysis parameter table into bundle records.
  *
  * ⚠️ Strict on the record shape — the same bargain the ZIP parser in
  * extract-vcu-tables.ts makes: a file this does not fully understand must throw, not
@@ -108,7 +108,7 @@ async function readTableFile(path: string, tableType: number): Promise<BundleRec
     text = await readFile(path, "utf-8");
   } catch (err) {
     throw new Error(
-      `import-em-table: could not read ${path} for TABLE_TYPE ${tableType} — em-diagnostics names each table's ` +
+      `import-em-table: could not read ${path} for TABLE_TYPE ${tableType} — the analysis names each table's ` +
         `file after its decimal TABLE_TYPE, so ${basename(path)} is what to expect there (${
           err instanceof Error ? err.message : String(err)
         })`

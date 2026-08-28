@@ -6,7 +6,7 @@ import { CHARGE_BMS_COMMAND_CAN_ID, CHARGE_STATE_CAN_ID } from "../src/can/charg
 // Reboots the two VCU micros with UDS ECUReset (service 0x11, sub-function 0x02 = keyOffOnReset) —
 // the same key-cycle restart the manufacturer's service tool performs between installation steps. Nothing
 // is erased and no setting is reverted; the ECUs simply drop off the bus for a second or two and come
-// back. Proven in the em-diagnostics tool (emdiag_vcu.py ecu_reset / ResetVCU); this is its port.
+// back. Proven in the service-tool analysis (its ResetVCU); this is its port.
 //
 //   sudo systemctl stop cool-eva      # the service owns can0; one raw socket at a time
 //   sudo node --experimental-strip-types scripts/reboot-vcu.ts            # interlock check + confirm prompt
@@ -28,7 +28,7 @@ import { CHARGE_BMS_COMMAND_CAN_ID, CHARGE_STATE_CAN_ID } from "../src/can/charg
 // bike is moving. It keys on those frames' PRESENCE, NOT the 0x625 b4 flag: that flag's DC bit is
 // read inverted and an all-zero idle byte decodes to a spurious `dc_charging` — which false-refused a
 // legitimate parked reset on 2026-08-27. Reset needs only a diagnostic session — no SecurityAccess
-// (0x27) unlock — matching the em-diagnostics reset path.
+// (0x27) unlock — matching the service tool's reset path.
 //
 // PRECONDITIONS: bike stationary and awake (key ON), NOT charging, on its stand. If a fault stays
 // latched afterwards, key off for 30 s and on — a real power cycle clears what a reset leaves behind.

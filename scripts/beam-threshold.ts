@@ -26,8 +26,8 @@ import { canIdsFor, identifierForIndex, parseResponseFrame, toHex } from "../src
 // scripts/headlight-off.ts. It reuses param-codec's PROVEN framing helpers but builds the write
 // frame itself, because the shipped codec cannot.
 //
-// ⚠️ A write here is PERSISTENT. It stores a DTC the VCU keeps until cleared (the manufacturer's
-// service tool / the em-diagnostics DTC page). --restore puts the factory thresholds back but does NOT clear the DTC.
+// ⚠️ A write here is PERSISTENT. It stores a DTC the VCU keeps until cleared (shown on the
+// service tool's DTC page). --restore puts the factory thresholds back but does NOT clear the DTC.
 //
 // PRECONDITIONS for a write: bike on its stand, key ON, headlight on, clear of moving parts, not ridden.
 
@@ -52,7 +52,7 @@ const NRC_SECURITY_ACCESS_DENIED = 0x33;
 // 0x3E5F4542 (fixed per module). Confirmed on this bike — see docs/headlight-diagnostic-control.md.
 const KEY_SUBTRAHEND = 0x3e5f4542;
 
-// VCU-Safety LIGHTS parameters (emdiag_vcu.py PARAM table): index, byte width, factory default in mA.
+// VCU-Safety LIGHTS parameters (the service tool's PARAM table): index, byte width, factory default in mA.
 // All bank 1, all uint16. The beam's fault window is [MIN..MAX]; HILO is the low/high split.
 const BEAM_PARAMS = {
   max: { index: 240, name: "BEAM_MAX_CURR_TH", bytes: 2, factory: 7500 },
@@ -62,7 +62,7 @@ const BEAM_PARAMS = {
 type BeamParamKey = keyof typeof BEAM_PARAMS;
 
 // The beam's current sense, read via io_get (0x2F sub 0x01) so we can size the write and observe the
-// effect. Same control the LOW_BEAM guided test reads (tests_data.py control 18 on ecu 168).
+// effect. Same control the LOW_BEAM guided test reads (control 18 on ecu 168).
 const BEAM_SENSE_CONTROL = 18;
 
 const NRC_NAMES: Record<number, string> = {

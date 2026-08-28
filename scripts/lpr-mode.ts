@@ -1,5 +1,5 @@
 // Enables / disables the VCU's "LPR mode" — dash command 0x15 on the 0x120/0x121 command channel
-// (emdiag_vcu.py DASH_CMD_NAMES: "LPR mode, 0 = off / 1 = on"). Confirmed on-bike 2026-08-27:
+// (the service tool's dash-command name table: "LPR mode, 0 = off / 1 = on"). Confirmed on-bike 2026-08-27:
 // writing 0x15 = 1 makes the dash read "LPR mode active", and the value persists as a stored setting
 // (it survives the script exiting), unlike the decaying 0x2F diagnostic force. What "LPR" stands for
 // is not spelled out anywhere in the vendor tool. It is NOT a light control — toggling it moved the

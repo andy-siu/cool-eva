@@ -551,12 +551,12 @@ expect(damaged.rows[0].value !== -366, "…and must not keep 16407's signed read
 //
 // ⚠️ The count is hardcoded so that a contributed table landing here is a DELIBERATE bump,
 // not a silent drift — 28 came from the 2024 service-tool build, and 4115 was imported from
-// em-diagnostics (scripts/import-em-table.ts) because it is the table THIS bike reports and
+// the service-tool analysis (scripts/import-em-table.ts) because it is the table THIS bike reports and
 // that build did not carry it. Adding your own bike's table raises this number the same way.
 expect(
   KNOWN_TABLE_TYPES.length === 29,
   `the catalogue should carry 29 tables — the 2024 service-tool build's 28 plus 4115 imported from ` +
-    `em-diagnostics — but has ${KNOWN_TABLE_TYPES.length}`
+    `the service-tool analysis — but has ${KNOWN_TABLE_TYPES.length}`
 );
 expect(
   new Set(KNOWN_TABLE_TYPES).size === KNOWN_TABLE_TYPES.length,
@@ -630,7 +630,7 @@ expect(
 // The RegenFade split, counted. 21 tables carry the fade curve at 70…94 and 8 carry the
 // battery cell block; nothing carries a mixture. The count is asserted rather than
 // described so that a contributed table landing on the wrong side of it is a red build.
-// 4115 (imported from em-diagnostics) is a fade table, which is why this is 21 not 20.
+// 4115 (imported from the service-tool analysis) is a fade table, which is why this is 21 not 20.
 const fadeTables = builtTables.filter(table => table?.byIndex.get(70)?.name === "RegenFade_0");
 const cellTables = builtTables.filter(table => table?.byIndex.get(70)?.name === "CELL_COUNT");
 expect(

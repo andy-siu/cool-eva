@@ -3,7 +3,7 @@ import { fingerprintTable, type ParameterTableDelta } from "../src/vcu/table-cat
 
 // The delta arithmetic shared by every way a table gets INTO src/vcu/table-catalog.data.ts:
 // scripts/extract-vcu-tables.ts (from the manufacturer's binary) and
-// scripts/import-em-table.ts (from an em-diagnostics params JSON). One copy on purpose —
+// scripts/import-em-table.ts (from a service-tool-analysis params JSON). One copy on purpose —
 // the delta line format here has to stay in lockstep with the PARSER in
 // src/vcu/table-catalog.ts, and a second copy is a second thing to keep true.
 //

@@ -574,7 +574,7 @@ async function runClearDtcs(context: SessionContext): Promise<ClearDtcsOutcome> 
 /**
  * Restarts both VCU micros with UDS ECUReset (`11 02` = keyOffOnReset) — a key-cycle
  * restart, nothing erased. Ported from scripts/reboot-vcu.ts, itself a port of
- * em-diagnostics' ResetVCU, and proven on-bike 2026-08-27.
+ * the service-tool analysis's ResetVCU, and proven on-bike 2026-08-27.
  *
  * ⚠️ BOTH micros are reset, back-to-back, with a session opened on BOTH before the
  * first reset. The two processors watch each other: restart one alone and its partner

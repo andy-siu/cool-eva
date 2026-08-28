@@ -510,7 +510,7 @@ export const PARAMETER_TABLE_DELTAS: ParameterTableDelta[] = [
   },
   {
     tableType: 4115,
-    exportStamp: "em-diagnostics",
+    exportStamp: "service-tool-analysis",
     fingerprint: "f591017d",
     delta: `
 1 TH_HIGH_B_H_TEMP
