@@ -15,16 +15,17 @@ import {
 const { button, div } = van.tags;
 
 // Stop an active charge from the charge tab — the dashboard equivalent of the rider's two Mode
-// presses on the bike. It sends the 0x120 + 0x121 stop pair we cracked 2026-08-25
-// (docs/can-0x121-charge-command.md), through the SAME gated /vcu-write path and shared two-tap
-// dwell as the set-current control beside it, and renders NOTHING unless writing is on AND a
-// charge is live. Session tracking and the status fetch are shared (../lib/charge-write.js).
+// presses on the bike. It sends the single 0x120 stop frame we cracked 2026-08-25
+// (docs/can-0x121-charge-command.md — the 0x120 request-twin alone commits, the 0x121 half is
+// redundant), through the SAME gated /vcu-write path and shared two-tap dwell as the set-current
+// control beside it, and renders NOTHING unless writing is on AND a charge is live. Session
+// tracking and the status fetch are shared (../lib/charge-write.js).
 //
 // ⚠️ Two taps, NOT press-and-hold, even though the bike's own gesture involves holding: the real
-// command is a discrete PAIR of frames sent once, so a hold would just re-send them. Stopping is
-// the benign direction (worst case a charge halts), and it is source-agnostic — the same pair ends
-// AC and DC — so there is nothing to type and nothing to choose; the Pi checks only that a charge
-// is live. Like set-current it does NOT use the stationary service gate (a charging bike is
+// command is a discrete frame sent once, so a hold would just re-send it. Stopping is the benign
+// direction (worst case a charge halts), and it is source-agnostic — the same frame ends AC and
+// DC — so there is nothing to type and nothing to choose; the Pi checks only that a charge is
+// live. Like set-current it does NOT use the stationary service gate (a charging bike is
 // energized and tethered by definition; write-runner.ts exempts it).
 
 /** @typedef {import("../../src/http/vcu-write.ts").VcuWriteResponse} VcuWriteResponse */

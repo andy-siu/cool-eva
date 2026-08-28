@@ -12,12 +12,14 @@ import type { ChargeMode } from "../can/charge-command.ts";
 import {
   clearStoredDtcs,
   readServiceStamp,
+  resetVcu,
   sendChargeCommand,
   sendChargeStopCommand,
   setServicePoint,
   syncBikeClock,
   writeParameter,
   type ClearDtcsOutcome,
+  type ResetVcuOutcome,
   type RunningWriteSession,
   type ServicePointOutcome,
   type ServiceWriteOutcome,
@@ -77,11 +79,19 @@ export type ServiceWriteRequest =
    */
   | { kind: "charge-current"; amps: number }
   /**
-   * Stop an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
-   * Source-agnostic — the same pair ends AC and DC — so it carries no fields; the only
-   * precondition is a live session, checked off charge_manager_state like charge-current.
+   * Stop an active charge by injecting the 0x120 request-twin `96 ff 01 …` — the half of the
+   * dash's Mode-stop that alone commits (2026-08-25 on-bike). Source-agnostic — the same frame
+   * ends AC and DC — so it carries no fields; the only precondition is a live session, checked
+   * off charge_manager_state like charge-current.
    */
-  | { kind: "charge-stop" };
+  | { kind: "charge-stop" }
+  /**
+   * Restart both VCU micros with ECUReset (`11 02`) — a key-cycle restart, nothing erased.
+   * Carries no fields: both nodes always reset together. Refused if a charge session is live
+   * (checked off charge_manager_state like charge-stop) and, through the shared gate, if the
+   * bike is moving. Reversible, so not on the irreversible tier.
+   */
+  | { kind: "reset-vcu" };
 
 /** How an action came out, in the shape the page renders. */
 export interface ServiceWriteResult {
@@ -509,6 +519,8 @@ async function performOnBus(
       return await performChargeCurrent(context, request, channel);
     case "charge-stop":
       return await performChargeStop(context, channel);
+    case "reset-vcu":
+      return await performResetVcu(context, channel);
   }
 }
 
@@ -880,15 +892,16 @@ async function performChargeCurrent(
 }
 
 /**
- * Stops an active charge by replaying the dash's two-frame Mode-button stop (0x120 + 0x121).
+ * Stops an active charge by injecting the 0x120 request-twin `96 ff 01 …` — the half of the dash's
+ * Mode-stop that alone commits (2026-08-25 on-bike).
  *
- * Source-agnostic — the same pair ends AC and DC — so it takes no fields and, unlike
+ * Source-agnostic — the same frame ends AC and DC — so it takes no fields and, unlike
  * performChargeCurrent, needs no opcode/ceiling lookup. The one precondition is the same live
  * session: charge_manager_state present, fresh, and a settled AC (0x02) / DC (0x23) — refused
  * otherwise, since there is no charge to stop. ⚠️ NOT charge_type, which flaps mid-session.
  *
- * Fire-and-forget like charge-current: 0x121/0x120 are event frames with no reply, so "sent" is
- * the strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
+ * Fire-and-forget like charge-current: 0x120 is an event frame with no reply, so "sent" is the
+ * strongest claim. The read-back is the charge tearing down (mains_v collapsing) over the
  * following seconds as the bike's "interruption in progress" countdown runs. Audited with after:null.
  */
 async function performChargeStop(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
@@ -909,20 +922,20 @@ async function performChargeStop(context: WriteContext, channel: RawChannel): Pr
   }
 
   const mode = chargeState === CHARGE_MANAGER_STATE_AC ? "AC" : "DC";
-  console.warn(`vcu-write: about to stop the ${mode} charge — replaying the 0x120 + 0x121 Mode-stop pair`);
+  console.warn(`vcu-write: about to stop the ${mode} charge — injecting the 0x120 Mode-stop request-twin`);
   const outcome = await sendChargeStopCommand(channel);
   await appendAuditRecord(context.directory, {
     at: Date.now(),
     clockTrustworthy: readPiClock().trustworthy,
     action: "charge-stop",
     status: outcome.status,
-    // No synchronous read-back: the stop pair has no reply. The effect surfaces as the charge
+    // No synchronous read-back: the stop frame has no reply. The effect surfaces as the charge
     // tearing down (mains_v → 0, charger_enabled → 0) over the next several seconds.
     after: null,
     rawHex: outcome.status === "sent" ? outcome.hex : undefined,
     note:
       outcome.status === "sent"
-        ? `${mode} stop pair on 0x120 + 0x121; event frames with no reply — confirm by the charge winding down`
+        ? `${mode} stop on 0x120; event frame with no reply — confirm by the charge winding down`
         : outcome.reason,
   });
   if (outcome.status !== "sent") {
@@ -941,6 +954,72 @@ async function performChargeStop(context: WriteContext, channel: RawChannel): Pr
       succeeded: true,
     },
   };
+}
+
+/**
+ * Restarts both VCU micros with ECUReset (`11 02`) — a key-cycle restart, nothing erased.
+ *
+ * Reversible, so it is NOT on the irreversible tier — but it drops the bike off the bus for a
+ * second or two, and `11 02` is also the charge manager's bootloader-entry service, so it is
+ * refused mid-charge: a live charge is managed by these very controllers. The charge check keys
+ * on charge_manager_state (present and fresh = a live session), matching performChargeStop — the
+ * reliable session signal, NOT the 0x625 dc_charging flag that false-refused the scratch script
+ * on 2026-08-27. The stationary check is inherited from the shared gate; this action is not
+ * gate-exempt, unlike the two charge actions. Both nodes always reset together — see resetVcu.
+ */
+async function performResetVcu(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
+  const chargeState = latestValue("charge_manager_state");
+  const chargeStateAge = ageMs("charge_manager_state");
+  if (chargeState !== null && chargeStateAge !== null && chargeStateAge <= CHARGE_SESSION_MAX_AGE_MS) {
+    return {
+      ok: false,
+      reason:
+        "a charge session is live (charge_manager_state is fresh) — do not reset the VCU mid-charge. " +
+        "Stop the charge or unplug first.",
+    };
+  }
+
+  console.warn("vcu-write: about to reset both VCU micros (ECUReset 11 02) — the bike drops off the bus briefly");
+  const session = resetVcu(channel);
+  context.running = session.session;
+  const outcome = await session.finished;
+  await appendAuditRecord(context.directory, {
+    at: Date.now(),
+    clockTrustworthy: readPiClock().trustworthy,
+    action: "reset-vcu",
+    status: outcome.status,
+    // No synchronous read-back: the micros reboot before replying, and there is nothing to read
+    // afterwards but a fresh session, which the page confirms on its own poll.
+    after: null,
+    micro: outcome.status === "refused" || outcome.status === "failed" ? outcome.micro : undefined,
+    note: describeResetOutcome(outcome),
+  });
+  if (outcome.status !== "reset") {
+    return { ok: false, reason: describeResetOutcome(outcome) };
+  }
+  return {
+    ok: true,
+    result: {
+      action: "reset-vcu",
+      status: "reset",
+      message:
+        `Restarted both VCU micros (ECUReset 11 02, a key-cycle restart — nothing erased). ${outcome.note}. ` +
+        "⚠️ The bike drops off the bus for a second or two while they reboot; the dash reconnects on its own. " +
+        "If a fault stays latched, key off for 30 s and on — a real power cycle clears what a reset leaves behind.",
+      succeeded: true,
+    },
+  };
+}
+
+function describeResetOutcome(outcome: ResetVcuOutcome): string {
+  switch (outcome.status) {
+    case "reset":
+      return `both VCU micros restarted (${outcome.note})`;
+    case "refused":
+      return `${outcome.micro} refused the reset: ${outcome.description}`;
+    case "failed":
+      return `${outcome.micro} failed at the ${outcome.stage} step: ${outcome.reason} — key off for 30 s and on to be sure of a clean state`;
+  }
 }
 
 /**

@@ -117,14 +117,47 @@ export type ClearDtcsOutcome =
   | { status: "refused"; negativeResponseCode: number; description: string }
   | { status: "failed"; reason: string };
 
+/**
+ * How an ECUReset of both VCU micros came out.
+ *
+ * "reset" is the success, and it is a weak claim on purpose: the reply to `11 02`
+ * almost never arrives — the micro reboots before answering — so a timed-out request
+ * is counted as issued, exactly as scripts/reboot-vcu.ts does. `note` records, per
+ * micro, whether it was a positive 0x51 or silence.
+ */
+export type ResetVcuOutcome =
+  | { status: "reset"; note: string }
+  | { status: "refused"; micro: string; negativeResponseCode: number; description: string }
+  | { status: "failed"; stage: "session" | "reset"; micro: string; reason: string };
+
 /** A reply window. Inherited from ./kwp-client.ts rather than measured for this path. */
 const RESPONSE_TIMEOUT_MS = 300;
 
 /** Gap after every exchange, so this is polite to a bus shared with the ABS and the BMS at 20 Hz. */
 const PACE_MS = 10;
 
-/** Gap between the two charge-stop frames, matching the ~20 ms the dash left between them. */
+/** Gap between charge-stop frames if more than one is ever sent; today the stop is a single frame. */
 const STOP_FRAME_GAP_MS = 20;
+
+// ── ECUReset (resetVcu) ─────────────────────────────────────────────────────
+const SERVICE_ECU_RESET = 0x11;
+const RESET_KEY_OFF_ON = 0x02; // keyOffOnReset — the only mode the service tool uses on the bike (a restart, not a factory reset)
+const POSITIVE_RESET_RESPONSE = 0x51; // 0x11 + 0x40
+const NEGATIVE_RESPONSE_SERVICE = 0x7f;
+/**
+ * Control (A9) first, then Safety (A8), matching scripts/reboot-vcu.ts and the service
+ * tool's ResetVCU. Sessions are opened on both before either is reset — see runResetVcu.
+ */
+const RESET_MICRO_ORDER: ("A8" | "A9")[] = ["A9", "A8"];
+/** Extended-addressing target byte per micro. Mirrors param-codec's TARGET_ADDRESS, which is module-private. */
+const RESET_TARGET_ADDRESS: Record<"A8" | "A9", number> = { A8: 0xa8, A9: 0xa9 };
+const RESET_NRC_NAMES: Record<number, string> = {
+  0x11: "serviceNotSupported",
+  0x12: "subFunctionNotSupported",
+  0x22: "conditionsNotCorrect",
+  0x31: "requestOutOfRange",
+  0x33: "securityAccessDenied",
+};
 
 /**
  * How long after an authenticated operation another one may start.
@@ -539,6 +572,107 @@ async function runClearDtcs(context: SessionContext): Promise<ClearDtcsOutcome> 
 }
 
 /**
+ * Restarts both VCU micros with UDS ECUReset (`11 02` = keyOffOnReset) — a key-cycle
+ * restart, nothing erased. Ported from scripts/reboot-vcu.ts, itself a port of
+ * the service-tool analysis's ResetVCU, and proven on-bike 2026-08-27.
+ *
+ * ⚠️ BOTH micros are reset, back-to-back, with a session opened on BOTH before the
+ * first reset. The two processors watch each other: restart one alone and its partner
+ * sees it drop off the bus and latches a U1000 — which is how a single-node reset once
+ * put a bike into error. There is deliberately no single-node path.
+ *
+ * ⚠️ Deliberately crosses this repo's standing ban on transmitting 0x11 — every shipped
+ * codec (param-codec, write-codec) refuses ECUReset by construction — the same way
+ * clearStoredDtcs hand-builds a Mode-04 frame the write codec will not. `exchangeRaw`
+ * is the bypass: it takes bytes and sends them without a service check.
+ *
+ * Needs only a diagnostic session (`10 81`), no SecurityAccess unlock. The charge/motion
+ * interlock lives in the runner, not here.
+ */
+export function resetVcu(channel: RawChannel): {
+  session: RunningWriteSession;
+  finished: Promise<ResetVcuOutcome>;
+} {
+  const context = newContext(channel);
+  return { session: sessionHandle(context), finished: runResetVcu(context) };
+}
+
+async function runResetVcu(context: SessionContext): Promise<ResetVcuOutcome> {
+  // Open a session on EVERY micro BEFORE the first reset, like the service tool's ResetVCU:
+  // opening the second node's session after the first is already down is one more
+  // round trip during which the partner sees it gone and stores a fault.
+  for (const micro of RESET_MICRO_ORDER) {
+    if (!(await openSession(context, micro))) {
+      return { status: "failed", stage: "session", micro, reason: `${micro} did not answer 10 81 — is the key ON?` };
+    }
+  }
+
+  const notes: string[] = [];
+  for (const micro of RESET_MICRO_ORDER) {
+    const outcome = await sendEcuReset(context, micro);
+    if (outcome.kind === "refused") {
+      return {
+        status: "refused",
+        micro,
+        negativeResponseCode: outcome.negativeResponseCode,
+        description: outcome.description,
+      };
+    }
+    if (outcome.kind === "failed") {
+      // A partner may already be restarting; the caller's guidance is to key off 30 s.
+      return { status: "failed", stage: "reset", micro, reason: outcome.reason };
+    }
+    notes.push(`${micro}: ${outcome.note}`);
+  }
+  return { status: "reset", note: notes.join("; ") };
+}
+
+/** One `11 02` to a named micro. A timeout is success — the micro reboots before it can answer. */
+async function sendEcuReset(
+  context: SessionContext,
+  micro: "A8" | "A9"
+): Promise<
+  | { kind: "issued"; note: string }
+  | { kind: "refused"; negativeResponseCode: number; description: string }
+  | { kind: "failed"; reason: string }
+> {
+  const canIds = canIdsFor(micro);
+  const frame = new Uint8Array(8);
+  frame[0] = RESET_TARGET_ADDRESS[micro]; // extended-addressing target byte
+  frame[1] = 2; // single-frame PCI: two payload bytes
+  frame[2] = SERVICE_ECU_RESET;
+  frame[3] = RESET_KEY_OFF_ON;
+  const result = await exchangeRaw(context, {
+    requestCanId: canIds.request,
+    responseCanId: canIds.response,
+    frame,
+    isObd: false,
+  });
+  if (result.kind === "timeout") {
+    return { kind: "issued", note: "issued (no reply — the micro is rebooting)" };
+  }
+  if (result.kind === "not-sent") {
+    return { kind: "failed", reason: `the frame never reached the bus — ${result.reason}` };
+  }
+  if (result.frame.kind !== "payload") {
+    return { kind: "failed", reason: `the reply was a ${result.frame.kind} frame` };
+  }
+  const payload = result.frame.payload;
+  if (payload.length >= 3 && payload[0] === NEGATIVE_RESPONSE_SERVICE) {
+    const negativeResponseCode = payload[2];
+    return { kind: "refused", negativeResponseCode, description: describeResetNrc(negativeResponseCode) };
+  }
+  if (payload[0] === POSITIVE_RESET_RESPONSE) {
+    return { kind: "issued", note: "accepted (positive 51)" };
+  }
+  return { kind: "failed", reason: `unexpected reply ${toHex(payload)}` };
+}
+
+function describeResetNrc(code: number): string {
+  return `NRC 0x${code.toString(16).padStart(2, "0")} (${RESET_NRC_NAMES[code] ?? "unknown"})`;
+}
+
+/**
  * Broadcasts the Pi's UTC onto CAN 0x120, setting the bike's own clock.
  *
  * ⚠️ FIRE AND FORGET, and that is not a shortcut — it is what the mechanism is.
@@ -612,15 +746,14 @@ export function sendChargeCommand(
 }
 
 /**
- * Stops an active charge by replaying the two-frame Mode-button stop the dash emits — 0x120
- * `96 ff 01 …` then 0x121 `16 ff 01 …` (charge-command.ts). Source-agnostic: the same pair ends
- * both AC and DC.
+ * Stops an active charge by injecting the single 0x120 request-twin `96 ff 01 …` (charge-command.ts).
+ * The dash pairs it with a 0x121 `16 ff 01 …`, but an on-bike isolation test proved 0x120 alone
+ * commits the stop. Source-agnostic: the same frame ends both AC and DC.
  *
- * ⚠️ FIRE AND FORGET like sendChargeCommand — these are event frames with no reply. "sent" means
- * both hit the bus; the read-back is the charge tearing down (mains_v collapsing, charger_enabled
- * → 0), which arrives over the following seconds as the bike's own "interruption in progress"
- * countdown runs. Both frames MUST go, in this order: injecting only the 0x121 half arms the
- * prompt but never completes the stop. A 20 ms gap between them matches the captured cadence.
+ * ⚠️ FIRE AND FORGET like sendChargeCommand — this is an event frame with no reply. "sent" means it
+ * hit the bus; the read-back is the charge tearing down (mains_v collapsing, charger_enabled → 0),
+ * which arrives over the following seconds as the bike's own "interruption in progress" countdown
+ * runs. The loop stays multi-frame in case a future gesture needs a companion, but today it is one.
  */
 export async function sendChargeStopCommand(
   channel: RawChannel
@@ -637,7 +770,7 @@ export async function sendChargeStopCommand(
     sentHex.push(`0x${frame.id.toString(16)} ${toHex(frame.data)}`);
     await delay(STOP_FRAME_GAP_MS);
   }
-  console.warn(`vcu-write: sent the charge-stop pair — ${sentHex.join(" / ")}`);
+  console.warn(`vcu-write: sent the charge-stop command — ${sentHex.join(" / ")}`);
   return { status: "sent", hex: sentHex.join(" / ") };
 }
 
