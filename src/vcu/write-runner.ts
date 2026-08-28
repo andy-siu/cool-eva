@@ -12,12 +12,14 @@ import type { ChargeMode } from "../can/charge-command.ts";
 import {
   clearStoredDtcs,
   readServiceStamp,
+  resetVcu,
   sendChargeCommand,
   sendChargeStopCommand,
   setServicePoint,
   syncBikeClock,
   writeParameter,
   type ClearDtcsOutcome,
+  type ResetVcuOutcome,
   type RunningWriteSession,
   type ServicePointOutcome,
   type ServiceWriteOutcome,
@@ -82,7 +84,14 @@ export type ServiceWriteRequest =
    * ends AC and DC — so it carries no fields; the only precondition is a live session, checked
    * off charge_manager_state like charge-current.
    */
-  | { kind: "charge-stop" };
+  | { kind: "charge-stop" }
+  /**
+   * Restart both VCU micros with ECUReset (`11 02`) — a key-cycle restart, nothing erased.
+   * Carries no fields: both nodes always reset together. Refused if a charge session is live
+   * (checked off charge_manager_state like charge-stop) and, through the shared gate, if the
+   * bike is moving. Reversible, so not on the irreversible tier.
+   */
+  | { kind: "reset-vcu" };
 
 /** How an action came out, in the shape the page renders. */
 export interface ServiceWriteResult {
@@ -510,6 +519,8 @@ async function performOnBus(
       return await performChargeCurrent(context, request, channel);
     case "charge-stop":
       return await performChargeStop(context, channel);
+    case "reset-vcu":
+      return await performResetVcu(context, channel);
   }
 }
 
@@ -943,6 +954,72 @@ async function performChargeStop(context: WriteContext, channel: RawChannel): Pr
       succeeded: true,
     },
   };
+}
+
+/**
+ * Restarts both VCU micros with ECUReset (`11 02`) — a key-cycle restart, nothing erased.
+ *
+ * Reversible, so it is NOT on the irreversible tier — but it drops the bike off the bus for a
+ * second or two, and `11 02` is also the charge manager's bootloader-entry service, so it is
+ * refused mid-charge: a live charge is managed by these very controllers. The charge check keys
+ * on charge_manager_state (present and fresh = a live session), matching performChargeStop — the
+ * reliable session signal, NOT the 0x625 dc_charging flag that false-refused the scratch script
+ * on 2026-08-27. The stationary check is inherited from the shared gate; this action is not
+ * gate-exempt, unlike the two charge actions. Both nodes always reset together — see resetVcu.
+ */
+async function performResetVcu(context: WriteContext, channel: RawChannel): Promise<ServiceWriteAnswer> {
+  const chargeState = latestValue("charge_manager_state");
+  const chargeStateAge = ageMs("charge_manager_state");
+  if (chargeState !== null && chargeStateAge !== null && chargeStateAge <= CHARGE_SESSION_MAX_AGE_MS) {
+    return {
+      ok: false,
+      reason:
+        "a charge session is live (charge_manager_state is fresh) — do not reset the VCU mid-charge. " +
+        "Stop the charge or unplug first.",
+    };
+  }
+
+  console.warn("vcu-write: about to reset both VCU micros (ECUReset 11 02) — the bike drops off the bus briefly");
+  const session = resetVcu(channel);
+  context.running = session.session;
+  const outcome = await session.finished;
+  await appendAuditRecord(context.directory, {
+    at: Date.now(),
+    clockTrustworthy: readPiClock().trustworthy,
+    action: "reset-vcu",
+    status: outcome.status,
+    // No synchronous read-back: the micros reboot before replying, and there is nothing to read
+    // afterwards but a fresh session, which the page confirms on its own poll.
+    after: null,
+    micro: outcome.status === "refused" || outcome.status === "failed" ? outcome.micro : undefined,
+    note: describeResetOutcome(outcome),
+  });
+  if (outcome.status !== "reset") {
+    return { ok: false, reason: describeResetOutcome(outcome) };
+  }
+  return {
+    ok: true,
+    result: {
+      action: "reset-vcu",
+      status: "reset",
+      message:
+        `Restarted both VCU micros (ECUReset 11 02, a key-cycle restart — nothing erased). ${outcome.note}. ` +
+        "⚠️ The bike drops off the bus for a second or two while they reboot; the dash reconnects on its own. " +
+        "If a fault stays latched, key off for 30 s and on — a real power cycle clears what a reset leaves behind.",
+      succeeded: true,
+    },
+  };
+}
+
+function describeResetOutcome(outcome: ResetVcuOutcome): string {
+  switch (outcome.status) {
+    case "reset":
+      return `both VCU micros restarted (${outcome.note})`;
+    case "refused":
+      return `${outcome.micro} refused the reset: ${outcome.description}`;
+    case "failed":
+      return `${outcome.micro} failed at the ${outcome.stage} step: ${outcome.reason} — key off for 30 s and on to be sure of a clean state`;
+  }
 }
 
 /**
