@@ -141,12 +141,12 @@ const STOP_FRAME_GAP_MS = 20;
 
 // ── ECUReset (resetVcu) ─────────────────────────────────────────────────────
 const SERVICE_ECU_RESET = 0x11;
-const RESET_KEY_OFF_ON = 0x02; // keyOffOnReset — the only mode EMSuite uses on the bike (a restart, not a factory reset)
+const RESET_KEY_OFF_ON = 0x02; // keyOffOnReset — the only mode the service tool uses on the bike (a restart, not a factory reset)
 const POSITIVE_RESET_RESPONSE = 0x51; // 0x11 + 0x40
 const NEGATIVE_RESPONSE_SERVICE = 0x7f;
 /**
- * Control (A9) first, then Safety (A8), matching scripts/reboot-vcu.ts and EMSuite's
- * ResetVCU. Sessions are opened on both before either is reset — see runResetVcu.
+ * Control (A9) first, then Safety (A8), matching scripts/reboot-vcu.ts and the service
+ * tool's ResetVCU. Sessions are opened on both before either is reset — see runResetVcu.
  */
 const RESET_MICRO_ORDER: ("A8" | "A9")[] = ["A9", "A8"];
 /** Extended-addressing target byte per micro. Mirrors param-codec's TARGET_ADDRESS, which is module-private. */
@@ -598,7 +598,7 @@ export function resetVcu(channel: RawChannel): {
 }
 
 async function runResetVcu(context: SessionContext): Promise<ResetVcuOutcome> {
-  // Open a session on EVERY micro BEFORE the first reset, like EMSuite's ResetVCU:
+  // Open a session on EVERY micro BEFORE the first reset, like the service tool's ResetVCU:
   // opening the second node's session after the first is already down is one more
   // round trip during which the partner sees it gone and stores a fault.
   for (const micro of RESET_MICRO_ORDER) {
