@@ -1,6 +1,6 @@
 # Turning the headlight off — the persistent current-threshold route
 
-There is a **second** way to switch the headlight off over the bus, distinct from the `0x2F` io_set force in [headlight-diagnostic-control.md](headlight-diagnostic-control.md), and **it persists across power cycles**. It works by lying to the VCU about the beam's fault window: write the beam's maximum-current threshold _below_ what the beam actually draws, and at the next beam initialisation the VCU declares the circuit faulted and brings the beam up off.
+There is a **second** way to switch the headlight off over the bus, distinct from the `0x2F` io*set force in [headlight-diagnostic-control.md](headlight-diagnostic-control.md), and **it persists across power cycles**. It works by lying to the VCU about the beam's fault window: write the beam's maximum-current threshold \_below* what the beam actually draws, and at the next beam initialisation the VCU declares the circuit faulted and brings the beam up off.
 
 This corrects the "the avenue is closed" verdict in [dash-command-channel.md](dash-command-channel.md): that is true of the _non-diagnostic_ channel, but false once a diagnostic session is on the table — there are two diagnostic routes, not one.
 
