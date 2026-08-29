@@ -181,6 +181,11 @@ const UNCONFIRMED: Record<string, URLSearchParams> = {
     on: "1",
     expected: "4371",
   }),
+  // Complete: one valid w=NAME:VALUE:EXPECTED triple (the batch is repeated `w=`). Like
+  // parameter and bit it carries no confirm — it is many reversible parameter writes, not one
+  // of the irreversible ones — so it parses OK here, never enters the gated set below, and
+  // belongs out in the open rather than behind the fold.
+  parameters: new URLSearchParams({ action: "parameters", w: "MAX_DC_CHG_CURRENT:80:75" }),
   "read-service-stamp": new URLSearchParams({ action: "read-service-stamp" }),
   "set-service-point": new URLSearchParams({ action: "set-service-point" }),
   "sync-clock": new URLSearchParams({ action: "sync-clock" }),
