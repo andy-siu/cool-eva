@@ -18,6 +18,7 @@ import {
   setServicePoint,
   syncBikeClock,
   writeParameter,
+  writeParameters,
   type ClearDtcsOutcome,
   type ResetVcuOutcome,
   type RunningWriteSession,
@@ -30,6 +31,7 @@ import {
   writeTargetNamed,
   writeTargetProblemIn,
   writeTargets,
+  type ParameterWritePlan,
   type WriteTarget,
 } from "./write-targets.ts";
 import { parameterTableFor } from "./table-catalog.ts";
@@ -53,15 +55,31 @@ import { parameterTableFor } from "./table-catalog.ts";
 // And behind all five, per action: a read of the current value, a compare-and-swap against
 // what the caller thought it was, and a read-back afterwards.
 //
-// ⚠️ What is NOT here, and must not be added: no "write these five parameters", no "restore
-// from a snapshot", no "revert". Each turns one confirmed change into a batch nobody reads.
-// If a batch is ever genuinely needed, the right shape is a list the owner confirms one row
-// at a time — not a loop over this function.
+// ⚠️ What is NOT here, and must not be added: no "restore from a snapshot", no "revert", no
+// bulk loader that writes a table of values nobody read one at a time. Each turns a
+// confirmed change into a batch nobody reads.
+//
+// There IS one batch — `kind: "parameters"`, for the all-lights buttons — and it is the
+// shape this rule always allowed: a short fixed list that is genuinely ONE gesture, where
+// every parameter is still compare-and-swapped against a fresh read, read back, and given
+// its own audit line. The ONLY thing shared is the authenticated session, because five
+// separate unlocks cannot fit inside SECURITY_COOLDOWN_MS and one unlock risks fewer
+// attempts than five. What stays refused is the OPEN-ENDED batch — a snapshot restore, a
+// revert, a loop over an arbitrary list; for one of those the right shape is still a list
+// the owner confirms one row at a time.
 
 /** What the write runner can be asked to do. Closed, and every member is one action. */
 export type ServiceWriteRequest =
   /** Set an allowlisted parameter to a value, having read `expectedCurrent` off the bike first. */
   | { kind: "parameter"; name: string; value: number; expectedCurrent: number }
+  /**
+   * Set SEVERAL allowlisted parameters in ONE authenticated session — a read + compare-and-swap
+   * on each, then a single `27` unlock shared across all the `2E` writes. Only for a batch that
+   * is genuinely one gesture (the all-lights buttons); see the ⚠️ at the top of this file for why
+   * an open-ended batch is refused. Each entry is still individually planned, CAS-checked, read
+   * back and audited — the session is the only shared thing.
+   */
+  | { kind: "parameters"; writes: { name: string; value: number; expectedCurrent: number }[] }
   /** Turn one named bit of an allowlisted config word on or off. */
   | { kind: "bit"; name: string; bit: string; on: boolean; expectedCurrent: number }
   /** Read the last-service block off A8. Read-only; here because it is the routine's before-picture. */
@@ -117,6 +135,25 @@ export interface ServiceWriteResult {
    * exactly as this one was.
    */
   onBike?: { name: string; value: number; rawHex: string | null } | null;
+  /**
+   * Present only for a batch (`kind: "parameters"`): one entry per parameter asked for,
+   * in the order asked, so the page can say which circuit went through and which did not.
+   * The top-level `status`/`message`/`succeeded` summarise the whole run.
+   */
+  writes?: PerWriteResult[];
+}
+
+/** One parameter's outcome inside a batch, in the shape the page renders per row. */
+export interface PerWriteResult {
+  name: string;
+  /** The parameter's own status word — `written`, `read-back-mismatch`, `stale-precondition`, `refused`, `failed`. */
+  status: string;
+  /** One sentence, already phrased for the page — the same text a single write would show. */
+  message: string;
+  /** True only when this parameter really is now the value asked for. */
+  succeeded: boolean;
+  /** What it reads on the bike now, off the bus, when the outcome read it; null otherwise. */
+  onBike: { name: string; value: number; rawHex: string | null } | null;
 }
 
 export type ServiceWriteAnswer = { ok: true; result: ServiceWriteResult } | { ok: false; reason: string };
@@ -243,6 +280,17 @@ const GATE_WATCH_INTERVAL_MS = 200;
 
 /** How many journal lines the page shows. Enough to see the last session's work. */
 const RECENT_AUDIT_LINES = 12;
+
+/**
+ * The most parameters one batch (`kind: "parameters"`) may write in a single session.
+ *
+ * NOT a bus limit — the unlock survives as many writes as stay under ~2.5 s apart, which
+ * is all of them. It is a policy ceiling: one authenticated session is meant to be one
+ * gesture (the five light circuits), and a request to write dozens is either a bug or the
+ * batch being misused as a bulk loader — the "batch nobody reads" this file's header
+ * refuses. Eight is the five lights plus headroom.
+ */
+const MAX_PARAMETERS_PER_BATCH = 8;
 
 /**
  * How fresh charge_manager_state must be before a charge-current command is honoured.
@@ -372,7 +420,7 @@ export function sweptValueOf(target: WriteTarget, sweep: VcuParameterSnapshot | 
  * being irreversible: docs/vcu-parameters.md §4.
  */
 function tableGateAppliesTo(request: ServiceWriteRequest): boolean {
-  return request.kind === "parameter" || request.kind === "bit";
+  return request.kind === "parameter" || request.kind === "bit" || request.kind === "parameters";
 }
 
 /**
@@ -450,20 +498,31 @@ async function checkPreconditions(
     // ./write-session.ts re-reads, compares and reads back by plan.index, so a
     // misrouted write reads the wrong cell, writes it, verifies it and records success.
     // This asks about the parameter actually being written.
-    const named = "name" in request ? writeTargetNamed(request.name) : null;
-    if (named && table.tableType !== null) {
+    // One name for a single write or bit toggle, every name for a batch — each checked,
+    // because a batch shares nothing that would let one bad index ride in on another's back.
+    const names =
+      request.kind === "parameters" ? request.writes.map(write => write.name) : "name" in request ? [request.name] : [];
+    if (names.length > 0 && table.tableType !== null) {
       const bikeTable = parameterTableFor(table.tableType);
       if (!bikeTable) {
         return { ok: false, reason: `the bike names table ${table.tableType}, which this software cannot rebuild` };
       }
-      const problem = writeTargetProblemIn(named, bikeTable);
-      if (problem) {
-        return {
-          ok: false,
-          reason:
-            `refusing to write ${named.name} on a bike running table ${table.tableType} — ${problem}. ` +
-            "The parameter is writable; it is this bike's table that puts something else at that index.",
-        };
+      for (const name of names) {
+        const named = writeTargetNamed(name);
+        // An unknown name is not judged here — it is refused later, in the pure planning
+        // layer, with the full writable list. This gate only asks about names it knows.
+        if (!named) {
+          continue;
+        }
+        const problem = writeTargetProblemIn(named, bikeTable);
+        if (problem) {
+          return {
+            ok: false,
+            reason:
+              `refusing to write ${named.name} on a bike running table ${table.tableType} — ${problem}. ` +
+              "The parameter is writable; it is this bike's table that puts something else at that index.",
+          };
+        }
       }
     }
   }
@@ -507,6 +566,8 @@ async function performOnBus(
     case "parameter":
     case "bit":
       return await performParameterWrite(context, request, channel, tableType);
+    case "parameters":
+      return await performParameterWrites(context, request, channel, tableType);
     case "read-service-stamp":
       return await performReadStamp(context, channel);
     case "set-service-point":
@@ -577,6 +638,136 @@ async function performParameterWrite(
       message: describeWriteOutcome(outcome),
       succeeded: outcome.status === "written",
       onBike: readingAfter(outcome),
+    },
+  };
+}
+
+/**
+ * Writes several allowlisted parameters in ONE authenticated session — the engine behind the
+ * all-lights buttons. Every parameter is still planned, compare-and-swapped, written and read
+ * back exactly as a single write is; the ONLY shared thing is the `10 81` session and the one
+ * `27` unlock, because five separate unlocks cannot fit inside SECURITY_COOLDOWN_MS and one
+ * unlock risks one attempt rather than five. See the ⚠️ at the top of this file for what stays
+ * refused (the open-ended batch).
+ *
+ * The whole batch is refused, before any frame, if it is empty, over the cap, names something
+ * off the allowlist, or mixes micros — a batch on the wrong footing is worse than a plain
+ * refusal, and half a gesture is not the gesture. Once it runs, each parameter gets its own
+ * audit line and its own row in `writes`; the top-level status summarises — `written` only if
+ * every one went through, `partial` if some did, `failed` if none did.
+ */
+async function performParameterWrites(
+  context: WriteContext,
+  request: Extract<ServiceWriteRequest, { kind: "parameters" }>,
+  channel: RawChannel,
+  tableType: TableTypeReport | null
+): Promise<ServiceWriteAnswer> {
+  if (request.writes.length === 0) {
+    return { ok: false, reason: "a batch write named no parameters" };
+  }
+  if (request.writes.length > MAX_PARAMETERS_PER_BATCH) {
+    return {
+      ok: false,
+      reason: `a batch may write at most ${MAX_PARAMETERS_PER_BATCH} parameters in one session; ${request.writes.length} were asked for`,
+    };
+  }
+
+  // Plan every write in the pure layer first: a name off the allowlist or a value out of range
+  // refuses the WHOLE batch before a session is opened. A batch is one gesture, and running
+  // four of five writes because the fifth was malformed is not what the button promised.
+  const plans: ParameterWritePlan[] = [];
+  for (const write of request.writes) {
+    const planned = planWrite(write.name, write.value, write.expectedCurrent);
+    if (!planned.ok) {
+      return { ok: false, reason: `${write.name}: ${planned.reason}` };
+    }
+    plans.push(planned.plan);
+  }
+
+  // One micro per session. ./write-session.ts backstops this, but refusing here keeps the
+  // reason specific instead of surfacing as an opaque session-step failure.
+  const micro = plans[0].micro;
+  if (plans.some(plan => plan.micro !== micro)) {
+    const micros = [...new Set(plans.map(plan => plan.micro))];
+    return { ok: false, reason: `a single-session batch must be one micro; these span ${micros.join(", ")}` };
+  }
+
+  console.warn(
+    `vcu-write: about to write ${plans.length} parameters in one session on ${micro} — ` +
+      plans.map(plan => `${plan.name}=${plan.value}`).join(", ")
+  );
+
+  const session = writeParameters(channel, plans, tableType);
+  context.running = session.session;
+  const outcome = await session.finished;
+
+  if (outcome.status === "failed") {
+    // The batch never got past `10 81` (a live cooldown, or the micro did not answer), so no
+    // parameter was read and no SecurityAccess attempt was spent. One audit line for the whole
+    // batch — there is no per-parameter before/after to record — and every row reported failed.
+    await appendAuditRecord(context.directory, {
+      at: Date.now(),
+      clockTrustworthy: readPiClock().trustworthy,
+      action: "parameter-write",
+      status: "failed",
+      micro,
+      note: `batch of ${plans.length} (${plans.map(plan => plan.name).join(", ")}) failed at the ${outcome.stage} step: ${outcome.reason}`,
+    });
+    return {
+      ok: true,
+      result: {
+        action: "parameter-write",
+        status: "failed",
+        message: `Nothing was written — the batch failed at the ${outcome.stage} step: ${outcome.reason}`,
+        succeeded: false,
+        writes: plans.map(plan => ({
+          name: plan.name,
+          status: "failed",
+          message: `Not attempted — ${outcome.reason}`,
+          succeeded: false,
+          onBike: null,
+        })),
+      },
+    };
+  }
+
+  // One audit line per parameter, the SAME shape a lone write records (see performParameterWrite),
+  // so a batched write and a single write are indistinguishable in the journal — which is the
+  // point: each row is a real, separately compare-and-swapped and read-back change to the bike.
+  for (const perWrite of outcome.results) {
+    await appendAuditRecord(context.directory, {
+      at: Date.now(),
+      clockTrustworthy: readPiClock().trustworthy,
+      action: "parameter-write",
+      status: perWrite.status,
+      name: perWrite.plan.name,
+      identifier: perWrite.plan.identifier,
+      micro: perWrite.plan.micro,
+      before: perWrite.status === "stale-precondition" ? perWrite.actual : perWrite.plan.previousValue,
+      after: perWrite.status === "written" || perWrite.status === "read-back-mismatch" ? perWrite.readBack : null,
+      requested: perWrite.plan.value,
+      rawHex: "rawHex" in perWrite ? perWrite.rawHex : undefined,
+      note: describeWriteOutcome(perWrite),
+    });
+  }
+
+  const writes: PerWriteResult[] = outcome.results.map(perWrite => ({
+    name: perWrite.plan.name,
+    status: perWrite.status,
+    message: describeWriteOutcome(perWrite),
+    succeeded: perWrite.status === "written",
+    onBike: readingAfter(perWrite),
+  }));
+  const writtenCount = writes.filter(write => write.succeeded).length;
+  const allWritten = writtenCount === writes.length;
+  return {
+    ok: true,
+    result: {
+      action: "parameter-write",
+      status: allWritten ? "written" : writtenCount > 0 ? "partial" : "failed",
+      message: `Wrote ${writtenCount} of ${writes.length} parameters in one authenticated session.`,
+      succeeded: allWritten,
+      writes,
     },
   };
 }

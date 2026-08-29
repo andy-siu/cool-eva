@@ -1,37 +1,38 @@
 import { canIdsFor, identifierForIndex, parseResponseFrame, toHex } from "../src/vcu/param-codec.ts";
 
-// Reads — and, with a write flag, changes — the VCU-Safety headlight current-threshold parameters
-// that decide when the beam output is cut. See docs/headlight-diagnostic-control.md and the
-// threshold-write route it documents. This is a SEPARATE mechanism from scripts/headlight-off.ts:
-// that one forces the beam OUTPUT (io_set 0x2F control 17), an override that decays in <40 ms and
-// needs a 5 ms re-assert to hold. This one writes a STORED CALIBRATION (WriteDataByCommonID 0x2E) —
-// it persists across power cycles until written back. That is why --restore exists and why every
-// write reads back and re-checks the live draw.
+// Reads — and, with a write flag, changes — the VCU-Safety LIGHT current-threshold parameters that
+// decide when each light circuit's output is cut. Originally beam-only; now covers every light the VCU
+// current-senses: beam, front/rear position, stop, indicators (src/vcu/param-file.ts, groups LIGHTS +
+// BLINKER, all node A8). See docs/headlight-beam-threshold.md for the proven beam route.
+//
+// SEPARATE mechanism from scripts/headlight-off.ts: that one FORCES an output (io_set 0x2F), an
+// override that decays in <40 ms and needs a 5 ms re-assert. This one writes a STORED CALIBRATION
+// (WriteDataByCommonID 0x2E) that persists across power cycles until written back. Write MAX below the
+// real draw and at the next init the VCU reads over-current and brings that circuit up OFF, storing an
+// open-circuit DTC. That is why --restore exists and why every write reads back.
 //
 //   sudo systemctl stop cool-eva      # the service owns can0; one raw socket at a time
-//   sudo node --experimental-strip-types scripts/beam-threshold.ts                 # READ-ONLY recon
-//   sudo node --experimental-strip-types scripts/beam-threshold.ts --off [--value <mA>] [--via-min]
-//   sudo node --experimental-strip-types scripts/beam-threshold.ts --restore       # factory defaults back
-//   sudo node --experimental-strip-types scripts/beam-threshold.ts --write max 1000 # raw single-threshold write
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts                       # READ-ONLY recon (beam)
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --all                 # READ-ONLY recon, all five
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --light stop          # recon one circuit
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --light beam --off    # force beam off (persistent)
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --all-off             # every light off
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --light beam --restore
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --all --restore       # undo all five
+//   sudo node --experimental-strip-types scripts/beam-threshold.ts --light stop --write max 20
 //
-// The theory (from the on-bike report of "turned the headlight off, complained about low circuit
-// amps"): the VCU decides the beam is faulted when the sensed current leaves its [MIN..MAX] window.
-// Default --off writes BEAM_MAX_CURR_TH BELOW the measured draw, so sensed current sits ABOVE the
-// max threshold — the VCU reads over-current and cuts the output. The beam then draws ~0, which is
-// what stores the LOW/HIGH BEAM OPEN CIRCUIT DTC (B1009/B1012 — the "low circuit amps" complaint).
-// --via-min instead writes BEAM_MIN_CURR_TH ABOVE the draw (immediate bulb-out). Either persists.
+// ⚠️ Deliberately crosses this repo's standing ban on transmitting 0x2E/0x27 — SCRATCH probe, same
+// footing as scripts/headlight-off.ts. It reuses param-codec's PROVEN framing but builds the write
+// frame itself, because the shipped codec is read-only by construction.
 //
-// ⚠️ Deliberately crosses this repo's standing ban on transmitting 0x2E/0x27 — every shipped path
-// refuses those (param-codec.ts is read-only by construction). SCRATCH probe, same footing as
-// scripts/headlight-off.ts. It reuses param-codec's PROVEN framing helpers but builds the write
-// frame itself, because the shipped codec cannot.
+// ⚠️ A write here is PERSISTENT and stores a DTC the VCU keeps until cleared. --restore writes the
+// CATALOGUE-BASE factory values (param-file.ts is table 16406, NOT this bike's 16407), so for anything
+// but beam prefer the live-value restore recipe this tool prints before it writes.
 //
-// ⚠️ A write here is PERSISTENT. It stores a DTC the VCU keeps until cleared (shown on the
-// service tool's DTC page). --restore puts the factory thresholds back but does NOT clear the DTC.
-//
-// PRECONDITIONS for a write: bike on its stand, key ON, headlight on, clear of moving parts, not ridden.
+// PRECONDITIONS for a write: bike on its stand, key ON, the light on if you want its draw measured,
+// clear of moving parts, not ridden.
 
-const NODE = "A8"; // VCU-Safety — the micro that owns the LIGHTS parameter group (ecu 168 / 0xA8)
+const NODE = "A8"; // VCU-Safety — owns the LIGHTS + BLINKER parameter groups (ecu 168 / 0xA8)
 const TARGET_ADDRESS = 0xa8;
 
 const SERVICE_START_SESSION = 0x10;
@@ -52,18 +53,76 @@ const NRC_SECURITY_ACCESS_DENIED = 0x33;
 // 0x3E5F4542 (fixed per module). Confirmed on this bike — see docs/headlight-diagnostic-control.md.
 const KEY_SUBTRAHEND = 0x3e5f4542;
 
-// VCU-Safety LIGHTS parameters (the service tool's PARAM table): index, byte width, factory default in mA.
-// All bank 1, all uint16. The beam's fault window is [MIN..MAX]; HILO is the low/high split.
-const BEAM_PARAMS = {
-  max: { index: 240, name: "BEAM_MAX_CURR_TH", bytes: 2, factory: 7500 },
-  hilo: { index: 241, name: "BEAM_HILO_CURR_TH", bytes: 2, factory: 3750 },
-  min: { index: 242, name: "BEAM_MIN_CURR_TH", bytes: 2, factory: 1500 },
-} as const;
-type BeamParamKey = keyof typeof BEAM_PARAMS;
+interface ParamSpec {
+  index: number; // bank-1 parameter index; CommonIdentifier = identifierForIndex(index)
+  name: string;
+  bytes: number;
+  factory: number; // CATALOGUE-BASE default (table 16406) — NOT necessarily this bike's value
+  signed: boolean; // the S/U column — RPOSLIGHTS are two's-complement
+}
 
-// The beam's current sense, read via io_get (0x2F sub 0x01) so we can size the write and observe the
-// effect. Same control the LOW_BEAM guided test reads (control 18 on ecu 168).
-const BEAM_SENSE_CONTROL = 18;
+interface LightCircuit {
+  key: string; // --light selector
+  name: string;
+  min: ParamSpec; // healthy-window floor (raise above the draw for a bulb-out fault)
+  max: ParamSpec; // healthy-window ceiling — the one --off lowers below the draw
+  hilo: ParamSpec | null; // beam only: the low/high split threshold
+  senseControl: number | null; // io_get control for the live draw; only the beam's (18) is confirmed
+  note: string | null; // a per-circuit caution printed before touching it
+}
+
+function word(index: number, name: string, factory: number, signed = false): ParamSpec {
+  return { index, name, bytes: 2, factory, signed };
+}
+
+// All from src/vcu/param-file.ts (Energica's params.ecf), node A8, bank 1, WORD/mA.
+const LIGHT_CIRCUITS: Record<string, LightCircuit> = {
+  beam: {
+    key: "beam",
+    name: "Headlight beam",
+    min: word(242, "BEAM_MIN_CURR_TH", 1500),
+    max: word(240, "BEAM_MAX_CURR_TH", 7500),
+    hilo: word(241, "BEAM_HILO_CURR_TH", 3750),
+    senseControl: 18, // confirmed: the LOW_BEAM guided test reads control 18 on ecu 168
+    note: null,
+  },
+  frontpos: {
+    key: "frontpos",
+    name: "Front position lights",
+    min: word(243, "POSLIGHTS_MIN_CURR_TH", 50),
+    max: word(244, "POSLIGHTS_MAX_CURR_TH", 300),
+    hilo: null,
+    senseControl: null, // the io_set sweep saw id 10 ≈ 60 mA "front position" — a candidate, unconfirmed
+    note: null,
+  },
+  rearpos: {
+    key: "rearpos",
+    name: "Rear position lights",
+    min: word(251, "RPOSLIGHTS_MIN_CURR_TH", 15, true),
+    max: word(252, "RPOSLIGHTS_MAX_CURR_TH", 500, true),
+    hilo: null,
+    senseControl: null,
+    note: "idx 251/252 contested — param-file.ts=RPOSLIGHTS (signed), table-catalog=LIGHTS_DUMMY. Confirm by read-back before writing.",
+  },
+  stop: {
+    key: "stop",
+    name: "Stop / brake light",
+    min: word(245, "STOPLIGHTS_MIN_CURR_TH", 50),
+    max: word(246, "STOPLIGHTS_MAX_CURR_TH", 300),
+    hilo: null,
+    senseControl: null,
+    note: "normally OFF — the fault latches when the brake circuit is next energized/tested (STOPLIGHTS_INITIAL_TEST=1).",
+  },
+  indicator: {
+    key: "indicator",
+    name: "Indicators (blinkers)",
+    min: word(235, "INDICATOR_MIN_CURR_TH", 200),
+    max: word(236, "INDICATOR_MAX_CURR_TH", 500),
+    hilo: null,
+    senseControl: null,
+    note: "BLINKER group; INDICATORLIGHTS_INITIAL_TEST=0, so the fault may only latch when you actually signal.",
+  },
+};
 
 const NRC_NAMES: Record<number, string> = {
   0x12: "subFunctionNotSupported",
@@ -80,11 +139,18 @@ interface Reply {
   payload: Uint8Array; // excludes the address and PCI byte; includes the service byte
 }
 
+interface CircuitReading {
+  min: number | null;
+  max: number | null;
+  hilo: number | null;
+  senseMilliamps: number | null;
+}
+
 const options = parseArguments(process.argv.slice(2));
 const { request: REQUEST_CAN_ID, response: RESPONSE_CAN_ID } = canIdsFor(NODE);
 
 console.log(
-  `beam-threshold probe — target VCU-Safety (0x${TARGET_ADDRESS.toString(16)}) on ${hexId(REQUEST_CAN_ID)}/${hexId(RESPONSE_CAN_ID)}`
+  `light-threshold probe — target VCU-Safety (0x${TARGET_ADDRESS.toString(16)}) on ${hexId(REQUEST_CAN_ID)}/${hexId(RESPONSE_CAN_ID)}`
 );
 describeMode();
 
@@ -134,62 +200,130 @@ async function runSequence(): Promise<void> {
     return;
   }
 
-  const before = await readAll("before");
+  for (const key of options.circuits) {
+    const circuit = LIGHT_CIRCUITS[key];
+    if (circuit.note !== null) {
+      console.log(`\n⚠ ${circuit.name}: ${circuit.note}`);
+    }
+    const before = await readCircuit(circuit, "before");
 
-  if (options.mode === "read") {
-    console.log("\nrecon complete — nothing was written. Recommendation:");
-    recommend(before.senseMilliamps);
-    await stopSession();
-    return;
-  }
+    if (options.mode === "read") {
+      recommend(circuit, before);
+      continue;
+    }
 
-  const writes = plannedWrites(before.senseMilliamps);
-  if (writes === null) {
-    await stopSession();
-    return;
-  }
-  for (const write of writes) {
-    if (!(await writeParam(write.key, write.value))) {
-      console.log("  aborting — a write failed; earlier writes (if any) already persisted. Consider --restore.");
-      await stopSession();
-      return;
+    printRestoreRecipe(circuit, before);
+    const writes = plannedWrites(circuit, before);
+    if (writes === null) {
+      continue; // refused for this circuit (reason already printed); keep the rest of the run going
+    }
+    let allWritten = true;
+    for (const write of writes) {
+      if (!(await writeParam(write.spec, write.value))) {
+        console.log(`  aborting ${circuit.name} — a write failed; earlier writes (if any) already persisted.`);
+        allWritten = false;
+        break;
+      }
+    }
+    if (allWritten) {
+      await readCircuit(circuit, "after");
     }
   }
 
-  await readAll("after");
-  console.log(
-    "\nnote: the threshold change is a STORED calibration and persists across power cycles. " +
-      "Run with --restore to put the factory values back. A beam OPEN CIRCUIT DTC (B1009/B1012) " +
-      "will have been stored and must be cleared separately."
-  );
+  if (options.mode === "read") {
+    console.log("\nrecon complete — nothing was written.");
+  } else {
+    console.log(
+      "\nnote: these are STORED calibrations and persist across power cycles. Each forced circuit stores an " +
+        "open-circuit DTC (shown on the dash) that must be cleared separately. Undo with the printed restore " +
+        "recipe (this bike's live values) or --restore (catalogue factory)."
+    );
+  }
   await stopSession();
 }
 
-/** Plan the writes for --off / --restore / --write. Null means refuse (with a printed reason). */
-function plannedWrites(senseMilliamps: number | null): { key: BeamParamKey; value: number }[] | null {
+/** Plan the writes for --off / --restore / --write on one circuit. Null means refuse (reason printed). */
+function plannedWrites(circuit: LightCircuit, before: CircuitReading): { spec: ParamSpec; value: number }[] | null {
   if (options.mode === "restore") {
-    return (Object.keys(BEAM_PARAMS) as BeamParamKey[]).map(key => ({ key, value: BEAM_PARAMS[key].factory }));
+    if (circuit.key !== "beam") {
+      console.log(`  ⚠ --restore writes CATALOGUE factory for ${circuit.name}, which may differ from this bike.`);
+    }
+    const specs = [circuit.min, circuit.max, ...(circuit.hilo ? [circuit.hilo] : [])];
+    return specs.map(spec => ({ spec, value: spec.factory }));
   }
   if (options.mode === "write") {
-    return [{ key: options.writeKey, value: options.writeValue }];
+    const spec = writeTarget(circuit, options.writeKey);
+    if (spec === null) {
+      console.log(`  ✗ ${circuit.name} has no '${options.writeKey}' threshold.`);
+      return null;
+    }
+    return [{ spec, value: options.writeValue }];
   }
-  // --off: derive a value from the live draw unless one was given.
-  const key: BeamParamKey = options.viaMin ? "min" : "max";
+  return offWrites(circuit, before);
+}
+
+/** --off: lower MAX below the draw (or, with --via-min, raise MIN above it). */
+function offWrites(circuit: LightCircuit, before: CircuitReading): { spec: ParamSpec; value: number }[] | null {
+  const spec = options.viaMin ? circuit.min : circuit.max;
   if (options.value !== null) {
-    return [{ key, value: options.value }];
+    return [{ spec, value: options.value }];
   }
-  if (senseMilliamps === null || senseMilliamps < 600) {
-    console.log(
-      `  ✗ --off could not read a plausible beam draw (got ${senseMilliamps ?? "no reply"} mA). ` +
-        "Turn the headlight on, or pass --value <mA> explicitly."
-    );
+  const draw = before.senseMilliamps;
+  if (circuit.senseControl !== null && draw !== null && draw >= 30) {
+    // MAX route: set the ceiling below the draw → sensed current reads over-max → cut.
+    // MIN route: set the floor above the draw → sensed current reads under-min → bulb-out.
+    const value = options.viaMin ? Math.round(draw * 1.5) : Math.round(draw * 0.5);
+    console.log(`  --off: ${circuit.name} draws ${draw} mA → ${spec.name} := ${value} mA`);
+    if (!options.viaMin && before.min !== null && value < before.min) {
+      console.log(
+        `    (that is below the stored MIN ${before.min}; the window inverts — expected for a low-draw light)`
+      );
+    }
+    return [{ spec, value }];
+  }
+  if (options.viaMin) {
+    console.log(`  ✗ ${circuit.name}: no current sense to size --via-min. Pass --value <mA> (above the real draw).`);
     return null;
   }
-  // MAX route: set the ceiling clearly BELOW the draw so sensed current reads over-max → cut.
-  // MIN route: set the floor clearly ABOVE the draw so sensed current reads under-min → bulb-out.
-  const value = options.viaMin ? Math.round(senseMilliamps * 1.5) : Math.round(senseMilliamps * 0.5);
-  console.log(`  --off: measured draw ${senseMilliamps} mA → writing ${BEAM_PARAMS[key].name} = ${value} mA`);
-  return [{ key, value }];
+  if (before.min === null) {
+    console.log(`  ✗ ${circuit.name}: MIN threshold unreadable; cannot size a fallback. Pass --value <mA>.`);
+    return null;
+  }
+  // No sense mapped: size from THIS bike's stored floor. A value below MIN is below any real "on"
+  // draw, so the circuit reads over-max whenever it is actually lit.
+  const value = Math.max(1, Math.round(before.min * 0.5));
+  console.log(
+    `  ⚠ ${circuit.name}: no current sense — fallback ${circuit.max.name} := ${value} mA (below stored MIN ${before.min}). VERIFY on-bike.`
+  );
+  return [{ spec: circuit.max, value }];
+}
+
+function writeTarget(circuit: LightCircuit, key: "min" | "max" | "hilo"): ParamSpec | null {
+  if (key === "min") return circuit.min;
+  if (key === "max") return circuit.max;
+  return circuit.hilo;
+}
+
+/** Print the exact commands to put THIS bike's live thresholds back — a bike-correct undo. */
+function printRestoreRecipe(circuit: LightCircuit, before: CircuitReading): void {
+  const parts: string[] = [];
+  if (before.min !== null) {
+    parts.push(`--write min ${before.min}`);
+  }
+  if (before.max !== null) {
+    parts.push(`--write max ${before.max}`);
+  }
+  if (circuit.hilo && before.hilo !== null) {
+    parts.push(`--write hilo ${before.hilo}`);
+  }
+  if (parts.length === 0) {
+    console.log(`  (could not read ${circuit.name} thresholds to build a restore recipe)`);
+    return;
+  }
+  console.log(`  to undo ${circuit.name} with THIS bike's live values:`);
+  for (const part of parts) {
+    console.log(`    beam-threshold.ts --light ${circuit.key} ${part}`);
+  }
 }
 
 // ── UDS operations ───────────────────────────────────────────────────────────
@@ -217,44 +351,57 @@ async function unlock(): Promise<boolean> {
   return true;
 }
 
-/** Read all three beam thresholds plus the live beam draw, and print them lined up. */
-async function readAll(label: string): Promise<{ senseMilliamps: number | null }> {
-  console.log(`\n[${label}]`);
-  for (const key of Object.keys(BEAM_PARAMS) as BeamParamKey[]) {
-    const parameter = BEAM_PARAMS[key];
-    const value = await readParam(key);
-    const text = value === null ? "unreadable" : `${value} mA`;
-    console.log(`  ${parameter.name.padEnd(18)} (idx ${parameter.index}) = ${text}   [factory ${parameter.factory}]`);
+/** Read one circuit's thresholds plus its live draw (if a sense is mapped), and print them lined up. */
+async function readCircuit(circuit: LightCircuit, label: string): Promise<CircuitReading> {
+  console.log(`\n[${label}] ${circuit.name}`);
+  const min = await readParam(circuit.min);
+  const max = await readParam(circuit.max);
+  const hilo = circuit.hilo ? await readParam(circuit.hilo) : null;
+  printParam(circuit.min, min);
+  printParam(circuit.max, max);
+  if (circuit.hilo) {
+    printParam(circuit.hilo, hilo);
   }
-  const senseMilliamps = await readSense();
-  console.log(
-    `  beam sense (io_get ${BEAM_SENSE_CONTROL})     = ${senseMilliamps === null ? "no reply" : `${senseMilliamps} mA`}`
-  );
-  return { senseMilliamps };
+  let senseMilliamps: number | null = null;
+  if (circuit.senseControl !== null) {
+    senseMilliamps = await readSense(circuit.senseControl);
+    const text = senseMilliamps === null ? "no reply" : `${senseMilliamps} mA`;
+    console.log(`  live draw (io_get ${circuit.senseControl})  = ${text}`);
+  } else {
+    console.log("  live draw                       = (no current sense mapped for this circuit)");
+  }
+  return { min, max, hilo, senseMilliamps };
 }
 
-/** ReadDataByCommonID for one beam parameter. Returns its value in mA, or null if unreadable. */
-async function readParam(key: BeamParamKey): Promise<number | null> {
-  const parameter = BEAM_PARAMS[key];
-  const identifier = identifierForIndex(parameter.index);
+function printParam(spec: ParamSpec, value: number | null): void {
+  const text = value === null ? "unreadable" : `${value} mA`;
+  console.log(`  ${spec.name.padEnd(20)} (idx ${spec.index}) = ${text}   [catalogue ${spec.factory}]`);
+}
+
+/** ReadDataByCommonID for one parameter. Returns its value in mA, or null if unreadable. */
+async function readParam(spec: ParamSpec): Promise<number | null> {
+  const identifier = identifierForIndex(spec.index);
   const reply = await transact([SERVICE_READ_PARAM, (identifier >> 8) & 0xff, identifier & 0xff]);
-  if (!reply.ok || reply.payload.length < 3 + parameter.bytes) {
+  if (!reply.ok || reply.payload.length < 3 + spec.bytes) {
     return null;
   }
   // Positive 0x62 reply echoes the 2-byte identifier, then the value bytes (big-endian).
-  const value = reply.payload.subarray(reply.payload.length - parameter.bytes);
-  return value.reduce((accumulated, byte) => accumulated * 256 + byte, 0);
+  const bytes = reply.payload.subarray(reply.payload.length - spec.bytes);
+  let value = bytes.reduce((accumulated, byte) => accumulated * 256 + byte, 0);
+  if (spec.signed && value >= 1 << (spec.bytes * 8 - 1)) {
+    value -= 1 << (spec.bytes * 8); // two's-complement for the S-column params (e.g. RPOSLIGHTS)
+  }
+  return value;
 }
 
-/** WriteDataByCommonID for one beam parameter, then read it back and confirm. Retries once on 0x33. */
-async function writeParam(key: BeamParamKey, value: number): Promise<boolean> {
-  const parameter = BEAM_PARAMS[key];
-  const identifier = identifierForIndex(parameter.index);
-  const valueBytes = uintBytes(value, parameter.bytes);
+/** WriteDataByCommonID for one parameter, then read it back and confirm. Retries once on 0x33. */
+async function writeParam(spec: ParamSpec, value: number): Promise<boolean> {
+  const identifier = identifierForIndex(spec.index);
+  const valueBytes = uintBytes(value, spec.bytes);
   const send = () => transact([SERVICE_WRITE_PARAM, (identifier >> 8) & 0xff, identifier & 0xff, ...valueBytes]);
 
   console.log(
-    `\n→ WriteDataByCommonID: ${parameter.name} (idx ${parameter.index}) := ${value} mA  [${toHex(Uint8Array.from(valueBytes))}]`
+    `\n→ WriteDataByCommonID: ${spec.name} (idx ${spec.index}) := ${value} mA  [${toHex(Uint8Array.from(valueBytes))}]`
   );
   let written = await send();
   if (written.negativeCode === NRC_SECURITY_ACCESS_DENIED) {
@@ -268,7 +415,7 @@ async function writeParam(key: BeamParamKey, value: number): Promise<boolean> {
     console.log(`  ✗ write refused: ${describe(written)}`);
     return false;
   }
-  const readBack = await readParam(key);
+  const readBack = await readParam(spec);
   if (readBack !== value) {
     console.log(`  ✗ read-back mismatch: wrote ${value}, reads ${readBack ?? "unreadable"}`);
     return false;
@@ -277,14 +424,9 @@ async function writeParam(key: BeamParamKey, value: number): Promise<boolean> {
   return true;
 }
 
-/** Live beam current via io_get (0x2F sub 0x01). Signed 16-bit trailing, per the service tool's decode. */
-async function readSense(): Promise<number | null> {
-  const reply = await transact([
-    SERVICE_IO_CONTROL,
-    (BEAM_SENSE_CONTROL >> 8) & 0xff,
-    BEAM_SENSE_CONTROL & 0xff,
-    IO_GET_READING,
-  ]);
+/** Live current via io_get (0x2F sub 0x01). Signed 16-bit trailing, per the service tool's decode. */
+async function readSense(control: number): Promise<number | null> {
+  const reply = await transact([SERVICE_IO_CONTROL, (control >> 8) & 0xff, control & 0xff, IO_GET_READING]);
   if (!reply.ok) {
     return null;
   }
@@ -302,17 +444,27 @@ async function stopSession(): Promise<void> {
   console.log("done.");
 }
 
-function recommend(senseMilliamps: number | null): void {
-  if (senseMilliamps === null || senseMilliamps < 600) {
-    console.log("  (beam draw not readable — turn the headlight on to see the recommendation)");
+function recommend(circuit: LightCircuit, before: CircuitReading): void {
+  const draw = before.senseMilliamps;
+  if (circuit.senseControl !== null && draw !== null && draw >= 30) {
+    console.log(`  ${circuit.name} draws ${draw} mA. To force it off persistently:`);
+    console.log(
+      `    --light ${circuit.key} --off            → ${circuit.max.name} ≈ ${Math.round(draw * 0.5)} mA (over-current cut)`
+    );
+    console.log(
+      `    --light ${circuit.key} --off --via-min  → ${circuit.min.name} ≈ ${Math.round(draw * 1.5)} mA (bulb-out)`
+    );
     return;
   }
-  const maxTarget = Math.round(senseMilliamps * 0.5);
-  const minTarget = Math.round(senseMilliamps * 1.5);
-  console.log(`  beam draws ${senseMilliamps} mA. To force it off persistently:`);
-  console.log(`    --off            → BEAM_MAX_CURR_TH ≈ ${maxTarget} mA (draw sits over max → over-current cut)`);
-  console.log(`    --off --via-min  → BEAM_MIN_CURR_TH ≈ ${minTarget} mA (draw sits under min → bulb-out)`);
-  console.log("  Then --restore to undo. Both store a beam OPEN CIRCUIT DTC.");
+  if (before.min !== null) {
+    const fallback = Math.max(1, Math.round(before.min * 0.5));
+    console.log(
+      `  ${circuit.name}: no current sense mapped. --light ${circuit.key} --off would use a fallback ` +
+        `${circuit.max.name} := ${fallback} mA (below stored MIN ${before.min}); verify on-bike, or pass --value.`
+    );
+    return;
+  }
+  console.log(`  ${circuit.name}: thresholds unreadable — is the key on and the bike awake?`);
 }
 
 // ── transport ────────────────────────────────────────────────────────────────
@@ -365,23 +517,27 @@ function describe(reply: Reply): string {
 }
 
 function describeMode(): void {
+  const scope =
+    options.circuits.length === 1
+      ? LIGHT_CIRCUITS[options.circuits[0]].name
+      : `${options.circuits.length} circuits (${options.circuits.join(", ")})`;
   if (options.mode === "read") {
-    console.log("mode: READ-ONLY recon — reading beam thresholds and live draw. Nothing is written.");
+    console.log(`mode: READ-ONLY recon — reading thresholds + live draw for ${scope}. Nothing is written.`);
     return;
   }
   if (options.mode === "restore") {
-    console.log("mode: RESTORE — writing the three beam thresholds back to their factory defaults.");
+    console.log(`mode: RESTORE — writing catalogue-factory thresholds for ${scope}.`);
   } else if (options.mode === "write") {
     console.log(
-      `mode: WRITE — ${BEAM_PARAMS[options.writeKey].name} := ${options.writeValue} mA (raw single-threshold write).`
+      `mode: WRITE — ${options.writeKey} := ${options.writeValue} mA on ${scope} (raw single-threshold write).`
     );
   } else {
     console.log(
-      `mode: OFF — writing ${options.viaMin ? "BEAM_MIN above" : "BEAM_MAX below"} the beam draw to cut it (PERSISTENT).`
+      `mode: OFF — ${options.viaMin ? "raising MIN above" : "lowering MAX below"} the draw to cut ${scope} (PERSISTENT).`
     );
   }
   console.log(
-    "⚠️  Bike on its stand, key ON, headlight on, clear of moving parts. The write persists across power cycles; --restore undoes it."
+    "⚠️  Bike on its stand, key ON, clear of moving parts. Writes persist across power cycles; a restore recipe is printed per circuit."
   );
 }
 
@@ -417,23 +573,34 @@ function hexId(id: number): string {
 type Mode = "read" | "off" | "restore" | "write";
 
 interface Options {
+  circuits: string[]; // one or more LIGHT_CIRCUITS keys
   mode: Mode;
-  value: number | null; // --value <mA> for --off (null = derive from live draw)
-  viaMin: boolean; // --via-min: raise BEAM_MIN above the draw instead of lowering BEAM_MAX below it
-  writeKey: BeamParamKey; // --write <key> <mA>
+  value: number | null; // --value <mA> for --off (null = derive from live draw or the stored floor)
+  viaMin: boolean; // --via-min: raise MIN above the draw instead of lowering MAX below it
+  writeKey: "min" | "max" | "hilo"; // --write <key> <mA>
   writeValue: number;
 }
 
 function parseArguments(argv: string[]): Options {
+  let circuits = ["beam"];
   let mode: Mode = "read";
   let value: number | null = null;
   let viaMin = false;
-  let writeKey: BeamParamKey = "max";
+  let writeKey: "min" | "max" | "hilo" = "max";
   let writeValue = 0;
 
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
-    if (flag === "--off") {
+    if (flag === "--all-off") {
+      circuits = Object.keys(LIGHT_CIRCUITS);
+      mode = "off";
+    } else if (flag === "--all") {
+      // Select every circuit but leave the mode alone: `--all` alone is read-only recon of all five,
+      // `--all --restore` undoes all five. `--all-off` stays as the one-word "cut everything".
+      circuits = Object.keys(LIGHT_CIRCUITS);
+    } else if (flag === "--light") {
+      circuits = parseCircuitList(argv[++index]);
+    } else if (flag === "--off") {
       mode = "off";
     } else if (flag === "--restore") {
       mode = "restore";
@@ -454,14 +621,31 @@ function parseArguments(argv: string[]): Options {
     }
   }
 
-  if (mode === "off" && viaMin === false && value !== null && !Number.isFinite(value)) {
-    throw new Error(`--value must be a number of milliamps, got ${value}`);
-  }
   if (value !== null && (!Number.isInteger(value) || value < 0 || value > 0xffff)) {
     throw new Error(`--value must be a 16-bit milliamp value, got ${value}`);
   }
-  if (mode === "write" && (!Number.isInteger(writeValue) || writeValue < 0 || writeValue > 0xffff)) {
-    throw new Error(`--write value must be a 16-bit milliamp value, got ${writeValue}`);
+  if (mode === "write") {
+    if (circuits.length !== 1) {
+      throw new Error("--write acts on one circuit — select it with --light <name>");
+    }
+    if (!Number.isInteger(writeValue) || writeValue < 0 || writeValue > 0xffff) {
+      throw new Error(`--write value must be a 16-bit milliamp value, got ${writeValue}`);
+    }
   }
-  return { mode, value, viaMin, writeKey, writeValue };
+  return { circuits, mode, value, viaMin, writeKey, writeValue };
+}
+
+function parseCircuitList(raw: string | undefined): string[] {
+  if (raw === undefined) {
+    throw new Error(
+      `--light needs a circuit name (${Object.keys(LIGHT_CIRCUITS).join("|")}), or a comma-separated list`
+    );
+  }
+  const keys = raw.split(",").map(part => part.trim());
+  for (const key of keys) {
+    if (!(key in LIGHT_CIRCUITS)) {
+      throw new Error(`--light: unknown circuit '${key}'. Known: ${Object.keys(LIGHT_CIRCUITS).join(", ")}`);
+    }
+  }
+  return keys;
 }

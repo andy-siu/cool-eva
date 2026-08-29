@@ -148,6 +148,49 @@ export function parseWriteRequest(
       }
       return { ok: true, request: { kind: "bit", name, bit, on: on === "1", expectedCurrent: expected } };
     }
+    case "parameters": {
+      // A batch is repeated `w=NAME:VALUE:EXPECTED`, one per parameter — colon-packed rather
+      // than three parallel arrays so a name can never end up paired with another's value if
+      // the query is reordered. Each carries its own compare-and-swap `expected`, exactly as a
+      // single `parameter` write does; no confirm token, because it is many parameter writes
+      // (the guarded, reversible action), not one of the irreversible ones. The runner caps the
+      // count, plans every name against the allowlist, and refuses the whole batch on any bad one.
+      const entries = params.getAll("w");
+      if (entries.length === 0) {
+        return {
+          ok: false,
+          reason:
+            "a batch write needs at least one w=NAME:VALUE:EXPECTED — the value and the value you read off the bike",
+        };
+      }
+      const writes: { name: string; value: number; expectedCurrent: number }[] = [];
+      for (const entry of entries) {
+        const parts = entry.split(":");
+        if (parts.length !== 3) {
+          return {
+            ok: false,
+            reason: `each w= must be NAME:VALUE:EXPECTED (three colon-separated fields), not "${entry}"`,
+          };
+        }
+        const name = parts[0].trim();
+        if (name.length === 0) {
+          return { ok: false, reason: `a w= entry has no parameter name: "${entry}"` };
+        }
+        const value = parseNumber(parts[1]);
+        if (value === null) {
+          return { ok: false, reason: `${name}: value must be a whole number, not ${parts[1] || "(nothing)"}` };
+        }
+        const expected = parseNumber(parts[2]);
+        if (expected === null) {
+          return {
+            ok: false,
+            reason: `${name}: expected= must carry the value you read off the bike — every write in the batch is still a compare-and-swap`,
+          };
+        }
+        writes.push({ name, value, expectedCurrent: expected });
+      }
+      return { ok: true, request: { kind: "parameters", writes } };
+    }
     case "read-service-stamp":
       return { ok: true, request: { kind: "read-service-stamp" } };
     case "set-service-point":
@@ -228,7 +271,7 @@ export function parseWriteRequest(
     default:
       return {
         ok: false,
-        reason: `action must be one of parameter, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs, charge-current, charge-stop, reset-vcu — not ${action ?? "(nothing)"}`,
+        reason: `action must be one of parameter, parameters, bit, read-service-stamp, set-service-point, sync-clock, clear-dtcs, charge-current, charge-stop, reset-vcu — not ${action ?? "(nothing)"}`,
       };
   }
 }
