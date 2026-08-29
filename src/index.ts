@@ -25,9 +25,11 @@ import {
   describeTableType,
   selectParameterTable,
 } from "./vcu/param-table.ts";
+import { handleFanEndpoint } from "./http/fan.ts";
 import { defineSignals, record } from "./can/signals.ts";
 import { SIGNALS } from "./can/registry.ts";
 import { startCoolantSensors } from "./sensors/max31865.ts";
+import { startFanControl } from "./fan/control.ts";
 import { bringUpCan, openChannel } from "./can/socket.ts";
 import { startCanLinkMonitor } from "./can/link-status.ts";
 import { decodeFrame, STREAM_IDS } from "./can/decode.ts";
@@ -56,6 +58,7 @@ const UPDATE_DIR = process.env.UPDATE_DIR ?? ROOT;
 
 // Config (env overrides). README's Configuration section is the full table; this indexes it:
 //   COOLANT_ENABLED=0 → skip the MAX31865 probes (a bike with no watercooling loop)
+//   FAN_ENABLED=1 → ⚠️ OPT IN. Drive the IBT-2 cooling fan and route /fan (docs/fan-control.md)
 //   CAN_ENABLED=0 → skip CAN entirely (coolant only)
 //   OBD_ENABLED=0 → passive/listen-only: decode broadcasts but don't TX OBD polls
 //   ELOCK_ENABLED=0 → skip the one-shot keys-paired read from the E-LOCK ECU
@@ -66,9 +69,8 @@ const UPDATE_DIR = process.env.UPDATE_DIR ?? ROOT;
 //   CUSTOM_BMS_CONFIG=1 → only with the custom LiBAL BMS config flashed; moves the
 //     true pack temperatures onto 0x660. Leave unset on a stock Energica.
 //   VCU_PARAM_DIR=… → where service mode leaves its parameter snapshots
-//   SERVICE_MODE_ENABLED=0 → the dashboard cannot start a parameter read; serving and
-//     exporting the last snapshot are unaffected, neither goes near the bike
-//   SERVICE_WRITE_ENABLED=1 → the dashboard may CHANGE things on the bike; see below.
+//   SERVICE_MODE_ENABLED=0 → no parameter read from the dashboard; the snapshot is still served
+//   SERVICE_WRITE_ENABLED=1 → ⚠️ OPT IN, the other one. The dashboard may CHANGE the bike; see below.
 const CAN_ENABLED = process.env.CAN_ENABLED !== "0";
 const OBD_ENABLED = process.env.OBD_ENABLED !== "0";
 const ELOCK_ENABLED = process.env.ELOCK_ENABLED !== "0";
@@ -80,8 +82,8 @@ const CUSTOM_BMS_CONFIG = process.env.CUSTOM_BMS_CONFIG === "1";
 const VCU_PARAM_DIR = process.env.VCU_PARAM_DIR ?? join(ROOT, "vcu-params");
 const SERVICE_MODE_ENABLED = process.env.SERVICE_MODE_ENABLED !== "0";
 // ⚠️ OPT IN, NOT OPT OUT — `=== "1"`, not `!== "0"`, and the asymmetry is deliberate:
-// every other flag above turns something off, this one turns something on, so a Pi
-// nobody has told about it cannot change a motorcycle's calibration EEPROM. Separate
+// every flag above except FAN_ENABLED turns something off, these two turn something on,
+// so a Pi nobody has told about it cannot change a motorcycle's EEPROM. Separate
 // from SERVICE_MODE_ENABLED because reads and writes are not the same risk and must
 // not share an off button. ⚠️ And it cannot satisfy src/vcu/table-gate.ts: a PARAMETER
 // write stays refused until a sweep has read both TABLE_TYPE copies, which on this
@@ -121,6 +123,14 @@ try {
 } catch (err) {
   console.error("coolant: init failed — continuing without coolant probes:", err);
 }
+
+// --- Cooling fan (IBT-2 half-bridge on hardware PWM) ---
+// The other half of the watercooling loop, and the only thing here that drives a
+// physical output on the Pi rather than reading one. It never throws — a fan that cannot
+// be brought up becomes a `fault` string the endpoint reports — and it does nothing at
+// all unless FAN_ENABLED=1. Phase 1 is manual duty from the dashboard; there is no
+// temperature curve. docs/fan-control.md.
+const fanController = await startFanControl();
 
 // --- CAN: broadcast decode + OBD-II polling ---
 let channel: RawChannel | undefined;
@@ -397,6 +407,13 @@ const server = createServer(async (req, res) => {
     await handleUpdateEndpoint(req, res, UPDATE_DIR);
     return;
   }
+  // Manual duty for the cooling fan. The Pi's own GPIO and PWM; it cannot reach the
+  // bike's bus. Routed only when FAN_ENABLED=1, so a Pi with no fan 404s here instead of
+  // offering a control that could never work.
+  if (fanController.configured && url.pathname === "/fan") {
+    await handleFanEndpoint(req, res, url, { controller: fanController });
+    return;
+  }
   if (url.pathname === "/dtc-table") {
     handleDtcTableEndpoint(req, res);
     return;
@@ -497,7 +514,19 @@ async function shutdown(): Promise<void> {
   await vcuReadRunner.stop();
   // Awaited, not fire-and-forget: sealing the last segment is async, and
   // process.exit() below would otherwise kill it and lose the final buffer.
+  //
+  // ⚠️ BEFORE the fan, irreversible data first. There is no TimeoutStopSec in the unit,
+  // so systemd's 90 s default is what a wedged sysfs write or a hung `pinctrl` costs —
+  // and it would cost it out of this call's budget. A lost ride-log segment is
+  // unrecoverable; a fan left spinning has the config.txt `gpio=` lines and a five-second
+  // `Restart=on-failure` behind it.
   await closeEncryptedLog();
+  // Awaited, and before the process goes: this is the only output this service drives.
+  // Deploy is `git pull` + `systemctl restart`, so leaving a fan spinning behind a dead
+  // process is a routine path rather than a rare one. A SIGKILL skips this — but the unit
+  // restarts in five seconds and openFanPwm() drops the enables first thing, with the
+  // config.txt `gpio=17,op,dl` lines as the backstop if it never comes back.
+  await fanController.stop();
   try {
     channel?.stop();
   } catch (err) {
