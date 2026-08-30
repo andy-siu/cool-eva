@@ -2,8 +2,9 @@
 
 // The cooling-fan slider's command transport, lifted out of ../views/fan.js because it is
 // a state machine rather than a view: nothing here touches van, the DOM or `fetch`. The
-// sender is passed in, so scripts/check-fan-endpoint.ts drives it with a recording one and
-// the coalescing is asserted rather than read.
+// sender, the clock and the timer are all passed in, so scripts/check-fan-endpoint.ts
+// drives it with a recording sender on time it steps by hand, and the coalescing is
+// asserted rather than read.
 //
 // ⚠️ What it exists to prevent: `oninput` fires about twenty times a second under a thumb,
 // and a Pi Zero 2 W does not want twenty POSTs and forty `pinctrl` spawns out of one
@@ -18,8 +19,9 @@
 /**
  * The shortest gap between two sends.
  *
- * The first move goes at once — `lastSentAt` starts at 0, so the first wait is 0 — and the
- * rest coalesce to the latest value at this rate. Superseded ones are never sent at all.
+ * The first move goes at once — `lastSentAt` starts a whole interval behind whatever the
+ * clock reads — and the rest coalesce to the latest value at this rate. Superseded ones
+ * are never sent at all.
  */
 export const FAN_COMMAND_INTERVAL_MS = 150;
 
@@ -32,6 +34,10 @@ export const FAN_COMMAND_INTERVAL_MS = 150;
  *   queued or in flight, so the page can stop mirroring the Pi's PREVIOUS answer back over
  *   a thumb that has already moved past it.
  * @property {number} [intervalMs]
+ * @property {() => number} [now] the clock the interval is measured on.
+ * @property {(callback: () => void, delayMs: number) => void} [setTimer] arms the one-shot
+ *   flush timer. Injected as a PAIR with `now`, never one alone, and both may start
+ *   anywhere: docs/fan-control.md §"The slider".
  */
 
 /**
@@ -51,10 +57,15 @@ export function createFanCommandQueue(options) {
     send: options.send,
     onSettlingChange: options.onSettlingChange ?? (() => {}),
     intervalMs: options.intervalMs ?? FAN_COMMAND_INTERVAL_MS,
+    now: options.now ?? (() => performance.now()),
+    setTimer: options.setTimer ?? ((callback, delayMs) => void setTimeout(callback, delayMs)),
     queued: null,
-    flushTimer: null,
+    flushTimerArmed: false,
     inFlight: false,
-    lastSentAt: 0,
+    // ⚠️ Not 0. An injected clock may read anything, including 0, and one that starts
+    // there would have its first command held for a whole interval — a slider that
+    // waited. docs/fan-control.md §"The slider".
+    lastSentAt: Number.NEGATIVE_INFINITY,
   };
   return {
     queue: command => queueCommand(state, command),
@@ -67,13 +78,15 @@ export function createFanCommandQueue(options) {
  * @property {(command: FanCommand, isSuperseded: () => boolean) => Promise<void>} send
  * @property {(settling: boolean) => void} onSettlingChange
  * @property {number} intervalMs
+ * @property {() => number} now
+ * @property {(callback: () => void, delayMs: number) => void} setTimer
  * @property {FanCommand | null} queued the next command, OVERWRITTEN rather than appended
- * @property {ReturnType<typeof setTimeout> | null} flushTimer
+ * @property {boolean} flushTimerArmed a flush is already waiting to fire. A flag and not
+ *   the handle, because nothing here ever cancels one.
  * @property {boolean} inFlight
- * @property {number} lastSentAt ⚠️ performance.now(), never Date.now(): this dashboard has
- *   a button on it that STEPS THE CLOCK, and a wall clock that jumps backwards would hold
- *   every later command for the size of the step. Same rule as ./arming.js and
- *   src/monotonic.ts.
+ * @property {number} lastSentAt read off state.now(), ⚠️ never Date.now(): this dashboard
+ *   has a button that STEPS THE CLOCK, and a wall clock jumping back would hold every
+ *   later command for the size of the step. Same rule as ./arming.js, src/monotonic.ts.
  */
 
 /**
@@ -93,12 +106,13 @@ function queueCommand(state, command) {
  * @param {QueueState} state
  */
 function scheduleFlush(state) {
-  if (state.flushTimer !== null || state.inFlight || state.queued === null) {
+  if (state.flushTimerArmed || state.inFlight || state.queued === null) {
     return;
   }
-  const wait = Math.max(0, state.intervalMs - (performance.now() - state.lastSentAt));
-  state.flushTimer = setTimeout(() => {
-    state.flushTimer = null;
+  const wait = Math.max(0, state.intervalMs - (state.now() - state.lastSentAt));
+  state.flushTimerArmed = true;
+  state.setTimer(() => {
+    state.flushTimerArmed = false;
     void flush(state);
   }, wait);
 }
@@ -114,7 +128,7 @@ async function flush(state) {
   }
   state.queued = null;
   state.inFlight = true;
-  state.lastSentAt = performance.now();
+  state.lastSentAt = state.now();
   try {
     await state.send(command, () => state.queued !== null);
   } catch (error) {

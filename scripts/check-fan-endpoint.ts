@@ -1,3 +1,4 @@
+import { readFile } from "fs/promises";
 import { createServer } from "http";
 import type { AddressInfo } from "net";
 import { createFanCommandQueue } from "../public/lib/fan-command-queue.js";
@@ -8,6 +9,8 @@ import { MAX_DUTY_PERCENT, MIN_RUNNING_DUTY_PERCENT } from "../src/fan/control.t
 import type { FanReply } from "../src/http/fan.ts";
 import { FAN_HEADER, FAN_HEADER_VALUE, handleFanEndpoint, parseFanRequest } from "../src/http/fan.ts";
 import { SERVICE_WRITE_HEADER, SERVICE_WRITE_HEADER_VALUE } from "../src/http/vcu-write.ts";
+import { createVirtualClock } from "./virtual-clock.ts";
+import type { VirtualClock } from "./virtual-clock.ts";
 
 // The /fan wire, both ends of it, with no Pi and no phone.
 //
@@ -219,10 +222,22 @@ server.close();
 // public/lib/fan-command-queue.js, driven with a recording sender. A drag fires `input`
 // about twenty times a second and every one of them calls queue(); what must reach the Pi
 // is the first and then the latest per window, never one POST per event.
+//
+// ⚠️ On a clock this file steps, never the machine's. The queue takes `now` and `setTimer`
+// for exactly this: the interval assertion below used to compare two performance.now()
+// reads against a 1 ms tolerance and went red under load — scripts/virtual-clock.ts has
+// the measurements. Nothing in this section may go back to sleeping for real.
 
 console.log("\n3. the slider's POSTs, coalesced");
 
 const QUEUE_INTERVAL_MS = 60;
+
+/**
+ * Where the fake clock starts. A real page is seconds in by the time a thumb finds the
+ * slider, so this is the honest origin — but it is no longer load-bearing, and the drag at
+ * the end of this section runs the same queue from an origin of 0 to keep it that way.
+ */
+const CLOCK_START_MS = 10_000;
 
 interface SenderLog {
   sent: FanCommand[];
@@ -232,17 +247,29 @@ interface SenderLog {
   supersededAt: boolean[];
 }
 
-/** A sender that records what it was given, how many were in flight, and when. */
-function recordingQueue(log: SenderLog, latencyMs: number, settling: boolean[], failFirst = false) {
+/**
+ * A sender that records what it was given, how many were in flight, and when — `at` read
+ * off the same clock the queue schedules on, so it is what the queue decided and not what
+ * the machine managed to deliver.
+ */
+function recordingQueue(
+  clock: VirtualClock,
+  log: SenderLog,
+  latencyMs: number,
+  settling: boolean[],
+  failFirst = false
+) {
   return createFanCommandQueue({
     intervalMs: QUEUE_INTERVAL_MS,
+    now: () => clock.now(),
+    setTimer: (callback, delayMs) => clock.setTimer(callback, delayMs),
     onSettlingChange: pending => settling.push(pending),
     send: async (command, isSuperseded) => {
       log.sent.push(command);
-      log.at.push(performance.now());
+      log.at.push(clock.now());
       log.concurrent += 1;
       log.maxConcurrent = Math.max(log.maxConcurrent, log.concurrent);
-      await new Promise(resolve => setTimeout(resolve, latencyMs));
+      await clock.sleep(latencyMs);
       log.supersededAt.push(isSuperseded());
       log.concurrent -= 1;
       if (failFirst && log.sent.length === 1) {
@@ -257,33 +284,34 @@ function emptyLog(): SenderLog {
 }
 
 /** Long enough for every timer this queue can still have armed to have fired. */
-async function settle(): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, QUEUE_INTERVAL_MS * 4));
+async function settle(clock: VirtualClock): Promise<void> {
+  await clock.advance(QUEUE_INTERVAL_MS * 4);
 }
 
 /** One `input` event's worth of thumb movement. A real drag fires about every 50 ms. */
-async function dragEvent(): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, 12));
+async function dragEvent(clock: VirtualClock): Promise<void> {
+  await clock.advance(12);
 }
 
+const dragClock = createVirtualClock(CLOCK_START_MS);
 const dragLog = emptyLog();
 const dragSettling: boolean[] = [];
-const dragQueue = recordingQueue(dragLog, 5, dragSettling);
-const startedAt = performance.now();
+const dragQueue = recordingQueue(dragClock, dragLog, 5, dragSettling);
+const startedAt = dragClock.now();
 dragQueue.queue({ duty: 30 });
 check("a move raises settling at once, before anything is on the wire", dragSettling[0] === true);
-await dragEvent();
+await dragEvent(dragClock);
 check(
   "⚠️  the FIRST move goes at once — a slider that waited would feel broken",
   dragLog.sent.length === 1 && "duty" in dragLog.sent[0] && dragLog.sent[0].duty === 30
 );
-check("…and it went immediately, not one interval later", dragLog.at[0] - startedAt < QUEUE_INTERVAL_MS);
+check("…and it went in the same instant, not one interval later", dragLog.at[0] === startedAt);
 
 for (const duty of [40, 50, 60, 70]) {
   dragQueue.queue({ duty });
-  await dragEvent();
+  await dragEvent(dragClock);
 }
-await settle();
+await settle(dragClock);
 check(
   "⚠️  five moves are TWO POSTs, not five — the superseded ones never reach the network at all",
   dragLog.sent.length === 2
@@ -292,20 +320,24 @@ check(
   "⚠️  and the second is the LAST value, so the fan ends where the thumb left it",
   "duty" in dragLog.sent[1] && dragLog.sent[1].duty === 70
 );
-check("the two are at least one interval apart", dragLog.at[1] - dragLog.at[0] >= QUEUE_INTERVAL_MS - 1);
+check(
+  "the two are EXACTLY one interval apart — measured on the queue's own clock, so no machine can move it",
+  dragLog.at[1] - dragLog.at[0] === QUEUE_INTERVAL_MS
+);
 check("never more than one in flight", dragLog.maxConcurrent === 1);
 check("settling is lowered again once nothing is queued or in flight", dragSettling.at(-1) === false);
 check("…and the queue agrees it has gone quiet", !dragQueue.isSettling());
 
 // A slow Pi: the send outlasts the interval, so a timer must NOT fire underneath it.
+const slowClock = createVirtualClock(CLOCK_START_MS);
 const slowLog = emptyLog();
-const slowQueue = recordingQueue(slowLog, QUEUE_INTERVAL_MS * 2, []);
+const slowQueue = recordingQueue(slowClock, slowLog, QUEUE_INTERVAL_MS * 2, []);
 slowQueue.queue({ duty: 35 });
-await new Promise(resolve => setTimeout(resolve, QUEUE_INTERVAL_MS / 2));
+await slowClock.advance(QUEUE_INTERVAL_MS / 2);
 slowQueue.queue({ duty: 45 });
 slowQueue.queue({ mode: "automatic" });
-await settle();
-await settle();
+await settle(slowClock);
+await settle(slowClock);
 check("⚠️  a send slower than the interval still never overlaps the next one", slowLog.maxConcurrent === 1);
 check(
   "⚠️  a mode tap inside a drag REPLACES the queued duty rather than merging with it — the queue holds one command of either kind",
@@ -317,17 +349,111 @@ check(
 );
 
 // The failure the `finally` exists for: one POST that throws must not wedge the slider.
+const brokenClock = createVirtualClock(CLOCK_START_MS);
 const brokenLog = emptyLog();
 const brokenSettling: boolean[] = [];
-const brokenQueue = recordingQueue(brokenLog, 5, brokenSettling, true);
+const brokenQueue = recordingQueue(brokenClock, brokenLog, 5, brokenSettling, true);
 brokenQueue.queue({ duty: 50 });
-await settle();
+await settle(brokenClock);
 brokenQueue.queue({ duty: 55 });
-await settle();
+await settle(brokenClock);
 check("⚠️  a send that THROWS does not wedge the queue — the next command still goes", brokenLog.sent.length === 2);
 check(
   "…and settling is lowered rather than left raised for ever",
   brokenSettling.at(-1) === false && !brokenQueue.isSettling()
+);
+
+// A clock whose origin is 0, which is the most natural clock anyone injecting one writes.
+// `lastSentAt` seeds to NEGATIVE_INFINITY rather than 0 so that the assertion above about
+// the FIRST move holds from any origin; with 0 there this is the drag that goes red.
+const zeroOriginClock = createVirtualClock(0);
+const zeroOriginLog = emptyLog();
+const zeroOriginQueue = recordingQueue(zeroOriginClock, zeroOriginLog, 5, []);
+zeroOriginQueue.queue({ duty: 30 });
+await zeroOriginClock.advance(0);
+check(
+  "⚠️  the first move goes at once from a clock that starts at ZERO too — the queue holds no hidden requirement on its clock's origin",
+  zeroOriginLog.sent.length === 1 && zeroOriginLog.at[0] === 0
+);
+zeroOriginQueue.queue({ duty: 70 });
+await settle(zeroOriginClock);
+check("…and the interval is the same one from there", zeroOriginLog.at[1] - zeroOriginLog.at[0] === QUEUE_INTERVAL_MS);
+
+// --- 4. the same queue with PRODUCTION's clock and timer ---------------------
+//
+// ⚠️ Everything above injects both, which leaves the two `??` defaults in
+// public/lib/fan-command-queue.js as the only lines in the file nothing runs — and they are
+// the lines that ship. Both of the mutations this section exists for were caught before the
+// seam existed and went green after it: swapping the default clock for Date.now(), and a
+// default timer that calls straight through so there is no pacing at all.
+//
+// Nothing here waits out a margin. The pacing assertions are COUNTS taken after a single
+// macrotask hop, which a 30 ms interval cannot lose; the one real-clock reading has half an
+// interval of slack and can only be pushed the safe way by load.
+
+console.log("\n4. the defaults nothing else exercises: the real performance.now() and the real setTimeout");
+
+const DEFAULT_INTERVAL_MS = 30;
+
+/** One turn of the event loop. Armed after the queue's own flush timer, so it lands after it. */
+function macrotaskHop(): Promise<void> {
+  return new Promise(resolve => void setTimeout(resolve, 0));
+}
+
+const defaultSent: FanCommand[] = [];
+const defaultSentAt: number[] = [];
+const defaultQueue = createFanCommandQueue({
+  intervalMs: DEFAULT_INTERVAL_MS,
+  send: async command => {
+    defaultSent.push(command);
+    defaultSentAt.push(performance.now());
+  },
+});
+
+defaultQueue.queue({ duty: 30 });
+await macrotaskHop();
+check(
+  "⚠️  with no clock and no timer injected, the first move still goes on the very next turn of the loop",
+  defaultSent.length === 1 && "duty" in defaultSent[0] && defaultSent[0].duty === 30
+);
+
+for (const duty of [40, 50, 60, 70]) {
+  defaultQueue.queue({ duty });
+}
+await macrotaskHop();
+check(
+  "⚠️  and the four behind it are HELD — one macrotask later nothing more has gone, which is the pacing itself",
+  defaultSent.length === 1
+);
+
+await new Promise(resolve => setTimeout(resolve, DEFAULT_INTERVAL_MS * 5));
+check(
+  "…then exactly one more goes, carrying the last value",
+  defaultSent.length === 2 && "duty" in defaultSent[1] && defaultSent[1].duty === 70
+);
+check(
+  "…at least half an interval after the first, on the machine's own clock — a wide bound on purpose, and load can only widen it",
+  defaultSentAt[1] - defaultSentAt[0] >= DEFAULT_INTERVAL_MS / 2
+);
+
+// The clock's OTHER requirement cannot be asserted by running it: Date.now() and
+// performance.now() behave identically until something steps the wall clock, and no check
+// can step the machine's. So it is read off the source, the way check-irreversible-actions.ts
+// reads the `switch` in src/http/vcu-write.ts rather than trusting a sentence about it.
+const QUEUE_SOURCE = await readFile(new URL("../public/lib/fan-command-queue.js", import.meta.url), "utf8");
+const clockDefault = defaultExpression(QUEUE_SOURCE, "now");
+const timerDefault = defaultExpression(QUEUE_SOURCE, "setTimer");
+check(
+  "both default expressions were found at all — a pattern that matched nothing would pass the two below in silence",
+  clockDefault !== null && timerDefault !== null
+);
+check(
+  "⚠️  the default clock is performance.now() and NOT Date.now() — this dashboard has a button on it that STEPS THE CLOCK",
+  clockDefault !== null && clockDefault.includes("performance.now()") && !clockDefault.includes("Date.now")
+);
+check(
+  "⚠️  the default timer really is setTimeout, so a drag on a phone is paced rather than called straight through",
+  timerDefault !== null && timerDefault.includes("setTimeout(")
 );
 
 console.log("");
@@ -335,8 +461,19 @@ if (failures > 0) {
   console.error(`FAILED — ${failures} assertion${failures === 1 ? "s" : ""}`);
   process.exitCode = 1;
 } else {
-  console.log("✓ the header stands in front of every POST, the query string is parsed the way the docs say, and a");
-  console.log("  twenty-event drag reaches the Pi as two commands with the last value intact");
+  console.log("✓ the header stands in front of every POST, the query string is parsed the way the docs say, a");
+  console.log("  twenty-event drag reaches the Pi as two commands with the last value intact from any clock origin,");
+  console.log("  and the defaults the phone actually runs on are paced by a real setTimeout off a monotonic clock");
+}
+
+/**
+ * The right-hand side of one `??` default in the queue's state initialiser, as source text.
+ * Scoped to that one line so a match cannot wander into the typedef above it, and null
+ * rather than "" when nothing matched, so the caller has to say which it got.
+ */
+function defaultExpression(source: string, property: string): string | null {
+  const match = source.match(new RegExp(`^\\s*${property}: options\\.${property} \\?\\? (.*)$`, "m"));
+  return match === null ? null : match[1];
 }
 
 /**
