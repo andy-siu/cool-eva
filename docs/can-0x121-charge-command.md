@@ -38,7 +38,22 @@ The set-current control originally refused an AC command until `ac_charge_ceilin
 
 ## Injection is honoured — with the right b4
 
-A Pi-injected `0x121` **is** obeyed by the VCU (the dash's charge-current SET display changes on transmit — proven 2026-08-24 on an AC session). The earlier mystery, where injecting `--amps 1` and `--amps 3` both drove the dash to a fixed **10 A**, is explained by the wrong ceiling: those frames carried `b4 = 32`, which the VCU rejected, falling back to a ~10 A default. With the correct `b4 = 15`, `b2` should be read as sent. (Pending confirmation: an injected AC command with a non-full battery to watch the delivered current follow, not just the dash SET display.)
+A Pi-injected `0x121` **is** obeyed by the VCU (the dash's charge-current SET display changes on transmit — proven 2026-08-24 on an AC session). The earlier mystery, where injecting `--amps 1` and `--amps 3` both drove the dash to a fixed **10 A**, is explained by the wrong ceiling: those frames carried `b4 = 32`, which the VCU rejected, falling back to a ~10 A default. With the correct `b4 = 15`, `b2` should be read as sent.
+
+> ⚠️ **Superseded — the `0x121` alone changes only the DISPLAY, not the committed setpoint.** See the next section: it moves the dash's pending SET display but `charge_limit_a` (0x10A `CHG.PWR.REF`, the committed value) never follows. Reading the display change as "obeyed" was the mistake; the commit needs the `0x120` twin.
+
+### CRACKED — set-current also needs the `0x120` commit twin — 2026-09-03
+
+The shipped set-current control sends only the `0x121` half. On an on-bike AC session (SoC 71–74 %, ceiling live at **15** = the fallback, so b4 was never the issue) an injected `0x121: 1a ff 05 01 0f …` moved the dash's **displayed** SET value to 5 A but `charge_limit_a` (0x10A b7 ÷ 7, the VCU's committed setpoint) stayed put — 14.3 A, then 7 A after a physical nudge. The value only committed when the rider turned the dial with the key present, which was mistaken for a key/menu authorisation gate.
+
+A passive sniff of `0x120`/`0x121` (`scripts/sniff-charge-commit.ts`, a second read-only `RawChannel` that does not touch the interface) during the rider's own dial change caught the dash emitting a **pair**, `0x120` first, ~5 ms before the `0x121`:
+
+```
+0x120  9a ff 05 00 00 00 00 00   ← request-twin (0x1A | 0x80 = 0x9A), b3=0 b4=0 — the COMMIT
+0x121  1a ff 05 01 0f 00 00 00   ← the command we were already sending (b3=1, b4=ceiling)
+```
+
+Replaying that pair (`scripts/inject-charge-pair.ts 5 15`) with **no key touched and no dial moved** committed `charge_limit_a` to **5 A**. So set-current is the exact mirror of the stop command: the commit rides on the `0x120` request-twin, and the `0x121` alone only sets the dash's pending display. The `0x9A` twin's tail differs from the `0x121` (b3=0, b4=0 vs b3=1, b4=ceiling); replicate the bytes as captured. Whether `0x120` alone commits (as it does for stop) was not isolated — the faithful pair is proven, so `buildChargeCurrentCommand` should emit both, `0x120` first. The key was never the gate; the feature was sending half the sequence.
 
 ## Not a current-limit frame
 
