@@ -25,7 +25,7 @@ import { parameterAtIndex } from "./param-table.ts";
 import {
   buildChargeCurrentCommand,
   buildChargeStopCommand,
-  CHARGE_COMMAND_CAN_ID,
+  type ChargeFrame,
   type ChargeMode,
 } from "../can/charge-command.ts";
 import {
@@ -152,6 +152,12 @@ const PACE_MS = 10;
 
 /** Gap between charge-stop frames if more than one is ever sent; today the stop is a single frame. */
 const STOP_FRAME_GAP_MS = 20;
+
+/**
+ * Gap between the two charge-current frames (0x120 commit twin, then 0x121 command). The dash spaces
+ * its own pair ~5 ms apart; matched here, since that spacing is what was proven to commit on-bike.
+ */
+const CURRENT_FRAME_GAP_MS = 5;
 
 // ── ECUReset (resetVcu) ─────────────────────────────────────────────────────
 const SERVICE_ECU_RESET = 0x11;
@@ -950,30 +956,38 @@ export function syncBikeClock(
  * NOT a guess: a wrong b4 makes the VCU reject the value and fall back to a ~10 A default.
  * The caller validates amps against it; the pure builder re-checks 1 ≤ amps ≤ ceiling.
  */
-export function sendChargeCommand(
+export async function sendChargeCommand(
   channel: RawChannel,
   mode: ChargeMode,
   selectedAmps: number,
   ceilingAmps: number
-): { status: "sent"; hex: string } | { status: "failed"; reason: string } {
-  let frame: Uint8Array;
+): Promise<{ status: "sent"; hex: string } | { status: "failed"; reason: string }> {
+  let frames: ChargeFrame[];
   try {
-    frame = buildChargeCurrentCommand(mode, selectedAmps, ceilingAmps);
+    frames = buildChargeCurrentCommand(mode, selectedAmps, ceilingAmps);
   } catch (err) {
     // The builder refused a request that should have been range-checked upstream — surfaced,
     // not swallowed, because a silently-dropped command looks identical to one the bike ignored.
     return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
   }
-  try {
-    channel.send({ id: CHARGE_COMMAND_CAN_ID, ext: false, rtr: false, data: Buffer.from(frame) });
-  } catch (err) {
-    console.error("vcu-write: could not transmit the charge-current command", err);
-    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  // The pair the dash sends: the 0x120 commit twin first, then the 0x121 command, spaced as the
+  // dash spaces them. The 0x121 alone only moves the pending display — the 0x120 is the commit
+  // (charge-command.ts). Same fire-and-forget multi-frame shape as sendChargeStopCommand.
+  const sentHex: string[] = [];
+  for (const frame of frames) {
+    try {
+      channel.send({ id: frame.id, ext: false, rtr: false, data: Buffer.from(frame.data) });
+    } catch (err) {
+      console.error(`vcu-write: could not transmit the charge-current frame on 0x${frame.id.toString(16)}`, err);
+      return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+    }
+    sentHex.push(`0x${frame.id.toString(16)} ${toHex(frame.data)}`);
+    await delay(CURRENT_FRAME_GAP_MS);
   }
   console.warn(
-    `vcu-write: sent ${mode.toUpperCase()} charge current ${selectedAmps} A (ceiling ${ceilingAmps} A) on 0x121 — ${toHex(frame)}`
+    `vcu-write: sent ${mode.toUpperCase()} charge current ${selectedAmps} A (ceiling ${ceilingAmps} A) — ${sentHex.join(" / ")}`
   );
-  return { status: "sent", hex: toHex(frame) };
+  return { status: "sent", hex: sentHex.join(" / ") };
 }
 
 /**

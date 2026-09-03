@@ -1065,7 +1065,7 @@ async function performChargeCurrent(
   console.warn(
     `vcu-write: about to command ${mode.toUpperCase()} charge current ${request.amps} A (ceiling ${ceiling} A) on 0x121`
   );
-  const outcome = sendChargeCommand(channel, mode, request.amps, ceiling);
+  const outcome = await sendChargeCommand(channel, mode, request.amps, ceiling);
   await appendAuditRecord(context.directory, {
     at: Date.now(),
     clockTrustworthy: readPiClock().trustworthy,
@@ -1090,7 +1090,7 @@ async function performChargeCurrent(
       action: "charge-current",
       status: "sent",
       message:
-        `Commanded ${mode.toUpperCase()} charge current ${request.amps} A on 0x121 (${outcome.hex}). ` +
+        `Commanded ${mode.toUpperCase()} charge current ${request.amps} A (${outcome.hex}). ` +
         "⚠️ This is an event frame with no reply — watch the dash's set value and charge_limit_a to see it take. " +
         "A full battery caps the current that actually flows regardless. The setting is transient (unplugging resets it) " +
         "and you can override it on the bike's own screen.",
