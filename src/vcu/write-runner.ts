@@ -307,6 +307,16 @@ const CHARGE_SESSION_MAX_AGE_MS = 5000;
 const CHARGE_MANAGER_STATE_AC = 0x02;
 const CHARGE_MANAGER_STATE_DC = 0x23;
 
+/**
+ * The AC ceiling (0x121 b4) to use when the dash has NOT broadcast ac_charge_ceiling_a this
+ * session — the remote case, where nobody is at the bike to nudge the charge-current dial.
+ * 15 (0x0f) is the only AC ceiling ever captured on this bike (docs/can-0x121-charge-command.md),
+ * and it is likely charger-specific: if the real pilot/cable rating is not 15, the VCU rejects the
+ * frame's b4 and settles on a ~10 A default — benign (nothing damaged, overridable on the bike),
+ * just ineffective. The live signal is still preferred whenever present; this is only the fallback.
+ */
+const AC_CEILING_FALLBACK_A = 15;
+
 interface WriteContext extends VcuWriteRunnerOptions {
   running: RunningWriteSession | null;
 }
@@ -1028,14 +1038,21 @@ async function performChargeCurrent(
     };
   }
 
-  const ceiling = latestValue(ceilingKey);
+  // AC falls back to a known ceiling when the dash has not broadcast one this session, so a remote
+  // command works without someone at the bike to nudge the dial. DC still refuses: its ceiling is a
+  // continuous broadcast, so an absent one means CAN is not being received — not a case to guess.
+  let ceiling = latestValue(ceilingKey);
+  if (ceiling === null && mode === "ac") {
+    console.warn(
+      `vcu-write: AC charge ceiling (${ceilingKey}) not seen this session — defaulting b4 to ${AC_CEILING_FALLBACK_A} A. If this charger's rating differs, the VCU will settle on ~10 A.`
+    );
+    ceiling = AC_CEILING_FALLBACK_A;
+  }
   if (ceiling === null) {
     return {
       ok: false,
       reason:
-        mode === "ac"
-          ? "the AC charge ceiling has not been seen this session — nudge the charge-current dial once on the bike's own screen so the dash broadcasts it, then retry. Sending an AC command with the wrong ceiling byte makes the VCU ignore it and default to ~10 A."
-          : "the DC charge ceiling (fast_dc_limit_max_a) has not arrived — it broadcasts whenever the bike is awake, so this means CAN is not being received. Not commanding blind.",
+        "the DC charge ceiling (fast_dc_limit_max_a) has not arrived — it broadcasts whenever the bike is awake, so this means CAN is not being received. Not commanding blind.",
     };
   }
   if (!Number.isInteger(request.amps) || request.amps < 1 || request.amps > ceiling) {
