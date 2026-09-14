@@ -69,12 +69,15 @@ van.derive(() => {
 // The cable coming out, alongside the two sibling controls — charge-current.js clears its form here
 // and charge-stop.js its outcome.
 //
-// ⚠️ `loaded` is the whole of it, and it is load-bearing. forgetSession() in src/charge/auto.ts
-// nulls the controller's commanded amps on the `charge_manager_state` edge and RECORDS NOTHING, so
-// until the next 60 s tick /charge-auto answers "commanding nothing" while both signals still hold
-// the last session's values — and clearing this is what stops the tile flashing the last session's
-// "Commanding 35 A" at the next one. The pair above needs nothing here: a session that ended shut
-// the gate, and the derive forgot it on its way out.
+// ⚠️ `loaded` is the whole of it, and it is STILL load-bearing after #204 gave the Pi a true
+// sentence at the edge: that made the ENDPOINT's answer true, this makes the TILE stop claiming to
+// know while it re-reads. The four steps by which the previous session's sentence would otherwise
+// paint for one round trip are in docs/charge-auto.md; deleting this line has been proposed twice
+// and scripts/check-charge-auto-live.ts §7 is what goes red for the third.
+//
+// ⚠️ It does NOT belong in forgetTheAnswerOnScreen(). That also runs on a failed read, where
+// clearing `loaded` would make the tile's own `!loaded` render re-fetch immediately, unpaced,
+// against a Pi that is already not answering.
 onChargeSessionEnd(() => {
   loaded.val = false;
 });
@@ -168,7 +171,8 @@ export function toggleAction(currentMode, reason, floor_a) {
 }
 
 /**
- * What the controller is doing, in words — the text the tile renders, and nothing else.
+ * What the controller is doing, in words — the text the tile renders, and nothing else, which is
+ * why it is `""` while the tile has no answer yet and shows only its label.
  *
  * ⚠️ No special case for the rider override: the controller already reports it as its REASON, and a
  * branch here beat that — with the toggle off and an override latched the tile said "you set the
@@ -176,12 +180,21 @@ export function toggleAction(currentMode, reason, floor_a) {
  *
  * ⚠️ The amps come from the ENDPOINT, never from `charge_auto_target_a` — that signal is only a
  * wake-up. It outlives the session that produced it (forgetSession() nulls the controller's own
- * copy and records nothing), so reading it here would print a current this charge never commanded.
+ * copy and records no new target), so reading it here would print a current this charge never commanded.
  *
  * Exported so scripts/check-charge-auto-live.ts can read the tile's own words without a browser,
  * on the same footing as toggleAction() above.
  */
 export function controllerSentence() {
+  // ⚠️ Empty while the tile has nothing to show. The render above returns its label and nothing
+  // else until `loaded`, so a sentence here would be text that is not on screen — and this
+  // function's contract, which scripts/charge-auto-live-harness.ts leans its whole no-DOM
+  // argument on, is "the text the binding puts on screen". It is also what lets that harness see
+  // the window `onChargeSessionEnd` exists for: between a plug-in and the answer for the new
+  // session, the primitives below still hold the PREVIOUS session's reason and amps.
+  if (!loaded.val) {
+    return "";
+  }
   const suffix = commandedAmps.val === null ? "" : ` Commanding ${commandedAmps.val} A.`;
   return `${reasonSentence.val}${suffix}`;
 }
