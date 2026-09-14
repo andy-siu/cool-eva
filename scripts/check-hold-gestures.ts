@@ -25,9 +25,11 @@ import {
 } from "../src/gestures/long-press.ts";
 import {
   MAX_PLAUSIBLE_KMH,
+  MAX_STEP_METRES,
   MIN_FIX_INTERVAL_MS,
   distanceKm,
   implausibleJumpKmh,
+  implausibleStepMetres,
   isPositionOnEarth,
   type Fix,
 } from "../src/gps/fix-plausibility.ts";
@@ -671,6 +673,14 @@ check(
   "…and the counter is what moves, so two identical refusals are two banners",
   latestValue("waypoint_refused_seq") === 2
 );
+// ⚠️ THE SENTENCE, PINNED ACROSS THE TWO FILES THAT MUST AGREE ON IT. Both plausibility
+// rules answer this one code, so the Pi has one literal for it and public/lib/announce.js
+// has another — the phone cannot import a .ts module. Nothing asserted they matched until
+// #241 made two gates share them, and a mutation of either stayed green.
+check(
+  "the sentence the Pi returns is the one public/lib/announce.js shows for that code",
+  jumped.message === WAYPOINT_REFUSAL_TEXT[WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE]
+);
 
 // ⚠️ THROUGH THE RUNNER, not by calling saveWaypointNow() again: everything above proves
 // the gates, and nothing yet proves the hold reaches them. This is the second gesture on
@@ -679,9 +689,29 @@ const waypointBus = setInterval(() => {
   record("btn_indicator_cancel", bus.cancel);
 }, TICK_MS);
 const waypointGestures = startHoldGestures([waypointHoldGesture()]);
+// ⚠️ ONE SPIKE COSTS TWO REFUSALS, and since #241 it costs them below the floor as well:
+// the corrected fix is measured against the spike, so the step back from 130.3° is itself
+// an impossible step. src/gps/fix-plausibility.ts calls that the right side to fail on —
+// asserted here rather than stepped around, because the fixture only goes green again
+// after a THIRD fix gives the gate a good pair, which is the recovery the rider sees.
 record("gps_lat", 57.7, Date.now());
 record("gps_lon", 11.97, Date.now());
 await settle(TICK_MS * 4);
+const afterTheSpike = saveWaypointNow();
+check(
+  `⚠️  the good fix right after the spike is refused too, measured against it (${afterTheSpike.message})`,
+  !afterTheSpike.saved && afterTheSpike.refusal === WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE
+);
+check(
+  "…and the STEP rule's refusal says the same sentence as the speed rule's, being the same code",
+  afterTheSpike.message === WAYPOINT_REFUSAL_TEXT[WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE]
+);
+// ~6 m east, which clears the 3 m deadband and so logs a row: now both tracked fixes are
+// good ones and the pair is an ordinary step again.
+record("gps_lon", 11.9701, Date.now());
+await settle(TICK_MS * 4);
+const recovered = saveWaypointNow();
+check(`…and the fix after THAT saves again (${recovered.message})`, recovered.saved);
 // ⚠️ A PRIMING TAP FIRST, for the reason §3a gives: a runner started mid-stream has not
 // seen the 0 that a watched 0→1 needs, so without this the negative below would pass
 // because HoldState.previous is still null rather than because 200 ms is under the
@@ -701,6 +731,11 @@ waypointGestures.stop();
 // The gate itself, as a table. It is pure (src/gps/fix-plausibility.ts), so both branches
 // are reachable without driving the signal store or waiting out an interval.
 const here: Fix = { latitudeDeg: 57.7, longitudeDeg: 11.97, at: 0 };
+// ⚠️ ONE OBJECT, USED BY BOTH RULES BELOW. The seam assertion claims this is "the exact
+// fixture" the speed test declines and the step test refuses; a second identical literal
+// would make that a promise instead of a fact, and an edit to one of them would break the
+// pairing silently.
+const insideTheFloor: Fix = { latitudeDeg: 57.7, longitudeDeg: 130.3, at: MIN_FIX_INTERVAL_MS - 1 };
 check(
   "one fix on its own is never implausible — there is nothing to compare it against",
   implausibleJumpKmh(null, here) === null
@@ -712,7 +747,7 @@ check(
 check(
   "⚠️  …but not when the two fixes are closer together than the GPS cadence, where a short " +
     "denominator turns metres into thousands of km/h",
-  implausibleJumpKmh(here, { latitudeDeg: 57.7, longitudeDeg: 130.3, at: MIN_FIX_INTERVAL_MS - 1 }) === null
+  implausibleJumpKmh(here, insideTheFloor) === null
 );
 check(
   "a lap of a town at a plausible speed is not refused",
@@ -721,6 +756,59 @@ check(
 check(
   `the great-circle distance is right to a metre (${distanceKm(here, { latitudeDeg: 57.71, longitudeDeg: 11.97, at: 0 }).toFixed(3)} km for 0.01°)`,
   Math.abs(distanceKm(here, { latitudeDeg: 57.71, longitudeDeg: 11.97, at: 0 }) - 1.112) < 0.001
+);
+
+// The STEP gate, which is the same gate one floor down (#241). Every fixture below is an
+// offset NORTH of the fix above — no new coordinate, and northOf() asserts its own size
+// against distanceKm() so each row rests on a measured distance rather than on arithmetic
+// done in this file. The metres are the archive's: docs/waypoints.md has where each came
+// from and what it costs.
+const ceilingMetresInsideFloor = (MAX_PLAUSIBLE_KMH * MIN_FIX_INTERVAL_MS) / 3_600;
+check(
+  `⚠️  MAX_STEP_METRES (${MAX_STEP_METRES} m) is at or above the ${Math.round(
+    ceilingMetresInsideFloor
+  )} m a bike at the shipped ceiling covers inside the floor, so it cannot refuse real motion`,
+  MAX_STEP_METRES >= ceilingMetresInsideFloor
+);
+check("one fix on its own is never an implausible step either", implausibleStepMetres(null, here) === null);
+check(
+  "⚠️  the smallest lone excursion in the archive (227 m) at its median cadence (551 ms) is refused",
+  implausibleStepMetres(here, northOf(here, 227, 551)) !== null
+);
+check(
+  "⚠️  …and the largest step under any of the 97 waypoints ever saved (19.6 m) is not",
+  implausibleStepMetres(here, northOf(here, 19.6, 551)) === null
+);
+check(
+  "⚠️  the largest good step in the archive (454 m, a real move split across the lat/lon " +
+    "staircase) IS refused — the cost this threshold buys, measured at 6 pairs in 59.8 h",
+  implausibleStepMetres(here, northOf(here, 454, 72)) !== null
+);
+// ⚠️ 221 AND 219 AS LITERALS, never MAX_STEP_METRES ± 1: a budget derived from the constant
+// under test moves with it and asserts nothing. The pair pins the threshold to within a
+// metre either side, which is as close as this can get — the mutation turning `>` into `>=`
+// SURVIVES, and is stated rather than papered over. It differs only for a step of exactly
+// 220 m, and no fixture can produce one: the great-circle distance between two doubles a
+// latitude apart steps from 219.999999999604 straight to 220.000000000394, so the exact
+// value is not representable along this path.
+check(
+  "221 m inside the floor is refused",
+  implausibleStepMetres(here, northOf(here, 221, MIN_FIX_INTERVAL_MS - 1)) !== null
+);
+check(
+  "…and 219 m is not, so the threshold is the threshold",
+  implausibleStepMetres(here, northOf(here, 219, MIN_FIX_INTERVAL_MS - 1)) === null
+);
+check(
+  "⚠️  AT the floor the step rule declines however far the fix moved — 10 km — because " +
+    "that pair is the speed test's, and two rules judging one pair is two chances to refuse it",
+  implausibleStepMetres(here, northOf(here, 10_000, MIN_FIX_INTERVAL_MS)) === null
+);
+// ⚠️ THE SEAM #241 EXISTS FOR, asserted as a pair so neither half can drift alone — and
+// against the same object, so "the same fixture" is structural rather than claimed.
+check(
+  "⚠️  the 2026-08-09 jump arriving inside the floor — declined by the speed test, refused by the step test",
+  implausibleJumpKmh(here, insideTheFloor) === null && implausibleStepMetres(here, insideTheFloor) !== null
 );
 
 // ⚠️ THE SEAM WITH #167, which landed the range gate while this branch was open. Both
@@ -912,4 +1000,26 @@ if (failures > 0) {
   );
   console.log("  moves but never the slider's, and leaves the fan off when the bus goes quiet; and a waypoint");
   console.log("  8 000 km from the fix before it is refused with a code the phone can read");
+}
+
+/**
+ * A fix `metres` north of another, at `atMs` on the monotonic clock.
+ *
+ * ⚠️ North, so the offset is a meridian arc and one degree is the same length everywhere —
+ * a longitude offset shortens with the cosine and would make every fixture below latitude-
+ * dependent. The size is asserted against distanceKm() rather than trusted, because the
+ * conversion here and the great-circle formula there are two different pieces of arithmetic.
+ */
+function northOf(from: Fix, metres: number, atMs: number): Fix {
+  const moved: Fix = {
+    latitudeDeg: from.latitudeDeg + metres / ((6371 * 1000 * Math.PI) / 180),
+    longitudeDeg: from.longitudeDeg,
+    at: from.at + atMs,
+  };
+  const actual = distanceKm(from, moved) * 1000;
+  if (Math.abs(actual - metres) > 0.5) {
+    console.error(`  ✗ northOf(${metres} m) actually moved ${actual.toFixed(1)} m`);
+    failures += 1;
+  }
+  return moved;
 }

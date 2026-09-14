@@ -1,7 +1,13 @@
 import { ageMs, latestValue, onChange, record, type LiveValue } from "../can/signals.ts";
 import type { HoldGesture } from "../gestures/runner.ts";
 import { monotonicNow, since } from "../monotonic.ts";
-import { implausibleJumpKmh, isPositionOnEarth, type Fix } from "./fix-plausibility.ts";
+import {
+  MIN_FIX_INTERVAL_MS,
+  implausibleJumpKmh,
+  implausibleStepMetres,
+  isPositionOnEarth,
+  type Fix,
+} from "./fix-plausibility.ts";
 import { systemClockTrust } from "./clock.ts";
 
 // Stamping "I am here, now" into the ride log, for both things that ask: GET /waypoint
@@ -20,6 +26,16 @@ import { systemClockTrust } from "./clock.ts";
 
 /** A fix older than this is not where you are any more. */
 export const FIX_MAX_AGE_MS = 30_000;
+
+/**
+ * What a rider is told when either plausibility rule refuses.
+ *
+ * ⚠️ ONE SENTENCE FOR BOTH, because both answer WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE and
+ * public/lib/announce.js maps that one code to one sentence — two literals here could drift
+ * apart and one of them would then disagree with the phone. What separates the two rules
+ * for a human is the journal reason, not this. docs/waypoints.md §"One code, two rules".
+ */
+const FIX_IMPLAUSIBLE_MESSAGE = "GPS fix jumped somewhere the bike cannot have ridden — waypoint not saved.";
 
 /** Held to save a waypoint: the turn-signal cancel switch, pushed in (0x102 b0 bit 5). */
 export const WAYPOINT_GESTURE_BUTTON = "btn_indicator_cancel";
@@ -178,8 +194,25 @@ export function saveWaypointNow(): WaypointOutcome {
   if (jump !== null) {
     return refuse(
       WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE,
-      "GPS fix jumped somewhere the bike cannot have ridden — waypoint not saved.",
+      FIX_IMPLAUSIBLE_MESSAGE,
       `fix implies ${Math.round(jump)} km/h since the previous one`
+    );
+  }
+
+  // ⚠️ THE SAME GATE BELOW ITS OWN FLOOR, where an implied speed means nothing and a
+  // distance still does (#241). It is not a rare branch: 93 % of this hub's fix pairs are
+  // closer together than MIN_FIX_INTERVAL_MS, and so were 91 of the 97 waypoints ever
+  // saved — until now the test above declined on nearly every save.
+  const step = latestFix === null ? null : implausibleStepMetres(precedingFix, latestFix);
+  if (step !== null) {
+    // ⚠️ The same code and the same sentence as the gate above, deliberately. The two rules
+    // are exclusive by Δt and a ride log carries the fix timeline, so which one refused is
+    // recoverable without a code of its own; the journal reason below is what separates
+    // them for a human. docs/waypoints.md §"One code, two rules".
+    return refuse(
+      WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE,
+      FIX_IMPLAUSIBLE_MESSAGE,
+      `fix moved ${Math.round(step)} m since the previous one, inside the ${MIN_FIX_INTERVAL_MS} ms floor`
     );
   }
 
@@ -188,7 +221,7 @@ export function saveWaypointNow(): WaypointOutcome {
   // every decoded sample, deadbanded or not, so a mark newer than the fix means another
   // sample arrived and moved the position by less than the 3 m deadband. Measured max life of
   // a corrupt fix: 661 ms over 65 archive excursions. docs/waypoints.md §"The first fix".
-  // ⚠️ NOT covered here: a corrupt fix that is not the first of the run — #241.
+  // A corrupt fix that is NOT the first of the run is the step gate's, just above.
   if (!laterSampleAgreed()) {
     return refuse(
       WAYPOINT_REFUSAL.FIX_UNCORROBORATED,

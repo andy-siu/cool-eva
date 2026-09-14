@@ -3,6 +3,7 @@ import {
   MIN_FIX_INTERVAL_MS,
   distanceKm,
   implausibleJumpKmh,
+  implausibleStepMetres,
   isPositionOnEarth,
   type Fix,
 } from "./fix-plausibility.ts";
@@ -46,6 +47,22 @@ export const RECOVERY_OUTCOME = {
 
 export type RecoveryOutcome = (typeof RECOVERY_OUTCOME)[keyof typeof RECOVERY_OUTCOME];
 
+/**
+ * Which of the two plausibility rules judged a pair. They are mutually exclusive by Δt:
+ * at or above MIN_FIX_INTERVAL_MS an implied speed is meaningful, below it only a distance
+ * is. docs/waypoints.md §"The jump gate mostly declines to judge".
+ */
+export const JUMP_RULE = {
+  /** implausibleJumpKmh(), against MAX_PLAUSIBLE_KMH. */
+  SPEED: "speed",
+  /** implausibleStepMetres(), against MAX_STEP_METRES. */
+  STEP: "step",
+  /** Neither rule ran: nothing preceded this fix, or a gate above refused first. */
+  NONE: "none",
+} as const;
+
+export type JumpRule = (typeof JUMP_RULE)[keyof typeof JUMP_RULE];
+
 export interface RecoveryVerdict {
   press: RecoveredPress;
   /** pressStart + holdMs — where the recogniser's threshold falls. */
@@ -57,21 +74,26 @@ export interface RecoveryVerdict {
   /** How old the carried-back position row was. Reported, never gated on — see below. */
   positionAgeMs?: number;
   /**
-   * ⚠️ Whether implausibleJumpKmh() actually looked at this point, or fell through.
+   * ⚠️ WHICH of the two plausibility rules looked at this point.
    *
-   * MIN_FIX_INTERVAL_MS is 1 s and the hub delivers fixes at ~1.8 Hz, so 96.3 % of fix
-   * pairs on 2026-09-09 are closer together than the gate's own floor and it answers null
-   * without judging. The bike ran the same gate in the same regime, so this is faithful
-   * rather than broken — but a report that prints "jump gate: passed" is claiming a test
-   * that did not run.
+   * It was a boolean until #241, when the step rule closed the hole the boolean existed to
+   * confess: with both rules in force every pair that HAS a predecessor is judged by one of
+   * them, so "did the gate look" became vacuously true and stopped carrying information.
+   * Which rule looked still does — they are exclusive by Δt and they refuse for different
+   * reasons.
+   *
+   * ⚠️ `none` means NEITHER RULE RAN, which is three cases: nothing preceded this fix in its
+   * own boot, a gate above refused before judgeJump() was reached, or the hold was already
+   * live. Read it WITH `outcome` and the pair is unambiguous — REFUSED + `none` is a gate
+   * above, RECOVERED + `none` is a boot's first fix — but never read it on its own.
    */
-  jumpGateJudged: boolean;
+  jumpRule: JumpRule;
   /**
    * ⚠️ TRUE IS THE WEAK CASE: this hold's fix had nothing before it in its own boot, so the
    * bike judged it on a position sample and this could only judge it on a `gps_epoch_s` row.
    * Named for the witness rather than for "witnessed", because a field that reads as
    * reassurance when it means the opposite is worse than no field. sampleAgreedAfter() has
-   * the asymmetry; same reason `jumpGateJudged` exists.
+   * the asymmetry; same reason `jumpRule` exists.
    */
   epochWitnessedOnly?: boolean;
 }
@@ -88,10 +110,10 @@ export interface TimelineFix extends Fix {
   sessionId: number | null;
 }
 
-/** What judgeJump() found: the pair it judged, and the two fixes it judged them from. */
+/** What judgeJump() found: whether a rule refused, which one looked, and the pair it saw. */
 interface JumpVerdict {
-  jump: number | null;
-  judged: boolean;
+  implausible: boolean;
+  rule: JumpRule;
   current: TimelineFix | null;
   previous: TimelineFix | null;
 }
@@ -293,7 +315,7 @@ function judgeOneHold(
   boot: BootRows
 ): RecoveryVerdict {
   if (alreadyFired.has(press)) {
-    return { press, fireAt, outcome: RECOVERY_OUTCOME.ALREADY_LIVE, jumpGateJudged: false };
+    return { press, fireAt, outcome: RECOVERY_OUTCOME.ALREADY_LIVE, jumpRule: JUMP_RULE.NONE };
   }
   const latitude = carryBack(boot.latitudeRows, fireAt);
   const longitude = carryBack(boot.longitudeRows, fireAt);
@@ -316,9 +338,9 @@ function judgeOneHold(
   if (epoch === null || fireAt - epoch.ts > FIX_MAX_AGE_MS) {
     return refused(press, fireAt, WAYPOINT_REFUSAL.FIX_STALE);
   }
-  const { jump, judged, current, previous } = judgeJump(boot.fixes, fireAt);
-  if (jump !== null) {
-    return { ...refused(press, fireAt, WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE), jumpGateJudged: judged };
+  const { implausible, rule, current, previous } = judgeJump(boot.fixes, fireAt);
+  if (implausible) {
+    return { ...refused(press, fireAt, WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE), jumpRule: rule };
   }
   // ⚠️ The bike's #178 rule, mirrored: with nothing before it in this boot, the fix is
   // believable only once a later sample has agreed. docs/waypoints.md.
@@ -339,7 +361,7 @@ function judgeOneHold(
     latitudeDeg: latitude.value,
     longitudeDeg: longitude.value,
     positionAgeMs: fireAt - Math.max(latitude.ts, longitude.ts),
-    jumpGateJudged: judged,
+    jumpRule: rule,
     epochWitnessedOnly: previous === null,
   };
 }
@@ -380,13 +402,17 @@ export function buildFixTimeline(latitudeRows: LogRow[], longitudeRows: LogRow[]
 }
 
 /**
- * The jump gate, and whether it actually judged.
+ * The jump gate, and which of its two rules judged.
  *
- * ⚠️ It fails OPEN far more often than it looks. MIN_FIX_INTERVAL_MS is 1 s and this hub
- * delivers fixes at ~1.8 Hz, so most consecutive pairs are under the gate's own floor and
- * implausibleJumpKmh() answers null without comparing anything. The bike ran the same gate
- * against the same cadence, so reproducing that is correct — but a report must not print
- * "cleared the jump gate" when the gate declined to look. docs/waypoints.md has the rate.
+ * ⚠️ It used to fail OPEN on most pairs: MIN_FIX_INTERVAL_MS is 1 s, this hub delivers
+ * fixes at ~1.8 Hz, and 93 % of the archive's pairs are closer together than that, so
+ * implausibleJumpKmh() answered null without comparing anything. Since #241 the step rule
+ * judges exactly that population, so a pair with a predecessor is always judged by one rule
+ * or the other — and the verdict names which, because the two refuse for different reasons.
+ *
+ * ⚠️ It branches on WALL-CLOCK Δt, which the Pi steps; pairPresses() orders on `seq` for
+ * exactly that reason. Harmless until #241 made the branch pick a rule rather than nothing.
+ * docs/waypoints.md §"A candidate follow-up, measured but not taken".
  */
 function judgeJump(fixes: TimelineFix[], fireAt: number): JumpVerdict {
   let currentIndex = -1;
@@ -397,7 +423,7 @@ function judgeJump(fixes: TimelineFix[], fireAt: number): JumpVerdict {
     currentIndex = index;
   }
   if (currentIndex < 0) {
-    return { jump: null, judged: false, current: null, previous: null };
+    return { implausible: false, rule: JUMP_RULE.NONE, current: null, previous: null };
   }
   const current = fixes[currentIndex];
   // Backwards to the nearest fix of the same boot. ⚠️ Belt and braces since judgeHolds()
@@ -412,10 +438,12 @@ function judgeJump(fixes: TimelineFix[], fireAt: number): JumpVerdict {
     }
   }
   if (previous === null) {
-    return { jump: null, judged: false, current, previous: null };
+    return { implausible: false, rule: JUMP_RULE.NONE, current, previous: null };
   }
-  const judged = current.at - previous.at >= MIN_FIX_INTERVAL_MS;
-  return { jump: implausibleJumpKmh(previous, current), judged, current, previous };
+  if (current.at - previous.at >= MIN_FIX_INTERVAL_MS) {
+    return { implausible: implausibleJumpKmh(previous, current) !== null, rule: JUMP_RULE.SPEED, current, previous };
+  }
+  return { implausible: implausibleStepMetres(previous, current) !== null, rule: JUMP_RULE.STEP, current, previous };
 }
 
 /**
@@ -446,8 +474,16 @@ function sampleAgreedAfter(epochRows: LogRow[], fix: TimelineFix, fireAt: number
 }
 
 function refused(press: RecoveredPress, fireAt: number, refusal: WaypointRefusal): RecoveryVerdict {
-  return { press, fireAt, outcome: RECOVERY_OUTCOME.REFUSED, refusal, jumpGateJudged: false };
+  return { press, fireAt, outcome: RECOVERY_OUTCOME.REFUSED, refusal, jumpRule: JUMP_RULE.NONE };
 }
 
-export { FIX_MAX_AGE_MS, MIN_FIX_INTERVAL_MS, WAYPOINT_REFUSAL, distanceKm, implausibleJumpKmh, isPositionOnEarth };
+export {
+  FIX_MAX_AGE_MS,
+  MIN_FIX_INTERVAL_MS,
+  WAYPOINT_REFUSAL,
+  distanceKm,
+  implausibleJumpKmh,
+  implausibleStepMetres,
+  isPositionOnEarth,
+};
 export type { Fix, WaypointRefusal };

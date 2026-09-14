@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { commitRecovered } from "./recover-waypoints-commit.ts";
 import {
+  JUMP_RULE,
   RECOVERY_OUTCOME,
   WAYPOINT_REFUSAL,
   buildFixTimeline,
@@ -183,23 +184,30 @@ check(
     WAYPOINT_REFUSAL.FIX_NOT_ON_EARTH
 );
 
-// ⚠️ The jump gate FAILS OPEN below MIN_FIX_INTERVAL_MS, and this hub's fixes are mostly
-// closer together than that, so it usually declines to judge. The bike ran the same gate in
-// the same regime — reproducing that is correct — but the verdict records whether it looked,
-// because a report saying "cleared the jump gate" about a gate that never ran is a lie.
-const tooClose = judge({
-  latitudeRows: [
-    { ts: BASE + 400, value: 57.7, sessionId: 1, seq: 1 },
-    { ts: BASE + 900, value: 57.7, sessionId: 1, seq: 2 },
-  ],
-  longitudeRows: [
-    { ts: BASE + 400, value: 11.97, sessionId: 1, seq: 1 },
-    { ts: BASE + 900, value: 130.3, sessionId: 1, seq: 2 },
-  ],
-});
+// ⚠️ THIS FIXTURE USED TO ASSERT THE OPPOSITE, and the inversion is the point of #241.
+// The jump gate failed OPEN below MIN_FIX_INTERVAL_MS, and this hub's fixes are mostly
+// closer together than that — 93 % of the archive's pairs — so a corrupt fix arriving at
+// the ordinary cadence was recovered with nothing looking at it. The step rule judges
+// exactly that population now, so the same 500 ms pair is refused, and the verdict names
+// the rule that did it rather than confessing that none had.
+const good = fixRows(400, 57.7, 11.97);
+const spike = fixRows(900, 57.7, 130.3);
+const tooClose = judge({ latitudeRows: [good.lat, spike.lat], longitudeRows: [good.lon, spike.lon] });
 check(
-  "⚠️  fixes closer than the gate's floor are NOT judged, and the verdict says so",
-  tooClose[0].outcome === RECOVERY_OUTCOME.RECOVERED && !tooClose[0].jumpGateJudged
+  "⚠️  a corrupt fix 500 ms after a good one — under the gate's floor — is refused by the step rule",
+  tooClose[0].outcome === RECOVERY_OUTCOME.REFUSED &&
+    tooClose[0].refusal === WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE &&
+    tooClose[0].jumpRule === JUMP_RULE.STEP
+);
+
+// ⚠️ AND THE OTHER HALF, or the assertion above is satisfied by a rule that refuses
+// everything under the floor — which is 93 % of this hub's pairs. ~19 m in 500 ms is the
+// largest step measured under any waypoint the rider really saved.
+const nudged = fixRows(900, 57.70017, 11.97);
+const ordinaryCadence = judge({ latitudeRows: [good.lat, nudged.lat], longitudeRows: [good.lon, nudged.lon] });
+check(
+  "…while an ordinary 19 m step at the same 500 ms cadence is recovered, judged by the same rule",
+  ordinaryCadence[0].outcome === RECOVERY_OUTCOME.RECOVERED && ordinaryCadence[0].jumpRule === JUMP_RULE.STEP
 );
 
 const jumped = judge({
@@ -213,8 +221,24 @@ const jumped = judge({
   ],
 });
 check(
-  "…and a real 8 000 km jump across a judgeable gap IS refused",
-  jumped[0].refusal === WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE && jumped[0].jumpGateJudged
+  "…and a real 8 000 km jump across a judgeable gap IS refused, by the SPEED rule this time",
+  jumped[0].refusal === WAYPOINT_REFUSAL.FIX_IMPLAUSIBLE && jumped[0].jumpRule === JUMP_RULE.SPEED
+);
+
+// ⚠️ THE SEAM, IN THE MIRROR TOO. The two rules meet at exactly MIN_FIX_INTERVAL_MS and
+// the boundary belongs to the SPEED rule — the pure function is asserted at that instant in
+// check-hold-gestures.ts, and without this the same `>=`-to-`>` mutation survives here.
+// 1 000 ms apart and ~19 m, so neither rule refuses and only the naming is under test.
+// ⚠️ The SAME pair as ordinaryCadence, one number apart: its first fix is 1 000 ms before
+// the second rather than 500, which is the whole difference between the two rules.
+const secondEarlier = fixRows(-100, 57.7, 11.97);
+const atTheSeam = judge({
+  latitudeRows: [secondEarlier.lat, nudged.lat],
+  longitudeRows: [secondEarlier.lon, nudged.lon],
+});
+check(
+  "⚠️  a pair exactly MIN_FIX_INTERVAL_MS apart is the SPEED rule's, in the mirror as on the bike",
+  atTheSeam[0].outcome === RECOVERY_OUTCOME.RECOVERED && atTheSeam[0].jumpRule === JUMP_RULE.SPEED
 );
 
 const live = judge({ waypointRows: [{ ts: BASE + 1600, value: 1, sessionId: 1, seq: 1 }] });
@@ -231,6 +255,17 @@ check(
   "⚠️  a boot's first fix with no later sample is refused as FIX_UNCORROBORATED",
   judge({ epochRows: [{ ts: BASE + 900, value: 1_788_000_000, sessionId: 1, seq: 1 }] })[0].refusal ===
     WAYPOINT_REFUSAL.FIX_UNCORROBORATED
+);
+
+// ⚠️ AND THE VERDICT SAYS `none`, which is the whole of what that word means since #241:
+// with both rules in force every pair that HAS a predecessor is judged by one of them, so
+// `none` is no longer "the gate declined" — it is "nothing preceded this fix in its boot".
+// Without this the mutation that has judgeJump() claim `step` on a first fix survives, and
+// a report would name a rule that never ran.
+const firstOfBoot = judge({});
+check(
+  "⚠️  …and a fix with nothing before it in its boot is judged by NEITHER rule",
+  firstOfBoot[0].outcome === RECOVERY_OUTCOME.RECOVERED && firstOfBoot[0].jumpRule === JUMP_RULE.NONE
 );
 
 // ⚠️ TWO BOOTS IN ONE WINDOW, which is the case that makes the session split load-bearing
@@ -424,7 +459,7 @@ function verdictAt(atMs: number, lat: number, lon: number): RecoveryVerdict {
     outcome: RECOVERY_OUTCOME.RECOVERED,
     latitudeDeg: lat,
     longitudeDeg: lon,
-    jumpGateJudged: false,
+    jumpRule: JUMP_RULE.NONE,
   };
 }
 

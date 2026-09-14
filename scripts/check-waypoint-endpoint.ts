@@ -64,9 +64,21 @@ async function ask(): Promise<WaypointReply> {
 // second sample, which is what the hub really sends ~550 ms later.
 const fixes = startWaypointFixTracking();
 
+/**
+ * How many landing hops stageFix() has fired — asserted to be 0 before the first save.
+ *
+ * ⚠️ The guard that keeps it 0 there is load-bearing and was WRONG once: written as
+ * `lastStaged !== null` against a variable initialised to `""`, it fired on the first
+ * staging too, which gives §3's save a non-null `precedingFix` and routes it through the
+ * OTHER arm of the corroboration gate — deleting this file's only exercise of it, silently
+ * and with every assertion still green. A diff reviewer put that bug back and the suite
+ * stayed green, which is why this counter exists rather than a comment.
+ */
+let landingHops = 0;
+
 /** When the last DIFFERENT position was staged — see the guard in stageFix(). */
 let lastDifferentStageAt = monotonicNow();
-let lastStaged = "";
+let lastStaged: string | null = null;
 
 /**
  * A fix, straight into liveState, exactly as the GPS decoders put one there — then a
@@ -77,29 +89,42 @@ let lastStaged = "";
  * stamped after both, and the second sample corroborates nothing. The check would then be
  * red for a reason that has nothing to do with the endpoint.
  *
- * ⚠️ And the second record() is deliberately the SAME position: equal values are inside the
- * 3 m deadband, so nothing is logged, no change fires, and `precedingFix` stays null — which
- * is precisely the "first fix of a run, seen twice" state the gate is about.
+ * ⚠️ And the second record() is deliberately the SAME position: equal values sit inside the
+ * deadband, so on the FIRST staging `precedingFix` stays null — the "seen twice" state.
+ *
+ * ⚠️ A move to a new position arrives as two fixes there since #241 — the landing hop.
+ * docs/waypoints.md §"What the checks had to change" has why, and what it does not weaken.
  */
 async function stageFix(latitude: number, longitude: number) {
   const staged = `${latitude},${longitude}`;
   if (staged !== lastStaged) {
     // ⚠️ Starting the tracker put the JUMP gate in a file whose fixtures teleport between
-    // continents. It only judges pairs at least MIN_FIX_INTERVAL_MS apart, and these are
-    // staged microseconds apart — but on a stalled machine that stops being true, and the
-    // symptom would be an unrelated FIX_IMPLAUSIBLE. Said out loud rather than left to be
-    // debugged: this is the fixture's problem, never the endpoint's.
+    // continents, and since #241 a sub-second pair is judged on DISTANCE rather than waved
+    // through — so the landing hop below is what excuses them, not this floor. What this
+    // still pins is the rule the HOP's own pair meets: on a stalled machine the gap grows
+    // past the floor, the speed test judges instead, and the symptom would be an unrelated
+    // FIX_IMPLAUSIBLE. The fixture's problem, never the endpoint's.
     const gap = since(lastDifferentStageAt);
     check(
       `staged fixes stay inside the jump gate's ${MIN_FIX_INTERVAL_MS} ms floor (${Math.round(gap)} ms)`,
       gap < MIN_FIX_INTERVAL_MS
     );
+    if (lastStaged !== null) {
+      // ~11 m north, which clears the 3 m deadband so it logs and moves the tracked pair.
+      landingHops += 1;
+      sample(latitude + 0.0001, longitude);
+      await Promise.resolve();
+    }
     lastDifferentStageAt = monotonicNow();
     lastStaged = staged;
   }
-  record("gps_lat", latitude);
-  record("gps_lon", longitude);
+  sample(latitude, longitude);
   await Promise.resolve();
+  sample(latitude, longitude);
+}
+
+/** One decoded sample, both axes together, the way src/gps/decode.ts emits them. */
+function sample(latitude: number, longitude: number) {
   record("gps_lat", latitude);
   record("gps_lon", longitude);
 }
@@ -183,6 +208,7 @@ if (clockClaimedElsewhere) {
   );
 }
 
+check("⚠️  no landing hop has fired yet, so this save is a run's FIRST fix, seen twice", landingHops === 0);
 const saved = await ask();
 check("a fresh, plausible fix under a trusted clock saves", saved.saved);
 check("…and the reply carries the sequence a banner shows", saved.sequence === 1);
