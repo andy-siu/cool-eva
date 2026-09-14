@@ -153,10 +153,10 @@ console.log(`${Object.keys(MUST_NOT_LATCH).length} outputs, states and measureme
 //    guard in this repo walks the signals that ARE gated.
 //
 //    ⚠️ The list below is NOT a blessing. It is a ratchet: these are what was ungated the day it
-//    was written, and this fails when the next one appears. Some of them are wrong and are left
-//    for whoever owns the frame — `vehicle_state`/`vehicle_substate` (the BLE twins of two keys
-//    the same change gated) and `speed_can_kmh` (whose `speed_kmh` sibling IS gated) are the
-//    obvious ones. docs/dashboard-decisions.md §"The ungated signals" has the list and the why.
+//    was written, and this fails when the next one appears. The three this paragraph used to name
+//    as obviously wrong are all gated now — `speed_can_kmh` by #230, `vehicle_state` and
+//    `vehicle_substate` by #227 — and what is left wants a judgement about a physical range
+//    rather than a line. docs/dashboard-decisions.md §"The ungated signals" has the list and the why.
 const KNOWN_UNGATED = new Set([
   // Flag WORDS and raw state bytes, where a 0/1 or numeric bound would reject the real value.
   "bms_error_flags",
@@ -195,31 +195,10 @@ const KNOWN_UNGATED = new Set([
   "time_since_clear_min",
   "bms_uptime_min",
   "gps_epoch_s",
-  // ⚠️ These are the ones a future change should FIX rather than inherit.
-  //
-  // The fourteen `bms_state_*` / `bms_err_*` / `bms_warn_*` below are genuine 1/0 flags —
-  // `bit()` or `? 1 : 0` in src/can/decode-bms.ts — so a [0, 1] bound rejects nothing and
-  // they only want a BY_KEY line or a BOOLEAN_GROUP. They sat under "a 0/1 bound would
-  // reject the real value" above until the #234 re-review pointed out that it is false of
-  // them; they are the cheapest fourteen on this list.
-  "bms_state_discharge",
-  "bms_state_charge",
-  "bms_state_balancing",
-  "bms_state_trickle",
-  "bms_state_idle",
-  "bms_state_charge_complete",
-  "bms_state_maintenance",
-  "bms_err_cell_overvoltage",
-  "bms_err_cell_undervoltage",
-  "bms_err_over_temp",
-  "bms_err_leak_detected",
-  "bms_err_leak_detect_failed",
-  "bms_err_contactor",
-  "bms_warn_low_soc",
-  "bms_warn_balancing_required",
-  "vehicle_state",
-  "vehicle_substate",
-  "charge_state",
+  // ⚠️ These are the ones a future change should FIX rather than inherit. The fifteen
+  // `bms_state_*` / `bms_err_*` / `bms_warn_*` flags and the three single-byte state words
+  // that stood here are gone — #227 gated them; scripts/check-flag-bounds.ts is what holds
+  // them. What is left wants a judgement about a physical range rather than a line.
   "charger_enabled",
   "bms_remaining_energy_raw",
   "remaining_ah",
