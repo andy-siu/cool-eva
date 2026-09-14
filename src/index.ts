@@ -578,6 +578,13 @@ server.listen(PORT, "0.0.0.0", () => {
 // --- Automatic DC charge current (docs/charge-auto.md) ---
 // ⚠️ It commands through the write runner's own `charge-current` action, so it inherits every lock
 // that door has — and is INERT unless SERVICE_WRITE_ENABLED is also 1. One transmit path.
+//
+// ⚠️ CONSTRUCTED AFTER THE CHANNEL, AND THE ORDERING IS LOAD-BEARING. Its SOC ring may only hold
+// crossing instants, and a process's first-ever reading is not one. What keeps that reading out is
+// the serial per-file `await loadStaticFiles(…)` above, which every logged boot spends longer in
+// than the bus takes to deliver a `soc`. Making that read concurrent, or moving this call above it,
+// hands the controller a sample it cannot stand behind; it says so in the journal when that
+// happens. The measurement is in docs/dc-taper.md.
 const chargeAutomatic = startChargeAutomatic(
   {
     commandChargeCurrent: async amps => {

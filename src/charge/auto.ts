@@ -2,7 +2,7 @@ import { ageMs, latestValue, onChange, record } from "../can/signals.ts";
 import { monotonicNow } from "../monotonic.ts";
 import { isPackTemperaturePlausible } from "../fan/curve.ts";
 import { RATE_WINDOW_MS, type TemperatureSample } from "./rate.ts";
-import { isSocPlausible, type SocSample } from "./soc.ts";
+import { isSocPlausible, SOC_WINDOW_MS, type SocSample } from "./soc.ts";
 import {
   CHARGE_AUTO_REASON,
   decideChargeCurrent,
@@ -107,6 +107,11 @@ export function startChargeAutomatic(sink: ChargeCommandSink, options: ChargeAut
     riderOverride: false,
     samples: [],
     socSamples: [],
+    // Decided here because this is the instant the listener starts; `rememberSoc` says why it
+    // matters. ⚠️ `isSocPlausible` rather than a null test: `soc` is the raw `data[1]` of `0x200`
+    // and `record()` has no plausibility gate, so a `255` already in `liveState` would otherwise
+    // answer "a SOC is known", disarm this, and the sample would be kept with nothing said.
+    firstSocMayNotBeACrossing: !isSocPlausible(latestValue("soc")),
     inFlight: false,
     lastSessionState: null,
     timer: null,
@@ -185,6 +190,8 @@ interface AutoContext {
   riderOverride: boolean;
   samples: TemperatureSample[];
   socSamples: SocSample[];
+  /** Whether the next SOC reading kept would be this process's first, and so not a crossing. */
+  firstSocMayNotBeACrossing: boolean;
   /** True while a command is in flight, so a slow POST cannot overlap the next tick. */
   inFlight: boolean;
   /** The last `charge_manager_state` seen, so entering and leaving a session are both edges. */
@@ -270,15 +277,37 @@ function remember(context: AutoContext, celsius: number): void {
  * The SOC ring, trimmed the same way the temperature ring is.
  *
  * ⚠️ NO ANCHOR kept here, unlike `remember` above. src/charge/soc.ts § estimateSocRate says why.
+ *
+ * ⚠️ EVERY SAMPLE IS A CROSSING INSTANT, and the lower bound rests on it: `record()` notifies only
+ * when the value moved, so a sample exists at the moment the reading BECAME that value. What is not
+ * a crossing is the first reading after there was nothing usable to compare against — kept out of
+ * the ring only by the CAN channel having recorded a plausible `soc` before this controller
+ * subscribes, which nothing enforces (src/index.ts, docs/dc-taper.md). So this says so rather than
+ * guarding: the sample is still kept, the first rate may over-state by one whole point, and the
+ * journal carries the line that explains it. Not re-armed by `forgetSession` — an emptied ring
+ * refills from changes. ⚠️ Nor by a LATER implausible reading, which leaves the same hole in the
+ * middle of a session: bounded by the same whole point, unguarded, and named in docs/dc-taper.md.
  */
 function rememberSoc(context: AutoContext, percent: number): void {
   if (!isSocPlausible(percent)) {
     console.warn(`charge-auto: ignoring an implausible SOC of ${percent} %`);
     return;
   }
+  if (context.firstSocMayNotBeACrossing) {
+    context.firstSocMayNotBeACrossing = false;
+    console.warn(
+      `charge-auto: keeping a first SOC of ${percent} % with no crossing instant behind it — no usable SOC had ` +
+        "been recorded when this controller subscribed, so the first rate this session reports may over-state by " +
+        "up to one whole point"
+    );
+  }
   const atMs = monotonicNow();
   context.socSamples.push({ atMs, percent });
-  const oldest = atMs - RATE_WINDOW_MS;
+  // ⚠️ SOC_WINDOW_MS, not the thermal constant next to it. The same number today and deliberately a
+  // separate one: src/charge/soc.ts § SOC_WINDOW_MS is the indirection, and reaching past it means a
+  // thermal argument that shortens RATE_WINDOW_MS silently trims this ring inside the estimator's
+  // own window.
+  const oldest = atMs - SOC_WINDOW_MS;
   while (context.socSamples.length > 0 && context.socSamples[0].atMs < oldest) {
     context.socSamples.shift();
   }
