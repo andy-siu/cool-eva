@@ -1,14 +1,10 @@
 import type { RawChannel } from "socketcan";
 import type { FrameArrival } from "../can/frame-arrival.ts";
-import { createVcuKwpClient } from "./kwp-client.ts";
-import {
-  activeParameterTable,
-  contentTwinsOf,
-  describeTableType,
-  parameterTable,
-  type VcuMicro,
-  type VcuParameter,
-} from "./param-table.ts";
+import { pollerRefusalFor, withObdPollerHold, type ObdPollerHold } from "../can/obd-hold.ts";
+import { createVcuKwpClient, type VcuReadOutcome } from "./kwp-client.ts";
+import { identifierForIndex } from "./param-codec.ts";
+import { activeParameterTable, contentTwinsOf, describeTableType } from "./param-table.ts";
+import { MICROS, sweepTargets, type SweepTarget } from "./sweep-targets.ts";
 import {
   describeRow,
   reportTableType,
@@ -34,8 +30,9 @@ import type { ServiceGateVerdict } from "./service-gate.ts";
 // nothing here calls `channel.start()` or `channel.stop()`. Frames are handed in by the
 // caller rather than subscribed to, so this module owns no listener to leak either.
 //
-// Why a ~277-request burst is allowed to exist inside the always-on service at all, and
-// what the old ssh-script rule was really about: docs/vcu-parameters.md §9.
+// Why a ~300-request burst is allowed to exist inside the always-on service at all, what
+// the old ssh-script rule was really about, and which of those requests park the OBD poller
+// first: docs/vcu-parameters.md §9.
 
 /** What a sweep needs. Everything is supplied — no globals, no env, no clock of its own. */
 export interface ParameterSweepOptions {
@@ -52,6 +49,14 @@ export interface ParameterSweepOptions {
   checkGate: () => ServiceGateVerdict;
   /** Called once per row as it is written down, so a caller can show progress without reading the file back. */
   onRow?: (row: VcuParameterRow) => void;
+  /**
+   * How the OBD poller is parked for a firmware-block row. Production passes nothing.
+   *
+   * ⚠️ Injectable for the same reason `gate` and `latestSweep` are injected on the write
+   * runner: a check has to be able to refuse a hold, and to assert that nothing reached the
+   * bus when one was refused. There is no other way to reach either from outside.
+   */
+  acquirePollerHold?: (reason: string) => Promise<ObdPollerHold | null>;
 }
 
 export interface ParameterSweepResult {
@@ -80,9 +85,6 @@ export interface RunningParameterSweep {
   finished: Promise<ParameterSweepResult>;
 }
 
-/** Both micros, A9 first: 233 of the 277 parameters live there, so the useful half arrives first. */
-const MICROS: VcuMicro[] = ["A9", "A8"];
-
 /**
  * Starts a sweep and hands back a handle to it.
  *
@@ -91,13 +93,13 @@ const MICROS: VcuMicro[] = ["A9", "A8"];
  */
 export function startParameterSweep(options: ParameterSweepOptions): RunningParameterSweep {
   const client = createVcuKwpClient(options.channel);
-  const state: SweepState = { rows: new Map(), stoppedBecause: null, client };
+  const state: SweepState = { rows: new Map(), stoppedBecause: null, client, pollerRefusal: null };
   const finished = runSweep(options, state);
   return {
     handleFrame: (id, data, arrival) => client.handleFrame(id, data, arrival),
     abort: reason => abort(state, reason),
     rows: () => [...state.rows.values()],
-    expected: parameterTable().length,
+    expected: sweepTargets().length,
     finished,
   };
 }
@@ -107,6 +109,16 @@ interface SweepState {
   /** Set once, by the first thing that stopped the sweep. Later reasons do not overwrite it. */
   stoppedBecause: string | null;
   client: ReturnType<typeof createVcuKwpClient>;
+  /**
+   * Why the OBD poller would not park, once it has refused. Set once and never cleared.
+   *
+   * ⚠️ ONE refusal ends the whole firmware block. `holdObdPoller` waits up to 6 s before
+   * giving up, so asking 25 times would be 150 s of a sweep doing nothing — and a poller
+   * that would not go quiet for the first row is not about to for the twenty-fifth. The
+   * remaining block rows are recorded `not-sent` with this sentence, which is true of every
+   * one of them, and the rest of the sweep carries on.
+   */
+  pollerRefusal: string | null;
 }
 
 /**
@@ -151,7 +163,7 @@ async function runSweep(options: ParameterSweepOptions, state: SweepState): Prom
       if (!mayContinue(options, state)) {
         break;
       }
-      const outcome = await state.client.readParameter(target.micro, target.index);
+      const outcome = await readOneTarget(options, state, target);
       if (state.stoppedBecause !== null) {
         // Aborted while this read was in flight. The outcome is DISCARDED rather
         // than filed: client.stop() settles it as `not-sent`, and writing that down
@@ -201,7 +213,7 @@ async function runSweep(options: ParameterSweepOptions, state: SweepState): Prom
 }
 
 /**
- * Says whether the bike agrees it runs the parameter table these 277 names came from.
+ * Says whether the bike agrees it runs the parameter table these names came from.
  *
  * Printed after the rows and before the archive is written, because it is the caption
  * for everything above it: 277 name/value pairs just scrolled past, and this is the
@@ -275,16 +287,14 @@ async function pingMicros(options: ParameterSweepOptions, state: SweepState): Pr
  * The gate check between the loop and the socket.
  *
  * ⚠️ This is HALF of the auto-exit, and which half matters: "no frame after unsafe" is the
- * sentence someone will quote when deciding whether the other half can be dropped. This
- * call runs once per PARAMETER, and one parameter can put up to FOUR frames on the bus since
- * #223 — the read, a `10 81`, the retry, and a flow control if the reply is a First Frame — so
- * a gate transition landing just after a check here can be followed by another frame up to
- * a reply window later.
+ * sentence someone will quote when deciding whether the other half can be dropped. One
+ * parameter can put up to FOUR frames on the bus since #223, and a firmware-block row adds
+ * a park of up to 6 s in front of them, so a gate transition landing just after a check
+ * here can be followed by another frame much later. `readWithPollerParked` therefore calls
+ * this again on the far side of the park rather than trusting the check that let it in.
  *
- * What actually bounds it is `stopped` inside kwp-client.ts's `exchange`, set by `abort` —
- * reached from here AND from the 200 ms watchdog in ../vcu/read-runner.ts, which is shorter
- * than the 300 ms reply window. This check is still worth having (it is what stops the
- * sweep in the common case), but the tight bound is the watchdog's.
+ * What actually BOUNDS it is `stopped` inside kwp-client.ts's `exchange`, set by `abort` —
+ * reached from here and from the 200 ms watchdog in ../vcu/read-runner.ts. The arithmetic:
  * docs/vcu-parameters.md §9.
  */
 function mayContinue(options: ParameterSweepOptions, state: SweepState): boolean {
@@ -305,14 +315,87 @@ function mayContinue(options: ParameterSweepOptions, state: SweepState): boolean
 }
 
 /**
- * Which parameters to read, grouped by micro.
+ * One target, read — with the OBD poller parked first if this is a firmware-block row.
  *
- * Grouped rather than interleaved because A8 and A9 hold SEPARATE sessions: hopping
- * between them would let each one idle out while the other was being read, and pay
- * for a re-open on every single parameter.
+ * ⚠️ The rule is "the width is a CLAIM, not a measurement", not "the record is wide". The
+ * 277's widths have 233 live records behind them; the block's have one disassembly, and a
+ * width that is wrong is wrong in the direction that opens a transfer for the poller to
+ * land in.
+ *
+ * ⚠️ An abort during the park is WAITED OUT and cannot be checked away — a re-check before
+ * the `await` would be dead code, since the loop's `mayContinue` runs in the same
+ * synchronous block as this prologue. Nothing transmits meanwhile; what is delayed is the
+ * bus lease coming free. Both arguments in full: docs/vcu-parameters.md §9.
  */
-function sweepTargets(): VcuParameter[] {
-  return [...parameterTable()].sort(
-    (left, right) => MICROS.indexOf(left.micro) - MICROS.indexOf(right.micro) || left.index - right.index
+async function readOneTarget(
+  options: ParameterSweepOptions,
+  state: SweepState,
+  target: SweepTarget
+): Promise<VcuReadOutcome> {
+  if (!target.widthUnverified) {
+    return state.client.readParameter(target.micro, target.index);
+  }
+  if (state.pollerRefusal !== null) {
+    return notSent(target, state.pollerRefusal);
+  }
+  const held = await withObdPollerHold(
+    `a parameter sweep's read of ${target.micro} index ${target.index}`,
+    () => readWithPollerParked(options, state, target),
+    options.acquirePollerHold
   );
+  if (held.ok) {
+    return held.result;
+  }
+  // ⚠️ The stored sentence is GENERIC, and `held.reason` is only logged. That reason names
+  // the row that was refused ("…read of A8 index 278…"), and it is stamped on the other 24
+  // as well — so index 1007's row would have said the poller would not park for a read of
+  // 278. A row must never claim something about itself that nobody established, least of
+  // all an index that is not its own.
+  console.warn(`vcu-sweep: ${held.reason}`);
+  state.pollerRefusal = POLLER_REFUSAL;
+  return notSent(target, POLLER_REFUSAL);
+}
+
+/**
+ * The read itself, inside the hold.
+ *
+ * ⚠️ The gate is re-checked HERE, after the park. Parking can take up to 6 s
+ * (`HOLD_WAIT_MS`), which is thirty gate-watchdog intervals, and transmitting on a decision
+ * taken before that wait would be a frame sent on a bike that may have started moving
+ * meanwhile. In the service the 200 ms watchdog wins that race anyway — it calls `abort`,
+ * and `client.stop()` settles the read as `not-sent` — so this is defence in depth, and it
+ * is the ONLY guard in a check harness, which has no watchdog running.
+ */
+async function readWithPollerParked(
+  options: ParameterSweepOptions,
+  state: SweepState,
+  target: SweepTarget
+): Promise<VcuReadOutcome> {
+  if (!mayContinue(options, state)) {
+    // ⚠️ What matters here is the `return` — nothing is transmitted. The ROW is thrown
+    // away: `mayContinue` sets `stoppedBecause` whenever it refuses, and the loop discards
+    // every outcome once that is set, because our own exit must never be filed as the bike
+    // failing to answer. The `??` is for the type checker, which cannot see the first half.
+    return notSent(target, state.stoppedBecause ?? POLLER_REFUSAL);
+  }
+  return state.client.readParameter(target.micro, target.index);
+}
+
+/**
+ * What every block row says when the poller would not go quiet — the same sentence
+ * `withObdPollerHold` returns, with a subject that is true of all 25 rather than of the
+ * one the hold was refused for. Built by ../can/obd-hold.ts so there is one wording.
+ */
+const POLLER_REFUSAL = pollerRefusalFor("the A8 rows whose width comes from the firmware table");
+
+/** A row nothing was asked for. OUR doing, never the bike's — the distinction ./kwp-client.ts draws. */
+function notSent(target: SweepTarget, reason: string): VcuReadOutcome {
+  return {
+    micro: target.micro,
+    index: target.index,
+    identifier: identifierForIndex(target.index),
+    status: "not-sent",
+    reason,
+    flowControlLatency: null,
+  };
 }

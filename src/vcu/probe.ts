@@ -1,13 +1,22 @@
 import type { RawChannel } from "socketcan";
 import type { ArrivalLatency, FrameArrival } from "../can/frame-arrival.ts";
+import { describeFirmwareRow, firmwareRowFor, type A8FirmwareRow } from "./a8-firmware-rows.ts";
 import { createVcuKwpClient, type VcuProbeOutcome } from "./kwp-client.ts";
-import { identifierFor, interpretRecord, type VcuTarget } from "./param-codec.ts";
+import {
+  describeWidthMismatch,
+  identifierFor,
+  interpretRecord,
+  type RecordEncoding,
+  type VcuTarget,
+} from "./param-codec.ts";
 import { CALIBRATION_BANK, parameterAtIndex } from "./param-table.ts";
+import { note } from "./snapshot.ts";
 
 // Read ONE identifier off ONE target, on demand, from the dashboard. It exists for what the
-// 277-parameter sweep cannot reach: the identifier is `(bank << 12) | index`, and **bank 2
-// is live data** — the running values, not the stored settings — which nothing here has
-// ever read.
+// sweep cannot reach — which since #219 is no longer "everything outside params.ecf": the
+// sweep now reads 302 identifiers, the 25 A8 firmware rows included. What is still only
+// reachable here is the identifier space itself, `(bank << 12) | index`, and **bank 2 is
+// live data** — the running values, not the stored settings.
 //
 // ⚠️ WHAT THIS WIDENS, PRECISELY. Before it, no HTTP input named a service, an identifier
 // or a value; now an identifier and a target are caller-supplied. The request union in
@@ -43,6 +52,10 @@ export interface VcuProbeReading extends VcuProbeRequest {
    * inside 1…277 — the table describes the VCU's calibration bank and nothing else,
    * so a bank-2 read or a charge-manager read is always unnamed here. That is not a
    * gap to fill in later with a guess: it is the honest state of what is known.
+   *
+   * ⚠️ Still null for the 25 A8 bank-1 identifiers ./a8-firmware-rows.ts describes. They
+   * are not `params.ecf` names and must not read as if they were; what they add is a
+   * width for the reply to be checked against, and a sentence in `note`.
    */
   name: string | null;
   section: string | null;
@@ -141,6 +154,10 @@ export function describeProbe(outcome: VcuProbeOutcome): VcuProbeReading {
   // VCU micro (PROBE_TARGETS), so bank 1 is always this table's bank. If another ECU
   // is ever added, this condition has to grow a target check back.
   const parameter = outcome.bank === CALIBRATION_BANK ? parameterAtIndex(outcome.index) : null;
+  // ⚠️ The target and the bank are both part of this lookup, not just the index: A8 bank 1
+  // index 1000 is the service date's low word, and A9 bank 1 or A8 bank 2 at the same index
+  // is neither. A probe can name any of them from a phone.
+  const firmware = parameter ? null : firmwareRowFor(outcome.target, outcome.bank, outcome.index);
   const base = {
     target: outcome.target,
     bank: outcome.bank,
@@ -152,25 +169,46 @@ export function describeProbe(outcome: VcuProbeOutcome): VcuProbeReading {
     flowControlLatency: outcome.flowControlLatency,
   };
   if (outcome.status !== "read") {
-    return { ...base, rawHex: null, unsigned: null, signed: null, value: null, note: describeFailure(outcome) };
+    return {
+      ...base,
+      rawHex: null,
+      unsigned: null,
+      signed: null,
+      value: null,
+      note: note(describeFailure(outcome), firmware && describeFirmwareRow(firmware)),
+    };
   }
-  const interpreted = interpretRecord(outcome.record, parameter ?? null);
+  const encoding = parameter ?? firmware;
+  const interpreted = interpretRecord(outcome.record, encoding);
   return {
     ...base,
     rawHex: interpreted.rawHex,
     unsigned: interpreted.unsigned,
     signed: interpreted.signed,
     value: interpreted.value,
-    note: probeNote(outcome.record.length, parameter !== null, interpreted.widthMismatch),
+    note: probeNote(outcome.record.length, parameter !== null, encoding, firmware, interpreted.widthMismatch),
   };
 }
 
-function probeNote(recordLength: number, named: boolean, widthMismatch: boolean): string | null {
-  if (widthMismatch) {
-    return `the reply is ${recordLength} byte(s), which contradicts the name table — value withheld, raw kept`;
+function probeNote(
+  recordLength: number,
+  named: boolean,
+  encoding: RecordEncoding | null,
+  firmware: A8FirmwareRow | null,
+  widthMismatch: boolean
+): string | null {
+  const known = firmware ? describeFirmwareRow(firmware) : null;
+  if (widthMismatch && encoding) {
+    // ⚠️ The SAME sentence ./snapshot.ts puts on a row, out of ./param-codec.ts, because it
+    // has to name which width the reply contradicts and the two sources carry very
+    // different weight. docs/vcu-parameters.md §2.
+    return note(describeWidthMismatch(recordLength, encoding), known);
   }
   if (named) {
     return null;
+  }
+  if (known) {
+    return known;
   }
   // Not an error, and said plainly rather than left as a silent null: the whole
   // point of probing is to reach identifiers nothing here describes.

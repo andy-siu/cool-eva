@@ -1,5 +1,5 @@
 import { describeNegativeResponseCode } from "../diagnostics/obd-dtc.ts";
-import { CALIBRATION_BANK, recordLengthFor, type VcuMicro, type VcuParameter } from "./param-table.ts";
+import { CALIBRATION_BANK, recordLengthFor, type ParameterStorageType, type VcuMicro } from "./param-table.ts";
 
 // Pure codec for the VCU micros' custom KWP framing: requests in, bytes out; bytes in,
 // values out. No socket, no clock, no state — so the whole protocol can be exercised from
@@ -363,41 +363,92 @@ export interface VcuParameterValue {
   /** The same bytes read as two's complement. Meaningful only for `S` parameters. */
   signed: number;
   /**
-   * The value per the table's S/U column — the number to show a human.
+   * The value per the S/U column — the number to show a human.
    *
-   * Null when there is no honest typed reading: the identifier is not in the name
-   * table (an index outside the 1…277 this variant's file describes), or its record
-   * length contradicts the TYPE column. In both cases `rawHex` and `unsigned` still
-   * carry everything the bike actually said, so nothing is lost by refusing to guess.
+   * Null when there is no honest typed reading, which is now three cases: nothing
+   * describes the identifier at all; its record length contradicts the width; or the
+   * width is known and the SIGN is not, which is every row in ./a8-firmware-rows.ts —
+   * A8's firmware table types the record and says nothing about two's complement. In
+   * all three `rawHex` and `unsigned` still carry everything the bike actually said,
+   * so nothing is lost by refusing to guess.
    */
   value: number | null;
-  /** The record length disagrees with the table. Never seen on 233 records; loud if it ever is. */
+  /** The record length disagrees with the width. Never seen on 233 records; loud if it ever is. */
   widthMismatch: boolean;
 }
 
 /**
- * Interprets a record. `parameter` is null for an identifier the name table does not
- * describe — which means an index outside the contiguous 1…277 this variant's file
- * covers, as it has no gaps (scripts/check-vcu-params.ts asserts exactly that). That
- * is an ordinary outcome, not an error: a bike with more parameters than this file
- * knows shows up here as more of them, with its raw bytes intact. (260/262/263/265
- * are NOT such cases — they are named EVSE placeholders, EE_EVSE_DUMMY_1 …
- * EVSE_DUMMY_WORD4, that happen to read 0 on this bike.)
+ * What the caller knows about a record's shape. Null where nothing does.
+ *
+ * ⚠️ A SHAPE rather than `VcuParameter`, and that is what lets one function own "withhold
+ * the value rather than guess" for both sources of a width: a table row (width and sign)
+ * and a firmware-table row (width only, `signed: null`). The alternative was a second
+ * width-verdict helper beside this one, which is two places to disagree about what a
+ * mismatch is. `VcuParameter` satisfies it unchanged, so no caller of it moved.
  */
-export function interpretRecord(record: Uint8Array, parameter: VcuParameter | null): VcuParameterValue {
+export interface RecordEncoding {
+  type: ParameterStorageType;
+  /** Null when the width is established and the sign is not — see ./a8-firmware-rows.ts. */
+  signed: boolean | null;
+  /**
+   * What claims this width, named the way a message to a person should name it.
+   *
+   * ⚠️ Optional so `VcuParameter` satisfies this unchanged, and it defaults to the name
+   * table because that is where every width came from until #219. It lives HERE rather
+   * than being passed to each message builder because the source is a property of the
+   * width, not of the sentence — a third source becomes a data change rather than an
+   * edit to every place that has to say which one disagreed.
+   */
+  describedBy?: string;
+}
+
+/** What a width is called when nothing says otherwise: `params.ecf` and the 29 tables built from it. */
+export const NAME_TABLE = "the name table";
+
+/**
+ * The one sentence for a reply whose length contradicts the width that was expected.
+ *
+ * ⚠️ It names WHICH width it contradicts, and that is the whole reason it is shared rather
+ * than written at each surface: the name table's TYPE column has 233 live records behind
+ * it, so a mismatch against it means the framing is wrong; A8's firmware table has one
+ * disassembly behind it, so a mismatch against that is at least as likely to mean the
+ * firmware image is not what is flashed. Same withheld value, very different thing to go
+ * and look at. docs/vcu-parameters.md §2.
+ */
+export function describeWidthMismatch(recordLength: number, encoding: RecordEncoding): string {
+  return (
+    `record is ${recordLength} byte(s); ${encoding.describedBy ?? NAME_TABLE} says ${encoding.type} — ` +
+    "value withheld, raw kept"
+  );
+}
+
+/**
+ * Interprets a record. `encoding` is null for an identifier nothing describes — an index
+ * outside the contiguous 1…277 this variant's file covers (it has no gaps;
+ * scripts/check-vcu-params.ts asserts exactly that) that ./a8-firmware-rows.ts does not
+ * cover either. That is an ordinary outcome, not an error: a bike with more parameters
+ * than this software knows shows up here as more of them, with its raw bytes intact.
+ * (260/262/263/265 are NOT such cases — they are named EVSE placeholders,
+ * EE_EVSE_DUMMY_1 … EVSE_DUMMY_WORD4, that happen to read 0 on this bike.)
+ */
+export function interpretRecord(record: Uint8Array, encoding: RecordEncoding | null): VcuParameterValue {
   const unsigned = record.reduce((accumulated, byte) => accumulated * 256 + byte, 0);
   const bits = record.length * 8;
   const signed = record.length > 0 && unsigned >= 2 ** (bits - 1) ? unsigned - 2 ** bits : unsigned;
   const rawHex = toHex(record);
 
-  if (!parameter) {
+  if (!encoding) {
     return { rawHex, unsigned, signed, value: null, widthMismatch: false };
   }
-  const widthMismatch = record.length !== recordLengthFor(parameter.type);
-  if (widthMismatch) {
+  const widthMismatch = record.length !== recordLengthFor(encoding.type);
+  if (widthMismatch || encoding.signed === null) {
+    // Two different reasons to withhold the same number, and they stay apart in the
+    // OUTCOME: a width mismatch is a fault worth shouting about, an unknown sign is
+    // the honest state of a firmware-derived row. `widthMismatch` is what tells them
+    // apart, which is why it is returned rather than folded into a null value.
     return { rawHex, unsigned, signed, value: null, widthMismatch };
   }
-  return { rawHex, unsigned, signed, value: parameter.signed ? signed : unsigned, widthMismatch };
+  return { rawHex, unsigned, signed, value: encoding.signed ? signed : unsigned, widthMismatch };
 }
 
 /** Uppercase, space-separated hex — the same shape obd-garage's notes quote raw payloads in. */
