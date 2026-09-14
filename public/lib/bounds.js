@@ -18,6 +18,21 @@ import { CELL_VOLTAGE_PATTERN } from "./cells.js";
 // an out-of-range coolant probe is a wire to go and wiggle.
 
 /**
+ * The whole width of a byte and of a 16-bit field.
+ *
+ * ⚠️ Named so a reader of a table headed "physical limits" can see at a glance which entries are
+ * NOT one. A field width gates a decode that reads the wrong bytes and nothing else — it cannot
+ * reject a sentinel, because every value the field can hold is inside it. That is the right
+ * bound for an identifier or a state enumeration, where the whole range is legitimate and a
+ * bound drawn round today's values would draw tomorrow's as a dead sensor; it is the wrong one
+ * for a measurement, and `charge_manager_error_code` below says the same thing about a code.
+ * @type {[number, number]}
+ */
+const FIELD_U8 = [0, 255];
+/** @type {[number, number]} */
+const FIELD_U16 = [0, 65_535];
+
+/**
  * Physical limits per signal, widest that is still definitely wrong outside.
  * These are deliberately generous: the job is catching decode sentinels and dead
  * sensors, not second-guessing the bike.
@@ -108,6 +123,36 @@ const BY_KEY = {
   // decrypted archive read past 360 — two at 442.0 on 2026-08-08, one at 366.0 on
   // 2026-09-13. Real data, on a signal a rider reads as a heading.
   "gps_course_deg": [0, 360],
+  // 0x101 `VCU_VEHICLE_STS` (src/can/vehicle-status.ts), added 2026-09-14. Every one of
+  // these has a blank unit in a group that is not a BOOLEAN_GROUP — `drive` and `vcu` —
+  // which is the combination this file's header says reaches no rule and renders whatever
+  // arrives. They are bounded to the FIELD, not to the values seen: the state byte has
+  // produced six values in 15 006 844 frames and the substate 38, and a bound drawn round
+  // today's set would draw a state this bike has not reached yet as a dead sensor. That is
+  // `charge_manager_state`'s reasoning, and it applies harder here — the whole point of
+  // logging a state machine raw is to catch a state nobody has seen.
+  //
+  // ⚠️ `drive_vsm_b3` is [0, 3] and NOT [0, 1]: Energica's mask is `byte 3 mask 0x03`, two
+  // bits, so the field's range is 0…3 however few values the bus has shown. Same call, same
+  // reason, as `abs_warning_lamp` below. `limp_pack_res` gets no unit and a full-field
+  // bound: the database carries no scaling factors, so 75…154 is plausible for this pack's
+  // milliohms and nothing more. docs/can-0x101.md.
+  "vehicle_state_can": FIELD_U8,
+  "vehicle_substate_can": FIELD_U8,
+  "drive_vsm": FIELD_U8,
+  "drive_vsm_b3": [0, 3],
+  "vehicle_status_flags": FIELD_U8,
+  "limp_pack_res": FIELD_U16,
+  "limp_module_word": FIELD_U16,
+  // 🚨 `moving` is a 0/1 flag that rendered COMPLETELY UNGATED until 2026-09-14 — blank unit,
+  // group `drive`, in neither table, so boundsFor() ran off the end and returned null. The
+  // combination this file's header warns about, on the tab a rider reads, and the shape of
+  // `high_beam` once reading 193. scripts/check-can-decoders.ts cannot catch it: it only walks
+  // signals that ARE gated. 0/1 by construction — `bit(lampsAndState, 7)` — so this cannot
+  // reject a real reading. ⚠️ #230 found the same miss on the same day, on 0x104's two flags,
+  // and fixed it below under `rolling_backwards`; check-all-view-tiles.ts §5 now ratchets the
+  // whole class so the next one cannot arrive silently.
+  "moving": [0, 1],
   "speed_kmh": [0, 300],
   "motor_rpm": [-12_000, 12_000],
   "aux_12v": [0, 20],
