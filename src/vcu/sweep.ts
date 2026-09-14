@@ -1,4 +1,5 @@
 import type { RawChannel } from "socketcan";
+import type { FrameArrival } from "../can/frame-arrival.ts";
 import { createVcuKwpClient } from "./kwp-client.ts";
 import {
   activeParameterTable,
@@ -68,7 +69,8 @@ export interface RunningParameterSweep {
    * Feed every CAN frame here; returns true when it was consumed. The service shares
    * one socket, so this is how a reply reaches the client without a second listener.
    */
-  handleFrame: (id: number, data: Buffer) => boolean;
+  /** ⚠️ `arrival` is the kernel's stamp — see ../can/frame-arrival.ts and RunningProbe. */
+  handleFrame: (id: number, data: Buffer, arrival?: FrameArrival | null) => boolean;
   /** Stops it. Everything read so far is kept and written. Safe to call more than once. */
   abort: (reason: string) => void;
   /** Rows on record right now, including any carried over from a resumed sweep. */
@@ -92,7 +94,7 @@ export function startParameterSweep(options: ParameterSweepOptions): RunningPara
   const state: SweepState = { rows: new Map(), stoppedBecause: null, client };
   const finished = runSweep(options, state);
   return {
-    handleFrame: (id, data) => client.handleFrame(id, data),
+    handleFrame: (id, data, arrival) => client.handleFrame(id, data, arrival),
     abort: reason => abort(state, reason),
     rows: () => [...state.rows.values()],
     expected: parameterTable().length,
@@ -274,7 +276,8 @@ async function pingMicros(options: ParameterSweepOptions, state: SweepState): Pr
  *
  * ⚠️ This is HALF of the auto-exit, and which half matters: "no frame after unsafe" is the
  * sentence someone will quote when deciding whether the other half can be dropped. This
- * call runs once per PARAMETER, and one parameter can put up to three frames on the bus, so
+ * call runs once per PARAMETER, and one parameter can put up to FOUR frames on the bus since
+ * #223 — the read, a `10 81`, the retry, and a flow control if the reply is a First Frame — so
  * a gate transition landing just after a check here can be followed by another frame up to
  * a reply window later.
  *

@@ -5,6 +5,7 @@ import {
   KWP_REQUEST_CAN_ID,
   KWP_RESPONSE_CAN_ID,
   buildRequestFrame,
+  buildRequestPayload,
   canIdsFor,
   decodeParameterReply,
   identifierFor,
@@ -23,18 +24,30 @@ import {
   type VcuMultiFrameReply,
   type VcuMultiFrameRequest,
 } from "./multiframe-codec.ts";
-import { startMultiFrameTransfer, type RunningMultiFrameTransfer, type TransferStage } from "./multiframe-transfer.ts";
+import {
+  startMultiFrameTransfer,
+  type MultiFrameResult,
+  type RunningMultiFrameTransfer,
+  type TransferStage,
+} from "./multiframe-transfer.ts";
 
 // The transport half of reading VCU calibration parameters: put a frame on the bus, wait
 // for the reply, keep the diagnostic session alive, give up on time. Every byte it sends is
 // built by ./param-codec.ts or ./multiframe-codec.ts and every byte it receives is
 // interpreted there — this file holds only the socket, the clock and the session state.
 //
-// ⚠️ READ-ONLY, structurally. It cannot express a write. Both routes to `channel.send` are
-// closed unions with a throwing default and an allowlist re-check on the emitted service
-// byte; a caller names an operation and a target, never a service byte, and there is
+// ⚠️ READ-ONLY, structurally. It cannot express a write. Every byte reaching `channel.send`
+// was built by one of TWO encoders — `buildRequestPayload` (./param-codec.ts, three members,
+// three service bytes) or `encodeMultiFrameRequestPayload` (./multiframe-codec.ts, five and
+// five) — each a closed union with a throwing default and an allowlist re-check on the
+// emitted byte. A caller names an operation and a target, never a service byte, and there is
 // nowhere to put a value. `0x31`, `0x2E`, `0x3B`, `0x14`, `0x11`, `0x27`, `0x2F` and `0x34`
 // are unreachable from this client.
+//
+// ⚠️ A parameter read is carried by the SAME transport as the five multi-frame services, so
+// a record too wide for one frame is assembled rather than refused. That changed no request
+// byte: `segmentRequestPayload` on a 3-byte `22 hi lo` emits the identical Single Frame
+// `buildRequestFrame` did. What it changed is the reply side, and the outcomes below.
 //
 // ⚠️ It SENDS FLOW-CONTROL FRAMES, and the property that mattered is preserved rather than
 // spent: **no transmit address is ever derived from something the bus said.**
@@ -74,10 +87,29 @@ export type VcuReadResult =
   /** The micro would not open a session, so nothing was even asked of it. */
   | { status: "no-session"; reason: string }
   /**
-   * The reply was a First Frame. Impossible for a bank-1 record (see the codec's
-   * header), so it means an assumption is wrong; reported rather than assembled.
+   * A First Frame arrived and the rest of the reply never did.
+   *
+   * A claim about the micro or the link, kept apart from `abandoned` below, which is
+   * a claim about the framing. In a garage with no reception those send you to
+   * different places, which is the whole reason ./multiframe-transfer.ts separates
+   * them and why they are not folded here either.
    */
-  | { status: "multi-frame"; totalLength: number }
+  | { status: "stalled"; reason: string }
+  /**
+   * A reply arrived and was DISCARDED as unusable: a sequence gap, a Consecutive
+   * Frame that under-filled, a declared length over the cap.
+   *
+   * ⚠️ Deliberately the same word `VcuMultiFrameOutcome` uses, so a tally line traces
+   * back to the frame that caused it. And its own status for the same reason: the
+   * alternative is completing at the declared length with shifted bytes, which decodes
+   * into plausible numbers.
+   *
+   * ⚠️ This REPLACED a `multi-frame` member meaning "a First Frame arrived where none
+   * can exist". One can, and does — A8 bank-1 index 278, 2026-09-14 — and it is now
+   * assembled rather than reported. `VcuFrame` in ./param-codec.ts keeps its own
+   * `multi-frame`, which is a different claim about a different path.
+   */
+  | { status: "abandoned"; reason: string }
   /** Something answered in a shape the service does not define. */
   | { status: "unrecognised"; reason: string }
   /**
@@ -87,8 +119,22 @@ export type VcuReadResult =
    */
   | { status: "not-sent"; reason: string };
 
+/**
+ * What a read observed about THIS PROCESS, as against about the bike.
+ *
+ * ⚠️ Carried on every read since #223, because a read can now answer a First Frame and
+ * this is the number that says whether it did so in time. ../can/obd-dtc.ts measured
+ * 4/12 transfers completing at 0 ms of added delay and 1/12 at 40 ms, so a late flow
+ * control is the first thing to suspect when a wide record comes back `stalled` — and
+ * without this it would be measured by the transport and then thrown away.
+ */
+export interface VcuReadMeasurement {
+  /** Kernel arrival of the First Frame → our flow control. Null when the reply needed none. */
+  flowControlLatency: ArrivalLatency | null;
+}
+
 /** How one parameter read came out. Resolves; nothing here rejects. */
-export type VcuReadOutcome = VcuReadTarget & VcuReadResult;
+export type VcuReadOutcome = VcuReadTarget & VcuReadResult & VcuReadMeasurement;
 
 /** What was asked in a one-off probe: any target, any bank, any index. */
 export interface VcuProbeTarget {
@@ -100,17 +146,17 @@ export interface VcuProbeTarget {
 }
 
 /** How one probe came out. Same outcomes as a sweep read — only the identity differs. */
-export type VcuProbeOutcome = VcuProbeTarget & VcuReadResult;
+export type VcuProbeOutcome = VcuProbeTarget & VcuReadResult & VcuReadMeasurement;
 
 /**
  * How one multi-frame exchange came out.
  *
- * Deliberately NOT folded into `VcuReadResult`. That union's `multi-frame` member
- * means "a First Frame arrived where none can exist, so an assumption is wrong",
- * which is still exactly right for a bank-1 parameter read and must keep meaning
- * that. Here a First Frame is the normal case, and the failures are different
- * ones — a transfer that stalled halfway is not the same claim as a micro that
- * said nothing.
+ * Deliberately NOT folded into `VcuReadResult`, even now that both go through one
+ * transport. What a reply MEANS differs: a parameter read is decoded against the
+ * identifier it echoed, these five against the service byte they name, and a `reply`
+ * here can carry a refusal while still being a successful exchange. The two unions
+ * agree about `abandoned` on purpose, because that one is a claim about the framing
+ * and the framing is the part they share.
  */
 export type VcuMultiFrameOutcome =
   /**
@@ -199,6 +245,12 @@ export interface VcuKwpClient {
    * Separate from `stop()` because a bulk log read must be interruptible without
    * killing the client that has to send `0x37` afterwards to close the transfer
    * politely. `stop()` is the shutdown; this is the pause button.
+   *
+   * ⚠️ "Multi-frame" here names the TRANSPORT, not the reply's shape, and since a
+   * parameter read uses that transport this now reaches one. No caller is affected
+   * today — ./freeze-frame-log.ts drives a client of its own that never reads
+   * parameters — but a caller sharing one would cancel whichever exchange is in the
+   * slot, which is no longer only a bulk read.
    */
   cancelMultiFrameRead: (reason: string) => boolean;
   /** Stops accepting work and clears any timer, so the process can exit. */
@@ -234,6 +286,23 @@ const SESSION_IDLE_LIMIT_MS = 1500;
 
 const DEFAULT_RESPONSE_TIMEOUT_MS = 300;
 const DEFAULT_PACE_MS = 10;
+
+/**
+ * Largest reply payload a parameter read will assemble.
+ *
+ * The widest record anything here describes is a 4-byte DWORD, so the longest reply that
+ * is not a surprise is `62 <hi> <lo>` plus 4 = 7 bytes. 32 leaves room for a record four
+ * times wider before the cap is what stops a read, which matters because an unexpected
+ * LENGTH is the evidence that a width is wrong — and the declared length survives in the
+ * abandonment's reason either way, so the cap costs no evidence even when it fires.
+ *
+ * ⚠️ Chosen here rather than inherited: ../diagnostics/extended-iso-tp.ts' constructor
+ * asks each caller to state the largest reply its own service can justify, and says in as
+ * many words that it is "deliberately not large enough for anything". It derives two caps —
+ * 6 contributing frames (`maxFramesFor`) and 22 frames per exchange — so a reply abandoned
+ * for frame count on this path was over one of those.
+ */
+const READ_MAX_PAYLOAD_BYTES = 32;
 
 /**
  * Multi-frame defaults.
@@ -323,7 +392,10 @@ export function createVcuKwpClient(channel: RawChannel, options: VcuKwpClientOpt
   };
   return {
     handleFrame: (id, data, arrival) => handleFrame(context, id, data, arrival),
-    openSession: target => openSession(context, target),
+    // The public contract stays a boolean: no caller outside this file needs to tell
+    // our own refusal from the micro's silence, and `performRead` — which does — reads
+    // `SessionAttempt` directly.
+    openSession: async target => (await openSession(context, target)).opened,
     ping: target => ping(context, target),
     readParameter: (micro, index) => readParameter(context, micro, index),
     probe: (target, bank, index) => probe(context, target, bank, index),
@@ -381,45 +453,19 @@ async function multiFrameExchange(
   request: VcuMultiFrameRequest,
   overrides: VcuMultiFrameOptions = {}
 ): Promise<VcuMultiFrameOutcome> {
-  if (context.stopped) {
-    return { status: "not-sent", reason: "client stopped" };
+  const busy = busyReason(context);
+  if (busy !== null) {
+    return { status: "not-sent", reason: busy };
   }
-  if (context.pending) {
-    const reason = "a request was already in flight";
-    console.warn(`vcu: ${reason} — refusing to interleave a multi-frame read`);
-    return { status: "not-sent", reason };
-  }
-  if (!(await ensureSession(context, micro))) {
-    return { status: "no-session", reason: `${micro} did not answer 10 81` };
+  const session = await ensureSession(context, micro);
+  if (!session.opened) {
+    return session.notSent === null
+      ? { status: "no-session", reason: `${micro} did not answer 10 81` }
+      : { status: "not-sent", reason: session.notSent };
   }
 
   const expectedService = expectedResponseService(request);
-  const settings = { ...context.multiFrame, ...overrides };
-  const transfer = startMultiFrameTransfer({
-    target: micro,
-    requestPayload: encodeMultiFrameRequestPayload(request),
-    send: frame =>
-      context.channel.send({ id: canIdsFor(micro).request, ext: false, rtr: false, data: Buffer.from(frame) }),
-    maxPayloadBytes: settings.maxPayloadBytes,
-    firstReplyTimeoutMs: settings.firstReplyTimeoutMs,
-    transferTimeoutMs: settings.transferTimeoutMs,
-    requestFlowControlTimeoutMs: settings.requestFlowControlTimeoutMs,
-  });
-  context.pending = { kind: "multi-frame", transfer };
-  context.pendingResponseCanId = canIdsFor(micro).response;
-
-  const result = await transfer.finished;
-  if (context.pending?.kind === "multi-frame" && context.pending.transfer === transfer) {
-    context.pending = null;
-  }
-  context.pendingResponseCanId = null;
-  if (result.kind === "payload") {
-    context.lastExchangeAt[micro] = monotonicNow();
-  }
-  // Paced on the way OUT, like every other exchange here, so every path through
-  // this client is polite to a bus shared with the ABS and the BMS by default
-  // rather than by the caller remembering to be.
-  await sleep(context.paceMs);
+  const result = await runTransfer(context, micro, encodeMultiFrameRequestPayload(request), overrides);
 
   switch (result.kind) {
     case "payload":
@@ -451,6 +497,79 @@ async function multiFrameExchange(
   }
 }
 
+/**
+ * Why this client cannot take another exchange right now, or null.
+ *
+ * ⚠️ Asked BEFORE the session is opened, deliberately. With a second request already in
+ * flight, `ensureSession` would itself be refused and the caller would be told the micro
+ * did not answer `10 81` — a claim about the bike, for a fault that is entirely ours.
+ */
+function busyReason(context: ClientContext): string | null {
+  if (context.stopped) {
+    return "client stopped";
+  }
+  if (context.pending) {
+    const reason = "a request was already in flight";
+    console.warn(`vcu: ${reason} — refusing to interleave a second one`);
+    return reason;
+  }
+  return null;
+}
+
+/**
+ * Runs one transfer to completion in the one-in-flight slot, and paces afterwards.
+ *
+ * The caller owns the session and the decode; this owns the slot, the socket and the
+ * pace, so a parameter read and a `0x17` differ only in the bytes they hand over and
+ * what they make of what comes back.
+ *
+ * ⚠️ `requestPayload` is raw bytes, which is the one shape this client's safety case says
+ * does not exist — so: it is module-private, and both callers hand it a payload built and
+ * allowlisted by a closed union (`buildRequestPayload`, `encodeMultiFrameRequestPayload`).
+ * Neither can express a write, and nothing widens by their sharing a transport.
+ */
+async function runTransfer(
+  context: ClientContext,
+  micro: VcuTarget,
+  requestPayload: Uint8Array,
+  overrides: VcuMultiFrameOptions
+): Promise<MultiFrameResult> {
+  const busy = busyReason(context);
+  if (busy !== null) {
+    // Both callers ask the same question before opening a session, where the answer
+    // makes a better message. This is the guard on the slot itself — the `await` in
+    // between is real — and it is loud rather than quiet for that reason.
+    return { kind: "not-sent", reason: busy, flowControlLatency: null };
+  }
+  const settings = { ...context.multiFrame, ...overrides };
+  const transfer = startMultiFrameTransfer({
+    target: micro,
+    requestPayload,
+    send: frame =>
+      context.channel.send({ id: canIdsFor(micro).request, ext: false, rtr: false, data: Buffer.from(frame) }),
+    maxPayloadBytes: settings.maxPayloadBytes,
+    firstReplyTimeoutMs: settings.firstReplyTimeoutMs,
+    transferTimeoutMs: settings.transferTimeoutMs,
+    requestFlowControlTimeoutMs: settings.requestFlowControlTimeoutMs,
+  });
+  context.pending = { kind: "multi-frame", transfer };
+  context.pendingResponseCanId = canIdsFor(micro).response;
+
+  const result = await transfer.finished;
+  if (context.pending?.kind === "multi-frame" && context.pending.transfer === transfer) {
+    context.pending = null;
+  }
+  context.pendingResponseCanId = null;
+  if (result.kind === "payload") {
+    context.lastExchangeAt[micro] = monotonicNow();
+  }
+  // Paced on the way OUT, like every other exchange here, so every path through
+  // this client is polite to a bus shared with the ABS and the BMS by default
+  // rather than by the caller remembering to be.
+  await sleep(context.paceMs);
+  return result;
+}
+
 async function readParameter(context: ClientContext, micro: VcuMicro, index: number): Promise<VcuReadOutcome> {
   const identity: VcuReadTarget = { micro, index, identifier: identifierForIndex(index) };
   return { ...identity, ...(await performRead(context, micro, CALIBRATION_BANK, index)) };
@@ -470,44 +589,94 @@ async function probe(context: ClientContext, target: VcuTarget, bank: number, in
   return { ...identity, ...(await performRead(context, target, bank, index)) };
 }
 
-/** The read itself, shared by the sweep and the probe so there is one session/retry/decode path. */
+/**
+ * The read itself, shared by the sweep and the probe so there is one session/retry/decode path.
+ *
+ * ⚠️ It goes through the MULTI-FRAME transport, and every read does, not only the wide
+ * ones. The request bytes are unchanged — `segmentRequestPayload` emits the same Single
+ * Frame `buildRequestFrame` does for a 3-byte payload — and a Single Frame reply still
+ * completes on the first frame pushed. What it buys is the reply that does not fit: A8
+ * answered bank-1 index 278 with a 7-byte First Frame on 2026-09-14 and this repo could
+ * not assemble it. The alternative, asking again after seeing a First Frame, would meet a
+ * micro mid-ISO-TP-abort on a guess about its N_Bs window that cannot be tested from here.
+ * docs/vcu-parameters.md §9.
+ */
 async function performRead(
   context: ClientContext,
   micro: VcuTarget,
   bank: number,
   index: number
-): Promise<VcuReadResult> {
-  const target = { identifier: identifierFor(bank, index) };
-  if (context.stopped) {
-    return { status: "not-sent", reason: "client stopped" };
+): Promise<VcuReadResult & VcuReadMeasurement> {
+  const identifier = identifierFor(bank, index);
+  const busy = busyReason(context);
+  if (busy !== null) {
+    return { status: "not-sent", reason: busy, flowControlLatency: null };
   }
-  if (!(await ensureSession(context, micro))) {
-    return { status: "no-session", reason: `${micro} did not answer 10 81` };
+  const session = await ensureSession(context, micro);
+  if (!session.opened) {
+    return { ...sessionFailure(session, micro, "did not answer 10 81"), flowControlLatency: null };
   }
 
-  let result = await exchange(context, micro, { kind: "read-parameter", bank, index });
-  if (result.kind === "timeout") {
+  // Both hoisted: the retry must run under the same bytes and the same settings as the
+  // first attempt, and a reader should not have to prove that from two call sites.
+  const requestPayload = buildRequestPayload({ kind: "read-parameter", bank, index });
+  const transferOptions = readTransferOptions(context);
+  let result = await runTransfer(context, micro, requestPayload, transferOptions);
+  if (result.kind === "timeout" && result.stage === "first-reply") {
     // Far and away the likeliest cause of silence is the session having expired
     // while we were doing something else, so re-open and ask once more before
     // reporting the bike as unresponsive. Exactly one retry: past that, a second
     // silence is information, and hammering a shared bus to re-establish it is not
     // a trade worth making (same reasoning as obd-dtc.ts' "only a stall is retried").
-    if (!(await openSession(context, micro))) {
-      return { status: "no-session", reason: `${micro} stopped answering 10 81 mid-read` };
+    //
+    // ⚠️ ONLY on `first-reply`. A stall AFTER a First Frame is not a stale session —
+    // the micro demonstrably answered — so the retry's whole premise is absent, and
+    // asking again would put a second request on a micro that is still transmitting
+    // the first reply.
+    const reopened = await openSession(context, micro);
+    if (!reopened.opened) {
+      return { ...sessionFailure(reopened, micro, "stopped answering 10 81 mid-read"), flowControlLatency: null };
     }
-    result = await exchange(context, micro, { kind: "read-parameter", bank, index });
+    result = await runTransfer(context, micro, requestPayload, transferOptions);
   }
-  if (result.kind === "not-sent") {
-    return { status: "not-sent", reason: result.reason };
-  }
-  if (result.kind === "timeout") {
-    return { status: "no-response" };
-  }
-  if (result.frame.kind === "multi-frame") {
-    return { status: "multi-frame", totalLength: result.frame.totalLength };
-  }
+  // ⚠️ ONE attachment point, which is what ./multiframe-transfer.ts's `settle` earned
+  // its comment for: a stalled read is exactly the case the measurement exists for, so
+  // it must not be droppable by a branch someone adds later and forgets to spread it on.
+  return { ...describeReadResult(result, identifier), flowControlLatency: result.flowControlLatency };
+}
 
-  const reply = decodeParameterReply(result.frame.payload, target.identifier);
+/** What one finished transfer means for a parameter read. Pure. */
+function describeReadResult(result: MultiFrameResult, identifier: number): VcuReadResult {
+  switch (result.kind) {
+    case "payload":
+      return describeReadPayload(result.payload, identifier);
+    case "timeout":
+      return describeReadTimeout(result.stage);
+    case "abandoned":
+      return { status: "abandoned", reason: result.reason };
+    // "We stopped", not "the bike went quiet" — the same claim `stop()` made before this
+    // path assembled anything, and ./sweep.ts discards an in-flight outcome on abort on
+    // the strength of it. A cancel and a dead socket are one answer to a caller here.
+    case "cancelled":
+    case "not-sent":
+      return { status: "not-sent", reason: result.reason };
+  }
+}
+
+/**
+ * The transfer settings a parameter read runs under.
+ *
+ * ⚠️ `firstReplyTimeoutMs` is the CLIENT's `responseTimeoutMs`, not the multi-frame
+ * default. A read's reply window is the caller's to set and has been since before any of
+ * this existed; inheriting 300 ms here would quietly ignore whatever the caller asked for.
+ */
+function readTransferOptions(context: ClientContext): VcuMultiFrameOptions {
+  return { maxPayloadBytes: READ_MAX_PAYLOAD_BYTES, firstReplyTimeoutMs: context.responseTimeoutMs };
+}
+
+/** One assembled reply, decoded against the identifier that was asked for. */
+function describeReadPayload(payload: Uint8Array, identifier: number): VcuReadResult {
+  const reply = decodeParameterReply(payload, identifier);
   switch (reply.kind) {
     case "record":
       return { status: "read", record: reply.record };
@@ -527,17 +696,53 @@ async function performRead(
   }
 }
 
-async function openSession(context: ClientContext, micro: VcuTarget): Promise<boolean> {
+/**
+ * A timeout, by the window it happened in.
+ *
+ * ⚠️ A switch over all three stages with NO `default`, so a fourth `TransferStage` is a
+ * compile error here rather than silently inheriting whatever the last branch said. That
+ * is the whole payment: the `request-flow-control` branch is unreachable from a read — a
+ * 3-byte request is one frame, so nothing is ever outstanding for a micro to be asked
+ * about — and it says so in its own reason rather than being folded into a neighbour.
+ */
+function describeReadTimeout(stage: TransferStage): VcuReadResult {
+  switch (stage) {
+    case "first-reply":
+      return { status: "no-response" };
+    case "reply-transfer":
+      return { status: "stalled", reason: "a First Frame arrived and the rest of the reply never did" };
+    case "request-flow-control":
+      return {
+        status: "stalled",
+        reason: "no flow control for a request of ours — impossible for a read, which is always one frame",
+      };
+  }
+}
+
+/**
+ * Why a session was not opened — OURS or the micro's.
+ *
+ * ⚠️ A boolean here was one layer too high. `exchange` knows it never transmitted, and
+ * for two reasons (we stopped, or another exchange holds the slot); collapsing that to
+ * false made the caller guess the cause back from `context.stopped`, which covered one
+ * of the two and reported the other as the bike being asleep. The reason travels now.
+ */
+type SessionAttempt = { opened: true } | { opened: false; notSent: string | null };
+
+async function openSession(context: ClientContext, micro: VcuTarget): Promise<SessionAttempt> {
   const result = await exchange(context, micro, { kind: "start-session" });
   const opened = result.kind === "reply" && result.frame.kind === "payload" && isSessionOpened(result.frame.payload);
   // Cleared rather than left stale on failure: believing a session is open when it
   // is not turns every subsequent read into a silent one.
   context.lastExchangeAt[micro] = opened ? monotonicNow() : null;
-  return opened;
+  if (opened) {
+    return { opened: true };
+  }
+  return { opened: false, notSent: result.kind === "not-sent" ? result.reason : null };
 }
 
 async function ping(context: ClientContext, micro: VcuTarget): Promise<boolean> {
-  if (!(await ensureSession(context, micro))) {
+  if (!(await ensureSession(context, micro)).opened) {
     return false;
   }
   const result = await exchange(context, micro, { kind: "tester-present" });
@@ -545,12 +750,26 @@ async function ping(context: ClientContext, micro: VcuTarget): Promise<boolean> 
 }
 
 /** Opens a session only when the last one is believed to have expired. */
-async function ensureSession(context: ClientContext, micro: VcuTarget): Promise<boolean> {
+async function ensureSession(context: ClientContext, micro: VcuTarget): Promise<SessionAttempt> {
   const lastExchangeAt = context.lastExchangeAt[micro] ?? null;
   if (lastExchangeAt !== null && since(lastExchangeAt) < SESSION_IDLE_LIMIT_MS) {
-    return true;
+    return { opened: true };
   }
   return openSession(context, micro);
+}
+
+/**
+ * A failed session open, as an outcome — ours or the micro's, never a guess.
+ *
+ * `notSent` is set only when nothing reached the bus, which is the one case where
+ * blaming the micro would be a claim about the motorcycle for a fault of ours.
+ * ./probe.ts renders `no-session` as "either nothing is at this address, or it is
+ * asleep", so this is the difference between a diagnosis and a wild goose chase.
+ */
+function sessionFailure(attempt: { notSent: string | null }, micro: VcuTarget, when: string): VcuReadResult {
+  return attempt.notSent === null
+    ? { status: "no-session", reason: `${micro} ${when}` }
+    : { status: "not-sent", reason: attempt.notSent };
 }
 
 /**
@@ -584,10 +803,9 @@ function exchange(context: ClientContext, micro: VcuTarget, request: VcuRequest)
     // the guarantee belongs for all three callers.
     return Promise.resolve({ kind: "not-sent", reason: "client stopped" });
   }
-  if (context.pending) {
-    const reason = "a request was already in flight";
-    console.warn(`vcu: ${reason} — refusing to interleave a second one`);
-    return Promise.resolve({ kind: "not-sent", reason });
+  const busy = busyReason(context);
+  if (busy !== null) {
+    return Promise.resolve({ kind: "not-sent", reason: busy });
   }
   const frame = Buffer.from(buildRequestFrame(micro, request));
   const canIds = canIdsFor(micro);

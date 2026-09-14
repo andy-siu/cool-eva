@@ -326,12 +326,19 @@ export function writeTargets(): WriteTarget[] {
   return [...CURATED_WRITE_TARGETS, ...generated];
 }
 
-/** The widest value the record can physically carry. NOT a safe range — see below. */
+/**
+ * The widest value the record can physically carry. NOT a safe range — see below.
+ *
+ * ⚠️ The width comes from `recordLengthFor`, not from a `type === "BYTE" ? 8 : 16`. That
+ * ternary answered 16 bits for every type that was not BYTE, so the first 4-byte record
+ * named in a table would have been offered a 16-bit range on a 32-bit cell — a bound that
+ * looks researched, is wrong, and nothing downstream could contradict.
+ */
 function datatypeBounds(parameter: VcuParameter): { min: number; max: number } {
   if (parameter.type === "BOOL") {
     return { min: 0, max: 1 };
   }
-  const bits = parameter.type === "BYTE" ? 8 : 16;
+  const bits = recordLengthFor(parameter.type) * 8;
   return parameter.signed ? { min: -(2 ** (bits - 1)), max: 2 ** (bits - 1) - 1 } : { min: 0, max: 2 ** bits - 1 };
 }
 
@@ -469,6 +476,12 @@ export function planBitWrite(name: string, bitKey: string, on: boolean, currentV
     // The current word is the base every bit of the new one is copied from, so a
     // nonsense one would be written straight back into the EEPROM with one bit
     // changed. Refused rather than masked into range.
+    //
+    // ⚠️ `0xffff` is a BIT-FIELD bound and deliberately not `datatypeBounds`. Every
+    // `control.kind === "bits"` target is curated, and the only one is VSM_CONFIG_1
+    // (index 16, WORD U), so 16 bits is right by the list rather than by the type. It
+    // stays literal for that reason — a bit field on a wider record would need a bit
+    // map, not a wider mask.
     return { ok: false, reason: `the current ${target.name} reads ${currentValue}, which is not a 16-bit word` };
   }
   const next = on ? (currentValue | bit.mask) >>> 0 : (currentValue & ~bit.mask) >>> 0;
@@ -498,6 +511,7 @@ function rebuildBitPlan(target: WriteTarget, value: number, previousValue: numbe
   if (target.control.kind !== "bits") {
     return { ok: false, reason: `${target.name} is not a bit field` };
   }
+  // ⚠️ Bit-field bound, curated targets only — see the note in `planBitWrite`.
   if (!Number.isInteger(value) || value < 0 || value > 0xffff) {
     return { ok: false, reason: `${value} is not a 16-bit word` };
   }

@@ -1,12 +1,12 @@
 import type { RawChannel } from "socketcan";
 import type { FrameArrival } from "../can/frame-arrival.ts";
 import { ageMs, latestValue } from "../can/signals.ts";
-import { acquireBus, type BusLease } from "./bus-lease.ts";
+import { acquireBus, busHeldBy, type BusLease } from "./bus-lease.ts";
 import { evaluateServiceGate, sampleServiceGate, type ServiceGateVerdict } from "./service-gate.ts";
 import { startParameterSweep, type RunningParameterSweep } from "./sweep.ts";
 import { startProbe, type VcuProbeReading, type VcuProbeRequest } from "./probe.ts";
 import { describeMeasurement, startLifetimeRead, type LifetimeReadResult } from "./lifetime-read.ts";
-import { holdObdPoller } from "../can/obd.ts";
+import { withObdPollerHold } from "../can/obd-hold.ts";
 import { parameterTable, type VcuMicro } from "./param-table.ts";
 import type { VcuParameterRow } from "./snapshot.ts";
 
@@ -22,8 +22,10 @@ import type { VcuParameterRow } from "./snapshot.ts";
 //     check precedes the socket rather than racing it.
 //  2. A watchdog here re-checks the gate every GATE_WATCH_INTERVAL_MS and calls `abort`
 //     from outside the loop. That is what bounds the worst case: one `readParameter` can
-//     spend ~1.2 s inside itself, and without the watchdog a bike that started moving
-//     during one would keep four more frames on the bus until the loop came back round.
+//     spend ~1.33 s inside itself, and without the watchdog a bike that started moving
+//     during one would keep five more frames on the bus until the loop came back round.
+//     (Both numbers grew with #223: a reply that starts and stalls costs a transfer
+//     window on top of the reply window, and a First Frame draws a flow control.)
 //
 // `abort` calls `client.stop()`, which refuses every subsequent transmit, so the sweep
 // cannot emit one more frame on its way out. The session it opened is left to expire by
@@ -84,9 +86,10 @@ export interface VcuReadRunner {
    * Reads the bike's lifetime battery statistics — components 51 and 52 — in this
    * process, behind the same gate and the same single-flight as a sweep or a probe.
    *
-   * ⚠️ It also PARKS THE 2 Hz OBD POLLER for the duration, which nothing else here
-   * does: this is the only read whose reply is multi-frame, and the poller is the
-   * documented cause of that channel's failures (src/can/obd.ts). The result carries
+   * ⚠️ It PARKS THE 2 Hz OBD POLLER for the duration, and so does a probe since #223:
+   * a parameter read's reply can be multi-frame too, and the poller is the documented
+   * cause of that channel's failures (src/can/obd.ts). A SWEEP still does not park —
+   * see `runParameterSweep`. The result carries
    * how late our flow control was, which is the number this whole path exists to
    * produce. Resolves with a refusal rather than throwing.
    */
@@ -144,16 +147,27 @@ export interface VcuReadRunnerOptions {
  */
 const GATE_WATCH_INTERVAL_MS = 200;
 
-/** Every status a row can carry, so a tally always has all the keys and the page never sees `undefined`. */
-const ROW_STATUSES: VcuParameterRow["status"][] = [
-  "read",
-  "refused",
-  "no-response",
-  "no-session",
-  "multi-frame",
-  "unrecognised",
-  "not-sent",
-];
+/**
+ * Every status a row can carry, at zero, so a tally always has all the keys and the page
+ * never sees `undefined`.
+ *
+ * ⚠️ A RECORD, not an array — so adding a status to the union is a missing-property error
+ * here and retiring one an excess-property error. As a `VcuParameterRow["status"][]` only
+ * the retirement was caught, and an added status simply vanished from the phone's
+ * breakdown (`public/views/service-mode.js` renders whatever keys the tally has) — the
+ * failure you would only notice by the thing you added it to see not being there. Same
+ * reasoning as `RECORD_LENGTH_BYTES` in ../vcu/param-file.ts.
+ */
+const ZERO_BY_STATUS: VcuReadTally["byStatus"] = {
+  "read": 0,
+  "refused": 0,
+  "no-response": 0,
+  "no-session": 0,
+  "stalled": 0,
+  "abandoned": 0,
+  "unrecognised": 0,
+  "not-sent": 0,
+};
 
 interface RunnerContext extends VcuReadRunnerOptions {
   sweep: RunningParameterSweep | null;
@@ -235,6 +249,18 @@ function readGate(): ServiceGateVerdict {
  * Single-flight WITHIN this process, which is now the whole story: the sweep runs
  * here, so there is no longer a second copy of it anyone can start over ssh, and no
  * lockfile to go stale on a Pi that loses power.
+ *
+ * ⚠️ A SWEEP DOES NOT PARK THE OBD POLLER, where a probe and a lifetime read do. Two
+ * reasons, and the second is the one that would change: a sweep can run for a minute and
+ * `MAX_HOLD_MS` in ../can/obd-hold.ts caps a hold at 15 s, so parking it is not on offer
+ * without dropping telemetry for longer than the hold allows; and none of the 277 indices
+ * `params.ecf` describes can produce a multi-frame reply at all — every record there is 1
+ * or 2 bytes, so no transfer window ever opens for the poller to land in.
+ *
+ * ⚠️ **Extending the sweep past those 277 — #219's A8 block, say — changes that**, and
+ * whoever does it inherits this decision: indices 278, 279 and 626 are 4-byte records, and
+ * a mode-01 request arriving mid-transfer is what ../can/obd.ts records as making the VCU
+ * abandon it. Park per read, or sweep the wide ones through the probe path.
  */
 function start(context: RunnerContext): { started: boolean; reason: string | null } {
   const ready = checkPreconditions(context, "a parameter read");
@@ -345,6 +371,18 @@ function checkBusFreeRefusals(
   if (!verdict.safe) {
     return { ok: false, reason: `the bike is not safe to service — ${verdict.blockers.join("; ")}` };
   }
+  // ⚠️ The CROSS-FILE lease, and it has to be asked HERE rather than left to
+  // `checkPreconditions`. Since a one-shot read parks the OBD poller first, a probe
+  // pressed while the trouble-code clear holds the bus would otherwise spend the park
+  // wait — up to 6 s — and come back blaming the poller, for a bus that was never going
+  // to be free. `busHeldBy` costs nothing and names who has it.
+  const holder = busHeldBy();
+  if (holder !== null) {
+    // ⚠️ Word for word what `checkPreconditions` says when `acquireBus` refuses below,
+    // because it is the same refusal found earlier — two wordings for one condition is
+    // what makes a journal ungreppable.
+    return { ok: false, reason: `${holder} is using the bus — one thing at a time` };
+  }
   return { ok: true, channel };
 }
 
@@ -357,7 +395,7 @@ function checkBusFreeRefusals(
  * to resume.
  *
  * The gate watchdog runs for it too. A single read is short, but "short" here means
- * up to ~1.2 s of a bike that might have started moving, and the rule this feature
+ * up to ~1.33 s of a bike that might have started moving, and the rule this feature
  * rests on is that nothing transmits once the gate shuts — not that nothing
  * transmits for long.
  */
@@ -367,7 +405,20 @@ async function runProbe(context: RunnerContext, request: VcuProbeRequest): Promi
   // about, and a probe that hangs or is aborted by the gate watchdog would otherwise
   // never say which one it was — on a bike you cannot attach a debugger to.
   console.log(`vcu-probe: reading bank ${request.bank} index ${request.index} off ${request.target}`);
-  const outcome = await runOneShotBusModule(context, "a probe", channel => startProbe({ ...request, channel }));
+  // ⚠️ THE POLLER IS PARKED, as it is for a lifetime read and for the same reason: since
+  // #223 a probe's reply can be multi-frame, and ../can/obd.ts records that "a request
+  // arriving mid-transfer is what makes the VCU abandon it". A probe is the read most
+  // likely to be pointed at a wide record — that is what it is for — so racing the 2 Hz
+  // poller would produce intermittent `stalled` outcomes indistinguishable from a micro
+  // that went quiet. A sweep does NOT park; see the note on `runParameterSweep`.
+  //
+  // ⚠️ Unconditionally, including for the 1- and 2-byte reads that cannot need it, which
+  // costs ~0.2-1 s of telemetry (the poller's park wait) on a manual button press. The
+  // cheaper form — park only when the name table says the record is wide — was weighed
+  // and rejected: it skips the park exactly where the table is WRONG about a parameter,
+  // which is the entire finding of #219 and the reason this path exists.
+  const what = "a probe";
+  const outcome = await runOneShotBusModule(context, what, channel => startProbe({ ...request, channel }));
   if (!outcome.ok) {
     console.log(`vcu-probe: ${request.target} bank ${request.bank} index ${request.index} — ${outcome.reason}`);
     return outcome;
@@ -387,17 +438,7 @@ async function runProbe(context: RunnerContext, request: VcuProbeRequest): Promi
  */
 async function runLifetimeRead(context: RunnerContext): Promise<LifetimeReadOutcomeOrRefusal> {
   const what = "a lifetime-statistics read";
-  const outcome = await runOneShotBusModule(
-    context,
-    what,
-    channel => startLifetimeRead({ channel }),
-    async () => {
-      const hold = await holdObdPoller(what);
-      return hold
-        ? { ok: true, release: hold.release }
-        : { ok: false, reason: "the OBD poller would not go quiet — a multi-frame read needs the bus to itself" };
-    }
-  );
+  const outcome = await runOneShotBusModule(context, what, channel => startLifetimeRead({ channel }));
   if (outcome.ok) {
     console.log(`vcu-read: lifetime statistics — ${describeMeasurement(outcome.result)}`);
   }
@@ -430,31 +471,51 @@ export interface OneShotBusModule<T = unknown> {
  *
  * The file is past the ~400 guideline and splitting it is its own migration. The seam,
  * so the next person does not have to find it: `OneShotBusModule`,
- * `runOneShotBusModule`, `PreparedResource`, `startWatchdog` and `startGateWatchdog`
+ * `runOneShotBusModule`, `runHeldOneShot`, `startWatchdog` and `startGateWatchdog`
  * are ~130 self-contained lines that already take the context as a parameter.
  */
 async function runOneShotBusModule<T>(
   context: RunnerContext,
   what: string,
-  start: (channel: RawChannel) => OneShotBusModule<T>,
-  prepare?: () => Promise<PreparedResource>
+  start: (channel: RawChannel) => OneShotBusModule<T>
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
-  // ⚠️ FIRST, and before `prepare` — every refusal that costs nothing to find out. A
-  // read refused for a switched-off bus must say so, not park the OBD poller for six
-  // seconds and then blame the poller.
+  // ⚠️ FIRST, and before the poller hold — every refusal that costs nothing to find
+  // out. A read refused for a switched-off bus must say so, not park the OBD poller for
+  // six seconds and then blame the poller.
   const free = checkBusFreeRefusals(context);
   if (!free.ok) {
     return free;
   }
-  const prepared = prepare ? await prepare() : { ok: true as const, release: () => {} };
-  if (!prepared.ok) {
-    return { ok: false, reason: prepared.reason };
-  }
-  // The lease comes after `prepare`, so the poller is already quiet before a session is
+  // ⚠️ UNCONDITIONAL, and through ../can/obd-hold.ts's wrapper rather than a park helper
+  // of our own. Both one-shot reads want the poller quiet for one reason — a reply that
+  // spans frames is abandoned by the VCU if a request lands mid-transfer (../can/obd.ts)
+  // — and #233 landed `withObdPollerHold` for exactly that, with one refusal sentence and
+  // the release in its own `finally`. A second helper here would be the third wording of
+  // one condition, which is what both of them were written to stop. A SWEEP does not come
+  // through this function at all; why it does not park is argued at `start`.
+  //
+  // The double `ok` is flattened on the way out: the wrapper reports whether the HOLD was
+  // granted, the body whether the READ succeeded, and a caller wants one answer.
+  const held = await withObdPollerHold(what, () => runHeldOneShot(context, what, start));
+  return held.ok ? held.result : held;
+}
+
+/**
+ * One one-shot read, with the poller already parked and the lease still to take.
+ *
+ * Split from `runOneShotBusModule` only so the hold can wrap it: everything here runs
+ * inside `withObdPollerHold`'s `finally`, so the poller is released on every path out of
+ * it, including a throw.
+ */
+async function runHeldOneShot<T>(
+  context: RunnerContext,
+  what: string,
+  start: (channel: RawChannel) => OneShotBusModule<T>
+): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
+  // The lease comes after the hold, so the poller is already quiet before a session is
   // opened — the ordering the lifetime read's own header argues for.
   const ready = checkPreconditions(context, what);
   if (!ready.ok) {
-    prepared.release();
     return { ok: false, reason: ready.reason };
   }
   const watchdog = startWatchdog(reason => context.oneShot?.module.abort(reason));
@@ -475,12 +536,8 @@ async function runOneShotBusModule<T>(
     clearInterval(watchdog);
     context.oneShot = null;
     ready.lease.release();
-    prepared.release();
   }
 }
-
-/** Something held for the duration of a read — today, the parked OBD poller. */
-type PreparedResource = { ok: true; release: () => void } | { ok: false; reason: string };
 
 function cancel(context: RunnerContext): boolean {
   if (!context.sweep) {
@@ -506,8 +563,10 @@ function cancel(context: RunnerContext): boolean {
 async function stop(context: RunnerContext): Promise<void> {
   const sweep = context.sweep;
   stopGateWatchdog(context);
-  // A one-shot module is aborted and not waited for. A probe is at most two reply
-  // windows and holds nothing; a lifetime read holds a durable store write, but that
+  // A one-shot module is aborted and not waited for. A probe holds nothing and is
+  // bounded by two reply windows plus, on a reply that starts and stalls, one transfer
+  // window each — ~1.33 s worst case since #223, not the ~600 ms this used to imply;
+  // a lifetime read holds a durable store write, but that
   // write happens AFTER the lease is released and outside the module's own promise, so
   // awaiting the module here would not protect it either — ./lifetime-read.ts and the
   // caller in ../http/lifetime-read.ts own that ordering. A sweep is the exception,
@@ -536,8 +595,9 @@ async function stop(context: RunnerContext): Promise<void> {
  * loop.
  *
  * This is the half of auto-exit that bounds the worst case. The sweep's own check
- * runs between parameters, which is every ~310 ms in the good case but up to ~1.2 s
- * when a read times out and the session is re-opened; a bike that starts moving
+ * runs between parameters, which is every ~310 ms in the good case but up to ~1.33 s
+ * when a read times out and the session is re-opened, or when a reply starts and stalls;
+ * a bike that starts moving
  * during one of those would otherwise keep several more frames on the bus. Calling
  * `abort` from here settles the request in flight immediately and blocks every
  * transmit after it.
@@ -632,9 +692,14 @@ function readState(context: RunnerContext): VcuReadState {
 
 /** Counts rows the two ways the page needs them. Pure. */
 export function tallyOf(rows: VcuParameterRow[]): VcuReadTally {
-  const byStatus = Object.fromEntries(ROW_STATUSES.map(status => [status, 0])) as VcuReadTally["byStatus"];
+  const byStatus = { ...ZERO_BY_STATUS };
   const perMicro = new Map<VcuMicro, { micro: VcuMicro; read: number; failed: number }>();
   for (const row of rows) {
+    // ⚠️ `?? 0` for a row that came off DISK, not for the union. `ZERO_BY_STATUS` seeds
+    // every status this build knows, and its type is what keeps that exhaustive — but
+    // `sweep.partial.jsonl` is `JSON.parse(...) as VcuParameterRow` (./snapshot-store.ts),
+    // so a row written by an older build can carry a status this one retired, and `+= 1`
+    // on a missing key puts NaN on the phone.
     byStatus[row.status] = (byStatus[row.status] ?? 0) + 1;
     const entry = perMicro.get(row.micro) ?? { micro: row.micro, read: 0, failed: 0 };
     if (row.status === "read") {

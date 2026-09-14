@@ -173,6 +173,32 @@ export class ExtendedIsoTpReassembler {
     }
   }
 
+  /**
+   * A frame addressed to US that this framing does not define.
+   *
+   * ⚠️ ABANDONED, NOT IGNORED — changed 2026-09-14, and the distinction is the whole
+   * point of the two words. `ignored` means "not ours, hand it back so whoever it
+   * belongs to still sees it"; every branch routed here has already passed the
+   * `frame[0] !== TESTER_ADDRESS` check, so it IS ours, and the OBD poller that shares
+   * this id range reads it under NORMAL addressing where `0xF1` is an undefined PCI it
+   * discards anyway. Calling it ambient traffic left the caller's window running out
+   * instead — which since #223 means a parameter read timing out as `first-reply`, the
+   * stage that RETRIES, putting a second `22` on a micro mid-ISO-TP-abort.
+   *
+   * ⚠️ TWO branches are deliberately NOT routed here, so the rule is narrower than
+   * "anything addressed to us that this framing does not define": it is "a frame whose
+   * SHAPE says it was meant to be part of this transfer, and is malformed". A Consecutive
+   * Frame with no First Frame carries no service byte and no identifier, so nothing in it
+   * can say which transfer it belongs to; an undefined PCI (`0x4`-`0xF`) is likelier to be
+   * a corrupt or foreign frame than a piece of ours. Abandoning on either would let one
+   * stray frame kill a healthy exchange — the mirror of the failure the sequence check
+   * exists to prevent.
+   */
+  #malformed(reason: string): ExtendedIsoTpResult {
+    this.reset();
+    return { status: "abandoned", reason };
+  }
+
   reset(): void {
     this.#payload = new Uint8Array(0);
     this.#filled = 0;
@@ -184,18 +210,15 @@ export class ExtendedIsoTpReassembler {
   #pushSingleFrame(frame: Uint8Array): ExtendedIsoTpResult {
     const length = frame[1] & 0x0f;
     if (length === 0) {
-      return { status: "ignored", reason: "single frame declaring zero payload bytes" };
+      return this.#malformed("single frame declaring zero payload bytes");
     }
     if (length > MAX_SINGLE_FRAME_PAYLOAD) {
       // Six is all that fits once the address and the PCI are paid for. A larger
       // claim is a frame from a different addressing mode, not a long single frame.
-      return {
-        status: "ignored",
-        reason: `single frame claims ${length} bytes, over the ${MAX_SINGLE_FRAME_PAYLOAD}-byte limit`,
-      };
+      return this.#malformed(`single frame claims ${length} bytes, over the ${MAX_SINGLE_FRAME_PAYLOAD}-byte limit`);
     }
     if (frame.length < 2 + length) {
-      return { status: "ignored", reason: `single frame claims ${length} bytes but carries ${frame.length - 2}` };
+      return this.#malformed(`single frame claims ${length} bytes but carries ${frame.length - 2}`);
     }
     // A single frame is a whole transfer, so anything half-received is stale.
     this.reset();
@@ -208,13 +231,13 @@ export class ExtendedIsoTpReassembler {
 
   #pushFirstFrame(frame: Uint8Array): ExtendedIsoTpResult {
     if (frame.length < 8) {
-      return { status: "ignored", reason: "first frame shorter than 8 bytes" };
+      return this.#malformed("first frame shorter than 8 bytes");
     }
     const totalLength = ((frame[1] & 0x0f) << 8) | frame[2];
     if (totalLength <= MAX_SINGLE_FRAME_PAYLOAD) {
       // Would have fitted in a single frame. Honouring it would leave us waiting
       // for a Consecutive Frame that is never coming.
-      return { status: "ignored", reason: `first frame declares only ${totalLength} bytes` };
+      return this.#malformed(`first frame declares only ${totalLength} bytes`);
     }
     if (totalLength > this.#maxPayloadBytes) {
       const reason = `first frame declares ${totalLength} bytes, over the ${this.#maxPayloadBytes} cap`;
