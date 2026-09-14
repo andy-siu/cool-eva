@@ -660,6 +660,64 @@ So the tile counts down against the TRUE temperature (`batt_temp_hi`, sourced fr
 
 ---
 
+## Fitting a 390 px phone — `style.css`
+
+The phone is 390 CSS px wide and the page may never be wider. It was, on the Faults tab, until #253 — measured on `de72711`, and pre-existing rather than anything #252 did; the lane that filed #253 measured the identical number from that PR's parent. `document.body.scrollWidth` read **449** against a `clientWidth` of 390, the page scrolled sideways, and in the light theme the strip past 390 drew as black bars down the side of the tiles, because the body's background stops where the body does.
+
+### The chain, and the two wrong versions of it
+
+One row did it: `B1000 · Position lights open circuit fault · freeze frame · expected`, the freeze-frame code on this bike with both suffixes at once. Every box below was measured in the rendered page — `getBoundingClientRect()` for the box, `getComputedStyle().gridTemplateColumns` for the track inside it:
+
+| element                                                             | its box    | its own column       |
+| ------------------------------------------------------------------- | ---------- | -------------------- |
+| `.code-line-text`, `white-space: nowrap`                            | —          | min-content 326.6 px |
+| `.code-line` (+ the 3.6 rem id column, the gaps, the 0.9 rem caret) | —          | min-content 414.6 px |
+| `.tile.span2` (+ 0.75 rem of side padding)                          | 440.63 px  | min-content 440.6 px |
+| `.tile-group`                                                       | 440.63 px  | `440.633px`          |
+| `.tile-group`                                                       | 440.63 px  | `440.633px`          |
+| **`.tile-group`, the outermost**                                    | **374 px** | **`440.633px`**      |
+| `.view`                                                             | 390 px     | `183px 183px`        |
+
+**The tile floors its column; the outermost group cannot follow it; the difference paints past the phone.** `.tile` has no `min-width`, so its automatic minimum is its content-based minimum — 440.6 px — and each single-column `.tile-group` above it is an implicit `auto` track that takes exactly that. The outermost group is where the chain breaks: it is a grid item of `.view` spanning `1 / -1`, and **an item spanning more than one track where any of them is flexible gets no content-based automatic minimum at all** (CSS Grid Level 1 §6.6: the content-based minimum applies only "if it spans more than one track in that axis, none of those tracks are flexible"). So it sits at its 374 px area with a 440.633 px column inside it. 8 px of `.view` padding + 440.6 = the 449 the body reports.
+
+⚠️ **Two earlier versions of this paragraph were wrong in opposite directions, which is why it is written out box by box.** The first said `.view`'s `1fr` tracks took the min-content and sized the page — false: they read `183px 183px` throughout, and injecting `minmax(0, 1fr)` there alone leaves the body at 449. The second said the tile overflowed its grid area — also false: the tile is exactly as wide as the column it floored, and the box that is narrower than its contents is the outermost `.tile-group`. Both stories predict the same screenshot and only the computed values tell them apart.
+
+⚠️ **And `1fr` really can be the whole bug — just not this one.** A **direct, non-spanning** tile in `.view` holding one unbreakable token pushes those tracks to `2733px 10.59px`; the spec exemption above is what spared #253, because its item spanned both columns. `.tile { min-width: 0 }` takes both shapes back to `183px 183px`, which is why the fix is on the item rather than on any of the three grids above it.
+
+### What fixes it, measured one line at a time
+
+Each variant injected into the rendered page on its own, at 390×844:
+
+| injected                                                     | `body.scrollWidth` | tile |
+| ------------------------------------------------------------ | ------------------ | ---- |
+| nothing (as shipped before #253)                             | 449                | 441  |
+| `.view { grid-template-columns: repeat(2, minmax(0, 1fr)) }` | **449**            | 441  |
+| `.tile-group { grid-template-columns: minmax(0, 1fr) }`      | 390                | 374  |
+| `.tile { min-width: 0 }`                                     | 390                | 374  |
+
+So `.tile { min-width: 0 }` is the fix, and it is the one that ships — the same line `.raw` has carried since `38f1ec1`, the rebuild that created the raw grid. Naming `.tile-group`'s implicit column does the same job by a different route and was dropped as redundant once the item itself can shrink; the `.view` edit was dropped because it does nothing at all.
+
+### Wrapping, not an ellipsis
+
+`.code-line-text` was `white-space: nowrap` + `text-overflow: ellipsis`. With the tile free to shrink, that clipping would also have fitted — truncated, at 374 px. It is the wrong answer for this screen: the Faults tab is the one place meant to be read carefully rather than glanced at, `· freeze frame` and `· expected` are the two suffixes that say why a row matters, and they sit at the END of exactly the longest lines. An ellipsis eats the part you needed. One row of today's list takes a second line for that (+19.5 px); the other five still fit on one.
+
+**What each wrapping option is worth**, min-content of that span, measured:
+
+| `.code-line-text`                     | min-content | body |
+| ------------------------------------- | ----------- | ---- |
+| `white-space: nowrap`                 | 326.6 px    | 449  |
+| wrapping, `overflow-wrap: normal`     | 53 px       | 390  |
+| wrapping, `overflow-wrap: break-word` | 53 px       | 390  |
+| wrapping, `overflow-wrap: anywhere`   | 10.6 px     | 390  |
+
+⚠️ **Dropping `nowrap` is what fixes the page; `anywhere` is insurance, not the fix** — an earlier version of this section claimed `break-word` "would still widen the page", which is false: it leaves the minimum at the longest word, 53 px, nowhere near the 374 px column. What `anywhere` buys is the case a word is longer than the column, which Energica's names can produce — it is why `.code-field` next door already uses it.
+
+### What the grid line protects, and what it does not
+
+⚠️ Worth being exact, because the obvious reading is too generous. With `.tile { min-width: 0 }` in place, appending a `white-space: nowrap` span to the stored-codes tile keeps the **tile** at 374 px — but `body.scrollWidth` still reports **3878**, because the span paints straight past the tile's edge and nothing in this stylesheet clips it. Take the line away and the tile itself becomes 3883.
+
+So the two halves guard different things and neither is decoration: **the wrap keeps the page the phone's width, and `min-width: 0` keeps the tile box the phone's width so that wrapping or clipping inside it can work at all.** That is also what makes each falsifiable on its own — `scripts/check-phone-width.ts` asserts the page width against the real fixture and the tile's box against a synthetic unbreakable probe, and reverting either line turns exactly one of them red. §11.8 of `docs/diagnostics-and-checks.md`.
+
 ## Light and dark — `lib/theme.js`, `style.css`
 
 The dark screen washes out in direct sun. `lib/theme.js` resolves one of two palettes and stamps it on `<html>` as `data-theme`; `style.css` carries both under the same token names.

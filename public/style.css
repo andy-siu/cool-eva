@@ -217,6 +217,13 @@ body {
 
 /* ---------- layout ---------- */
 
+/* The two-column grid every tab lays its tiles out in. ⚠️ `1fr` and not `minmax(0, 1fr)`,
+   and that is measured rather than preferred: take `min-width: 0` off `.tile` below and a
+   DIRECT tile with one unbreakable token really does push these tracks out, to
+   `2733px 10.59px`. Every other child here spans `1 / -1` (.hero, .section, .tile-group,
+   and the catch-all below), and a spanner over flexible tracks has no content-based minimum
+   at all — so with that line in place there is nothing left for a track minimum to do.
+   docs/dashboard-decisions.md. */
 .view {
   display: grid;
   gap: 0.5rem;
@@ -254,6 +261,11 @@ body {
   flex-direction: column;
   gap: 0.2rem;
   min-height: 88px;
+  /* ⚠️ Not decoration: without it a tile's automatic minimum is its own min-content, so one
+     unbreakable row makes the card wider than the phone and the page scrolls sideways —
+     #253, and removing this line re-opens it. `.raw` has carried the same line since the
+     raw grid was written. The measured chain: docs/dashboard-decisions.md. */
+  min-width: 0;
   transition: opacity 0.3s;
 }
 
@@ -1121,9 +1133,11 @@ body {
 
 /* ---------- stored trouble codes (faults view) ---------- */
 
-/* Thirty-nine of these have to fit on a phone, so one line each: the code on the
-   left at a fixed width so the codes form a readable column, the description
-   filling the rest and clipping rather than wrapping every row to two lines. */
+/* Thirty-nine of these have to fit on a phone: the code on the left at a fixed width so
+   the codes form a readable column, the description filling the rest. Long rows wrap
+   rather than clip — `· freeze frame · expected` are the two suffixes that say why a row
+   matters at all, they sit at the END of the longest lines, and that is exactly what an
+   ellipsis eats. Most rows still take one line; today's list wraps one. */
 .code-line {
   display: flex;
   gap: 0.5rem;
@@ -1141,9 +1155,12 @@ body {
 .code-line-text {
   flex: 1 1 auto;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Wrapping at all is what fixes #253: `white-space: nowrap` held this span's min-content
+     at 327 px. `anywhere` rather than `break-word` — the call `.code-field` makes below,
+     for the same reason — buys the rest: break-word leaves the minimum at the longest WORD
+     (53 px in today's list, which fits), `anywhere` takes it to one character, and only
+     that survives a name longer than the column. Energica's table is full of candidates. */
+  overflow-wrap: anywhere;
 }
 
 /* The open/closed marker on a code line that has a shortlist. Pushed to the right
