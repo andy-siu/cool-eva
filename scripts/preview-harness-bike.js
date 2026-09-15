@@ -225,6 +225,26 @@ const LIFETIME_READ = {
 const STATUS = {
   uptimeSeconds: 4173,
   waypoints: 4,
+  waypointsRefused: 4,
+  // Four saves and four refusals in FIRE order, as src/gps/waypoint-log.ts keeps them.
+  // Eight against a six-row preview, so the toggle and the "showing the newest 6"
+  // sentence are both on screen in the design gate; the newest of each outcome agrees
+  // with `waypoint_seq` / `waypoint_refusal` in PARKED_SIGNALS. Two constraints carry
+  // the rest: every save is the one Greenwich fixture point this repo allows
+  // (docs/route-map.md §"No coordinates anywhere"), and the code-6 refusal is pinned
+  // BY ITS TEXT in scripts/check-phone-width.ts — the longest sentence in
+  // WAYPOINT_REFUSAL_TEXT, and the `clockTrustworthy: false` row. Why each:
+  // docs/waypoints.md §"What the list can and cannot be short of".
+  waypointEvents: [
+    { outcome: "saved", sequence: 1, latitudeDeg: 51.4779, longitudeDeg: -0.0015, at: NOW - 95 * MINUTE },
+    { outcome: "refused", refusal: 6, at: NOW - 51 * MINUTE, clockTrustworthy: false },
+    { outcome: "saved", sequence: 2, latitudeDeg: 51.4779, longitudeDeg: -0.0015, at: NOW - 47 * MINUTE },
+    { outcome: "refused", refusal: 3, at: NOW - 39 * MINUTE, clockTrustworthy: true },
+    { outcome: "saved", sequence: 3, latitudeDeg: 51.4779, longitudeDeg: -0.0015, at: NOW - 22 * MINUTE },
+    { outcome: "refused", refusal: 1, at: NOW - 14 * MINUTE, clockTrustworthy: true },
+    { outcome: "saved", sequence: 4, latitudeDeg: 51.4779, longitudeDeg: -0.0015, at: NOW - 6 * MINUTE },
+    { outcome: "refused", refusal: 8, at: NOW - 3 * MINUTE, clockTrustworthy: true },
+  ],
   log: { files: 13, bytes: 4812442, enabled: true },
   groups: {
     battery: [17, 46],
@@ -315,7 +335,7 @@ const PARKED_SIGNALS = {
   // size of the enum, so a code added without widening that bound renders as a dead
   // sensor rather than as a number — which is a thing a screenshot can catch and a
   // check cannot phrase as well.
-  "waypoint_refused_seq": [2, "", "waypoint", NOW - 3 * MINUTE],
+  "waypoint_refused_seq": [4, "", "waypoint", NOW - 3 * MINUTE],
   "waypoint_refusal": [8, "", "waypoint", NOW - 3 * MINUTE],
   // Two codes the bike is holding. 0044/0 is the water-pump open circuit — real,
   // and permanent on this bike, because the coolant pump is wired to the

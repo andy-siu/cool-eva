@@ -115,6 +115,81 @@ const PROBE = `(() => {
   return widths;
 })()`;
 
+interface SheetMeasurement {
+  open: boolean;
+  clientWidth: number;
+  bodyScrollWidth: number;
+  bodyClientWidth: number;
+  widestRowRight: number;
+  rows: string[];
+}
+
+/**
+ * The menu sheet, measured from INSIDE itself.
+ *
+ * ⚠️ `body.scrollWidth` cannot witness this surface at all: `.sheet` is `position: fixed;
+ * inset: 0`, so a fixed subtree contributes nothing to the document's scrollable overflow,
+ * and `.sheet-body` is `width: 100%` of that — its border box IS the viewport whatever it
+ * holds. So the question has to be asked the way the page asks it of the body: does the
+ * sheet's own content scroll inside it? `overflow-y: auto` makes `overflow-x` compute to
+ * `auto` too, which is exactly where a too-wide row goes to hide.
+ *
+ * The per-row right edge is the second witness, from outside the scroll container: an
+ * overflowing child keeps its real laid-out box, so its rect extends past the phone even
+ * though the box holding it does not.
+ */
+const SHEET = `(() => {
+  const sheet = document.querySelector(".sheet");
+  const body = document.querySelector(".sheet-body");
+  if (sheet === null || body === null) {
+    throw new Error("no menu sheet in the page to measure");
+  }
+  const rows = [...document.querySelectorAll(".waypoint-row")];
+  return {
+    open: sheet.classList.contains("open"),
+    clientWidth: document.documentElement.clientWidth,
+    bodyScrollWidth: body.scrollWidth,
+    bodyClientWidth: body.clientWidth,
+    widestRowRight: Math.round(rows.reduce((furthest, row) => Math.max(furthest, row.getBoundingClientRect().right), 0)),
+    rows: rows.map(row => row.textContent),
+  };
+})()`;
+
+/**
+ * The same synthetic-probe argument the stored-codes tile gets, for the sheet.
+ *
+ * Nothing a waypoint row can really hold is an unbreakable token — a coordinate has a space
+ * in it and every refusal sentence breaks at spaces — so no fixture can falsify
+ * `.waypoint-body { overflow-wrap: anywhere }`. Energica's identifiers are exactly that
+ * shape, which is why the rule is there and why the probe uses one.
+ *
+ * ⚠️ It measures the SCROLL CONTAINER, not the row. A row is a block inside a block, so its
+ * box is its containing block's width whatever it holds — 372 px with or without the rule,
+ * which is an assertion that cannot fail. The overflow is visible one level up: 969 px of
+ * `.sheet-body` scrollWidth without the rule against 390 with it, measured.
+ */
+const ROW_PROBE = `(() => {
+  const body = document.querySelector(".sheet-body");
+  const target = document.querySelector(".waypoint-row .waypoint-body");
+  if (body === null || target === null) {
+    throw new Error("no waypoint row to probe");
+  }
+  const probe = document.createElement("span");
+  probe.textContent = "a" + "WaterPumpCurrentInEnergicaIdentifier".repeat(4);
+  target.append(probe);
+  const widths = { sheet: body.scrollWidth, viewport: body.clientWidth };
+  probe.remove();
+  return widths;
+})()`;
+
+/**
+ * The row this half of the check exists for, pinned by its text — the same argument
+ * LONGEST_ROW makes above. A list of four short coordinates fits trivially and would report
+ * a clean ✓ for a sheet nothing had tested; at 74 characters this is the longest sentence
+ * in WAYPOINT_REFUSAL_TEXT, so it is the row that decides whether the list fits.
+ */
+const LONGEST_REFUSAL = "GPS fix jumped somewhere the bike cannot have ridden — waypoint not saved.";
+
 let failures = 0;
 
 function check(what: string, condition: boolean) {
@@ -171,7 +246,8 @@ if (failures > 0) {
 }
 console.log(
   `\n✓ ${SCENES.length * TABS.length} scene/tab combinations fit a ${PHONE.width} px phone, ` +
-    "and the longest stored-code row is readable in full"
+    "the longest stored-code row is readable in full, and the menu sheet — which none of those " +
+    "measurements can see — does not scroll sideways with the waypoint list open"
 );
 
 /**
@@ -200,6 +276,80 @@ async function sweep(page: HeadlessPage, previewFile: string) {
       await measureTab(page, previewFile, scene, tab.name);
     }
   }
+  // ⚠️ ONE scene, deliberately: the sheet is the same sheet behind every one of them, and
+  // sweeping 25 of it would buy nothing but wall-clock. It is measured at all because it is
+  // the surface the assertions above CANNOT see — §11.8 of docs/diagnostics-and-checks.md,
+  // which named this as the gap for as long as it was one.
+  await measureSheet(page, previewFile, SCENES[0]);
+}
+
+/**
+ * Opens the menu sheet and measures inside it.
+ *
+ * ⚠️ THE CLICK IS AN ASSERTION, not a convenience. `.sheet` is `visibility: hidden`, not
+ * `display: none`, so the sheet and every row in it have full layout boxes whether or not
+ * anything ever opened it — every measurement below passes on a sheet nobody opened. Hence
+ * the `open` check first: a `.menu` button that stopped opening the sheet must go red here
+ * rather than green.
+ */
+async function measureSheet(page: HeadlessPage, previewFile: string, scene: string) {
+  const where = `${scene}/sheet`;
+  // `&sheet=1` is inert, exactly like `&tab=` above — the template reads only `scene`, and
+  // its whole job is to make this URL differ outside the fragment so the page really reloads.
+  // The CLICK below is what opens the sheet.
+  await gotoPage(page, `file://${previewFile}?scene=${scene}&sheet=1#ride`);
+  await waitOnPage(page, `document.querySelectorAll(".view > *").length > 0`, `the ${where} page to render`);
+  await evaluateOnPage(page, `document.querySelector(".header .menu").click()`);
+  // ⚠️ Waited on WITHOUT `.sheet.open`, deliberately. The rows are in the DOM whether or not
+  // anything opened the sheet, so waiting on the open class would turn the assertion below
+  // into a timeout with a vaguer reason — and the point of that assertion is to name what
+  // went wrong when every width still reads fine on a sheet nobody can see.
+  await waitOnPage(page, `document.querySelectorAll(".waypoint-row").length > 0`, `the ${where} to render its list`);
+  const collapsed = asSheetMeasurement(await evaluateOnPage(page, SHEET));
+  check(`${where} really opened — every width below is measured on a hidden sheet otherwise`, collapsed.open);
+  // ⚠️ Measured EXPANDED, because the row that decides this — the longest refusal sentence —
+  // is older than the six the list previews, and a check that never opened the list would
+  // report a clean ✓ for the rows nobody had measured. The toggle is asserted rather than
+  // assumed: it is also what says the preview is real, and clicking a `null` would fail
+  // this run with a stack trace instead of a sentence.
+  const toggles = await evaluateOnPage(page, `document.querySelectorAll(".waypoint-list .code-toggle").length`);
+  check(`${where}'s list previews fewer rows than the bike served — there is a "show all" to press`, toggles === 1);
+  if (toggles === 1) {
+    await evaluateOnPage(page, `document.querySelector(".waypoint-list .code-toggle").click()`);
+    await waitOnPage(
+      page,
+      `document.querySelectorAll(".waypoint-row").length > ${collapsed.rows.length}`,
+      `the ${where}'s waypoint list to expand past its ${collapsed.rows.length}-row preview`
+    );
+  }
+  const measured = asSheetMeasurement(await evaluateOnPage(page, SHEET));
+  console.log(
+    `\n${where}: sheet-body.scrollWidth ${measured.bodyScrollWidth} · clientWidth ${measured.bodyClientWidth} · ` +
+      `widest waypoint row right edge ${measured.widestRowRight} · ${collapsed.rows.length} rows previewed, ` +
+      `${measured.rows.length} shown`
+  );
+  check(
+    `${where} really did expand (${collapsed.rows.length} rows previewed, ${measured.rows.length} shown)`,
+    collapsed.rows.length < measured.rows.length
+  );
+  check(`${where} is being measured at ${PHONE.width} px`, measured.clientWidth === PHONE.width);
+  check(
+    `${where} does not scroll sideways inside itself (${measured.bodyScrollWidth} ≤ ${measured.bodyClientWidth})`,
+    measured.bodyScrollWidth <= measured.bodyClientWidth
+  );
+  check(
+    `${where}'s widest waypoint row ends inside the phone (${measured.widestRowRight} ≤ ${measured.clientWidth})`,
+    measured.widestRowRight <= measured.clientWidth
+  );
+  check(
+    `the fixture still carries the longest refusal sentence ("${LONGEST_REFUSAL.slice(0, 32)}…")`,
+    measured.rows.some(row => row.includes(LONGEST_REFUSAL))
+  );
+  const probed = asProbeWidths(await evaluateOnPage(page, ROW_PROBE), "sheet");
+  check(
+    `an unbreakable name in a row does not scroll the sheet sideways (${probed.measured} ≤ ${probed.viewport})`,
+    probed.measured <= probed.viewport
+  );
 }
 
 async function measureTab(page: HeadlessPage, previewFile: string, scene: string, tab: string) {
@@ -230,10 +380,10 @@ async function measureTab(page: HeadlessPage, previewFile: string, scene: string
   );
   if (scene === "faults" && tab === "faults") {
     checkStoredCodeRows(measured);
-    const probed = asTileWidths(await evaluateOnPage(page, PROBE));
+    const probed = asProbeWidths(await evaluateOnPage(page, PROBE), "tile");
     check(
-      `content that cannot wrap does not widen the stored-codes tile (${probed.tile} ≤ ${probed.viewport})`,
-      probed.tile <= probed.viewport
+      `content that cannot wrap does not widen the stored-codes tile (${probed.measured} ≤ ${probed.viewport})`,
+      probed.measured <= probed.viewport
     );
   }
 }
@@ -254,12 +404,41 @@ function checkStoredCodeRows(measured: Measurement) {
   }
 }
 
-function asTileWidths(value: unknown): { tile: number; viewport: number } {
+/**
+ * ⚠️ Named per probe rather than shared. One shape carrying both would let a probe that
+ * answered with the wrong field pass by reading the other one's number.
+ * @param field which box this probe measured
+ */
+function asProbeWidths(value: unknown, field: "tile" | "sheet"): { measured: number; viewport: number } {
   const fields = fieldsOf(value, "the probe's answer");
-  if (typeof fields.tile !== "number" || typeof fields.viewport !== "number") {
-    throw new Error(`the probe answered with an incomplete pair of widths: ${JSON.stringify(value)}`);
+  if (typeof fields[field] !== "number" || typeof fields.viewport !== "number") {
+    throw new Error(`the ${field} probe answered with an incomplete pair of widths: ${JSON.stringify(value)}`);
   }
-  return { tile: fields.tile, viewport: fields.viewport };
+  return { measured: fields[field], viewport: fields.viewport };
+}
+
+/** Throws rather than narrows, for the reason asMeasurement() does. */
+function asSheetMeasurement(value: unknown): SheetMeasurement {
+  const fields = fieldsOf(value, "the sheet's measurement");
+  const rows = fields.rows;
+  if (
+    typeof fields.open !== "boolean" ||
+    typeof fields.clientWidth !== "number" ||
+    typeof fields.bodyScrollWidth !== "number" ||
+    typeof fields.bodyClientWidth !== "number" ||
+    typeof fields.widestRowRight !== "number" ||
+    !Array.isArray(rows)
+  ) {
+    throw new Error(`the sheet answered with an incomplete measurement: ${JSON.stringify(value)}`);
+  }
+  return {
+    open: fields.open,
+    clientWidth: fields.clientWidth,
+    bodyScrollWidth: fields.bodyScrollWidth,
+    bodyClientWidth: fields.bodyClientWidth,
+    widestRowRight: fields.widestRowRight,
+    rows: rows.map(row => (typeof row === "string" ? row : "")),
+  };
 }
 
 /** Throws rather than narrows: a selector that stopped matching must not read as a pass. */

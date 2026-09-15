@@ -60,6 +60,17 @@ window.fetch = function previewFetch(input, init) {
     // Stamped with the moment of the save and holding it, because that is the time the
     // Waypoints tile prints — the Pi's record() only touches these three when one is saved.
     const savedAt = Date.now();
+    // ⚠️ AND the event, or the list and the counts come apart: waypointListSummary
+    // compares `waypoints` against the saves it can see, so bumping the count alone
+    // makes one tap here render "the bike kept only the newest 4 saves" — a truncation
+    // that never happened, on the screen whose job is to be believed.
+    STATUS.waypointEvents.push({
+      outcome: "saved",
+      sequence: STATUS.waypoints,
+      latitudeDeg: 51.4779,
+      longitudeDeg: -0.0015,
+      at: savedAt,
+    });
     pushPatch({
       waypoint_seq: [STATUS.waypoints, "", "waypoint", savedAt],
       waypoint_lat: [51.4779, "°", "waypoint", savedAt],

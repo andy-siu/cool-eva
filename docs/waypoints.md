@@ -141,8 +141,25 @@ Two archives, same pipeline — fixes formed at every `gps_lat` **or** `gps_lon`
 - **The route map** (`grafana/dashboards/route-map.json`, uid `cool-eva-route-map`) — stars on the map, and a table under it listing every waypoint in the window with its verdict.
 - **The dashboard's menu sheet** — the Waypoints tile shows the last saved position and the time, with `#N` for the count so far. Because `waypoint_*` live only in the server's `liveState`, a service restart empties them: the tile then reads **"none since restart"**, which is the thing the old bare `0` got wrong — it claimed a ride had saved none when the truth was that nobody could tell. A page reload keeps it (`src/ws.ts` sends the full snapshot on connect); a service restart does not.
 - **The ALL tab** — `waypoint_lat` / `waypoint_lon` to six decimals, and a rejected coordinate as a fault rather than a position.
+- **The menu sheet's waypoint LIST**, under that tile — every waypoint of THIS BOOT and every press that was refused, newest first, with the position at six decimals, the time it was saved and its age. **This boot only, and it says so on screen**: the bike has no SQLite and its ride log is write-only, so earlier rides are the route map's and the ride log's. It is drawn from `/status`, never from the `waypoint_*` signals — those carry the newest save and nothing before it, and the phone's socket is closed for every moment the page is hidden, which on a ride is most of them. `src/gps/waypoint-log.ts` is what the bike remembers (the newest 50 events, evicting refusals before it ever evicts a place); `public/lib/waypoint-list.js` turns them into rows.
 
 There is still no GPX export.
+
+### What the list can and cannot be short of
+
+Three ways it can hold fewer rows than the ride had, and each one is named on screen rather than left to be noticed:
+
+|  | why | what the phone says |
+| --- | --- | --- |
+| the view previews six | fifty rows above "Save waypoint here" makes the sheet unusable with a thumb | `· showing the newest 6`, with `show all N` beside it |
+| the bike dropped refusals | `MAX_EVENTS` is 50, and a cold boot with no fix can be asked as fast as a thumb moves | `· the bike dropped its oldest refusals` |
+| the bike dropped saves | only reachable once 50 saves are in one boot; the archive holds 97 **ever** | `· the bike kept only the newest N saves` |
+
+⚠️ **The eviction rule inverts at its own extreme**, which is why `append()` in `src/gps/waypoint-log.ts` points here rather than arguing it in the margin. With the cap reached and every held event a save, the only refusal in the log is the one just pushed — so that is what goes, and the phone then says _"the bike dropped its oldest refusals"_ about a press made a second ago. That is the same rule rather than an exception to it (a save is a place you cannot go back to; a refusal is news), and reaching it needs 50 saves in one boot against 97 in the whole archive. `scripts/check-waypoint-list.ts` §2 pins that shape deliberately, because the obvious "fix" is to evict the oldest save instead. Eviction removes an element and so leaves the relative order of the rest, which is the property the rest of the design rests on: the array is in **fire order**, nothing downstream sorts it, and `at` is a wall clock the Pi steps from GPS (`src/gps/clock.ts`) — a sort by time would scramble every event either side of a step.
+
+⚠️ **`/status` now carries coordinates rather than a count**, and it authenticates nobody on the bike's own wifi — the same tier as `/dl`. The live position is already there on the same wifi (`gps_lat` / `gps_lon` over the WebSocket), so what this adds is **where you stopped** rather than where you are. Worth knowing before it is served anywhere less private than a bike's hotspot; `docs/wifi-hardening.md` is the file that argues that boundary.
+
+`waypoints` and `waypointsRefused` in the payload are the true totals and are never capped, which is what makes those three sentences possible at all. A refusal the Pi could not date — `clockTrustworthy: false`, sampled from `systemClockTrust()` at the refusal — shows **"at an unknown time"** rather than a time of day off a clock the Pi itself disowns: the gates fire in order, so a press at a cold boot answers `NO_FIX` long before the clock gate is reached and the refusal CODE cannot stand in for the flag.
 
 ## The refusals, and what the rider hears
 
