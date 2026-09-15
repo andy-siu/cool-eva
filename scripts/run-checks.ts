@@ -578,6 +578,19 @@ const CHECKS: SelfCheck[] = [
       "sheet throwing once per panel while reporting zero failures. It never runs the page; §11.7 says what it misses",
   },
   {
+    script: "scripts/check-preview-harness.ts",
+    covers:
+      "that the two preview templates still SHARE one harness rather than carrying two copies of it. " +
+      "After #170 merged them, a name declared by both templates is a copy by definition, and so is a name a " +
+      "template declares that scripts/preview-harness-*.js already declares — so this needs no threshold: it " +
+      "asserts that every page-contract name is declared by both pages, that nothing else is, that no template " +
+      "shadows a harness name, and that nothing is declared twice across the harness parts in one of the two " +
+      "ways that redeclare SILENTLY (a function, or a window.* assignment — const/let/class throw at parse and " +
+      "check-service-preview.ts already catches those). Written for the dead settle(): copied into the second " +
+      "template when 85b8643 created it, never called there, improved in one copy only, and unnoticed for three " +
+      "weeks. It reads source and never runs a page; docs/diagnostics-and-checks.md §11.10",
+  },
+  {
     script: "scripts/check-service-gate-charging.ts",
     covers:
       "whether a charging motorcycle may be serviced, on real bytes replayed through the decoders: the two " +
