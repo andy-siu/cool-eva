@@ -34,7 +34,9 @@ import {
   decodeThrottleSensorFrame,
 } from "./drive.ts";
 import { type DecodedValue, bit, bitFieldLe, i16le, u16le } from "./frame.ts";
+import { CLUSTER_RANGE_CAN_ID, decodeClusterRangeFrame } from "./cluster-range.ts";
 import { decodeGpsCanFrame, GPS_CAN_ID } from "./gps.ts";
+import { decodeHubOutputFrame } from "./hub-output.ts";
 import { PSU_CAN_ID, decodePsuFrame } from "./psu.ts";
 import { handlebarSwitches, vehicleFlagsByte3 } from "./vcu-digitals.ts";
 import { VCU_FLAGS_CAN_ID, decodeVcuFlagsFrame } from "./vcu-flags.ts";
@@ -372,16 +374,22 @@ export function decodeFrame(id: number, data: Buffer): DecodedValue[] {
       return values;
     }
 
-    // 0x410 — the Connectivity Hub's own message stream, mirrored onto CAN with the
-    // same framing it uses over BLE (b0 = message type, b1 = sub-index). Carries the
-    // GPS multiplex at ~1.8 Hz unsolicited, which is the whole reason position no
-    // longer depends on the Bluetooth link. Decoded in gps.ts because a fix spans
-    // three sub-frames. ✅ framing and rate confirmed on the bus; the payload is
-    // all-zero in the garage, so the coordinates themselves are still BLE-verified
-    // only. (The old note that b4 here is a high-beam switch was reading one byte of
-    // this multiplex; 0x102 is the real lights frame and already supersedes it.)
+    // 0x410 — the Connectivity-Hub message set on one id (b0 = type, b1 = sub-index),
+    // carrying the GPS multiplex at ~1.8 Hz unsolicited, which is why position no longer
+    // depends on the Bluetooth link. Two pure readers, and neither returns early because a
+    // frame is one or the other: GPS in gps.ts, where a fix spans three sub-frames, and
+    // type 3's drive triple in hub-output.ts.
+    //
+    // 🚨 The INSTRUMENT CLUSTER transmits this id, not the hub, and SYNTHESISES each record
+    // from its own variables rather than forwarding it — so the CAN and BLE copies of one
+    // message type can disagree. Evidence, rates and the superseded b4 note:
+    // docs/can-0x410.md and docs/can-decode-findings.md § "0x410".
     case GPS_CAN_ID:
-      return decodeGpsCanFrame(data);
+      return [...decodeGpsCanFrame(data), ...decodeHubOutputFrame(data)];
+
+    // 0x412 — the cluster's range estimate at 2 Hz. docs/can-0x412.md.
+    case CLUSTER_RANGE_CAN_ID:
+      return decodeClusterRangeFrame(data);
 
     // 0x480 — E-LOCK / keyless status (10 Hz, present key-on/parked). b2-5 LE
     // uint32 = ID of the key fob currently present; it matches slot 1 of the 3
@@ -521,6 +529,7 @@ const VEHICLE_STREAM_IDS = [
   0x306,
   0x400,
   GPS_CAN_ID,
+  CLUSTER_RANGE_CAN_ID,
   0x480,
   PSU_CAN_ID,
   // The charge-manager group. Four of the five are silent unless a charge cable is live,

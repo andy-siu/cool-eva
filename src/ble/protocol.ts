@@ -18,11 +18,14 @@
 
 import { FRAME_SIZE, GPS_MESSAGE_TYPE, GpsMessageDecoder, type DecodedValue } from "../gps/decode.ts";
 import { SuppressedFixWatcher } from "../gps/fix-watch.ts";
+import { HUB_OUTPUT_TYPE, decodeHubOutput, isHubOutputFrame } from "../hub/output.ts";
+import { i16le } from "../can/frame.ts";
 
-// The GPS sub-frames are byte-identical on CAN 0x410, so their bit unpacking lives
-// in ../gps/decode.ts and is shared with src/can/gps.ts rather than duplicated. The
-// record size comes from there for the same reason: it is the hub's framing, not
-// this transport's.
+// The GPS sub-frames are byte-identical on CAN 0x410 — which the instrument cluster
+// transmits, not the hub (docs/can-0x410.md) — so their bit unpacking lives in
+// ../gps/decode.ts and is shared with src/can/gps.ts rather than duplicated. The record
+// size comes from there for the same reason: it is the protocol's framing, not this
+// transport's.
 export type { DecodedValue };
 
 // Message types (CommParser constants). Only read-only types are handled here —
@@ -32,7 +35,7 @@ export type { DecodedValue };
 const TYPE_SEED = 0;
 const TYPE_MATCH_ATTEMPT = 1;
 const TYPE_VEHICLE_STATUS = 2;
-const TYPE_OUTPUT = 3;
+// 3 is HUB_OUTPUT_TYPE, declared in ../hub/output.ts because CAN decodes it too.
 const TYPE_ODOMETER = 4;
 
 /**
@@ -99,10 +102,6 @@ export class FrameReassembler {
   }
 }
 
-function signed16(high: number, low: number): number {
-  return ((high << 24) >> 16) | (low & 0xff) | 0;
-}
-
 function unsigned32(byte3: number, byte2: number, byte1: number, byte0: number): number {
   return ((byte3 << 24) | (byte2 << 16) | (byte1 << 8) | byte0) >>> 0;
 }
@@ -123,7 +122,7 @@ export class BleTelemetryDecoder {
     switch (frame[0]) {
       case TYPE_VEHICLE_STATUS:
         return this.#decodeVehicleStatus(frame);
-      case TYPE_OUTPUT:
+      case HUB_OUTPUT_TYPE:
         return this.#decodeOutput(frame);
       case TYPE_ODOMETER:
         return this.#decodeOdometer(frame);
@@ -141,7 +140,13 @@ export class BleTelemetryDecoder {
     switch (frame[1]) {
       case 0x00:
         // SOC (frame[2]) and battery temp (frame[7]) duplicate CAN 0x200 at 20 Hz,
-        // so they're skipped. The range estimate is not on CAN at all.
+        // so they're skipped.
+        //
+        // 🚨 "The range estimate is not on CAN at all" stood here until #224 and was FALSE:
+        // it is CAN 0x412 b2-b3, from the same cluster variable that fills this frame's own
+        // range slot, and it is decoded as `range_can_km` (src/can/cluster-range.ts). That
+        // those two SOC and temperature slots agree with the BMS's own 0x200 is what tested
+        // the cluster fills this message faithfully — docs/can-0x412.md.
         //
         // 🚨 "…and the vehicle state machine [is] not on CAN at all" stood here until
         // 2026-09-14 and was FALSE. It is CAN 0x101 `VCU_VEHICLE_STS` at 100 Hz, decoded
@@ -156,8 +161,8 @@ export class BleTelemetryDecoder {
         ];
       case 0x01:
         return [
-          { key: "avg_consumption_wh_km", value: signed16(frame[5], frame[4]) / 10 },
-          { key: "km_per_kwh", value: signed16(frame[7], frame[6]) / 100 },
+          { key: "avg_consumption_wh_km", value: i16le(frame[4], frame[5]) / 10 },
+          { key: "km_per_kwh", value: i16le(frame[6], frame[7]) / 100 },
         ];
       case 0x02:
         return [{ key: "kwh_per_100km", value: ((frame[3] << 8) | frame[2]) / 100 }];
@@ -166,15 +171,17 @@ export class BleTelemetryDecoder {
     }
   }
 
+  // The unpacking is ../hub/output.ts, shared with the CAN 0x410 reader that decodes
+  // the byte-identical record off the bus. Only the keys differ: this transport keeps
+  // the bare names and CAN's carries `_can`, so the two stay comparable.
   #decodeOutput(frame: Uint8Array): DecodedValue[] {
-    if (frame[1] !== 0xff) {
+    if (!isHubOutputFrame(frame)) {
       return [];
     }
-    const revolutionsPerMinute = signed16(frame[5], frame[4]);
-    const torqueNm = signed16(frame[7], frame[6]);
+    const output = decodeHubOutput(frame);
     return [
-      { key: "motor_torque_nm", value: torqueNm },
-      { key: "motor_power_kw", value: (torqueNm * 2 * Math.PI * revolutionsPerMinute) / 60000 },
+      { key: "motor_torque_nm", value: output.torqueNm },
+      { key: "motor_power_kw", value: output.powerKw },
     ];
   }
 
