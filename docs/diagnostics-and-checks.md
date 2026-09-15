@@ -954,6 +954,51 @@ The dashboard has no build step and no VDOM, and until #253 nothing in this repo
 
 ⚠️ **And one surface it cannot see at all, which is worth knowing before trusting a green run.** `.sheet` is `position: fixed; inset: 0`, so a fixed subtree contributes nothing to the document's scrollable overflow — `body.scrollWidth` and `innerWidth` can never witness a menu sheet that is too wide. That is not a small gap: the sheet is where `style.css` worries about 390 px most (`.action-note.output`, `views/vcu-write.js`'s note about "pushing a 390 px sheet sideways", the 269-option select). Closing it means opening the sheet from the check and asserting on `.sheet-body` — not done, deliberately out of #253's scope, and written here so the next reader does not mistake the ✓ for one that covers it.
 
+### 11.9 Time as an oracle: what load can and cannot move
+
+A check that measures a real duration and asserts on it can go red because the laptop was busy. `scripts/check-virtual-clock.ts` did exactly that once (#258) and did not reproduce; three more sites were recorded in #126. This is where the reasoning lives, because the useful part is not "those checks were fixed" but **which comparisons a scheduler can invert and which it cannot.**
+
+**The rule.** A stall delays things; it never makes them early. So a bound is safe when load pushes the measurement _away_ from the boundary, and unsafe when it pushes it _across_:
+
+| shape                                                         | safe? | why                                 |
+| ------------------------------------------------------------- | ----- | ----------------------------------- |
+| a lower bound on a measured duration (`separation >= 35`)     | ✅    | a stall can only make the gap wider |
+| an upper bound on one (`separation < 60`)                     | ❌    | a stall walks straight through it   |
+| two independently measured durations compared (`a < b`)       | ❌    | load inflates them unequally        |
+| a count, an ordering, or a name                               | ✅    | no amount of load changes a count   |
+| a bound read from the same clock, _after_ the value it bounds | ✅    | the bracket only widens             |
+
+That last row is what `scripts/check-fan-curve.ts` §10 uses. The reading is handed to the store already `AGE_JUMP_MS` old through `recordArrival()`, and the age it reports back is bracketed between that and `AGE_JUMP_MS + since(theSameMark)`. Both bounds hold at any stall — the lower one because the reconstruction inside `sampleTemperature()` subtracts a gap that is itself inside the interval being measured, the upper one because the bound is read after the value. What it replaced was a _ratio_ — six ticks of real time against one — which load inflates on both sides at once.
+
+**Which orderings real timers keep under starvation.** The differential in `check-virtual-clock.ts` §1 compares the fake clock against real `setTimeout`. Real timers are only an oracle when what is asked of them is scheduling-independent, so each scenario was measured with the event loop deliberately blocked (a synchronous busy-wait at the start of the run), at 5, 12, 18, 25, 30, 45 and 60 ms:
+
+| scenario | invariant? | why |
+| --- | --- | --- |
+| `sameInstantTimers` | ✅ | one due time, so insertion order decides, and a stall does not reorder insertions |
+| `promiseChainBetweenTimers` | ✅ | Node drains microtasks between two timer callbacks, whatever the delay |
+| `asyncCallbackAwaitingSleep` | ✅ | the sleep is armed _inside_ the callback, so it is due after the timer it must not block |
+| `nestedArming` at +5 | ❌ | **inverts from a 15 ms stall up**, which is derivable rather than merely measured |
+| `nestedArming` at +15 | ✅ | due at ≥ 25 against 20, by construction |
+| `zeroDelayFirst` | ✅ | `setTimeout(fn, 0)` and `setTimeout(fn, 1)` share a deadline; insertion order decides |
+
+`nestedArming` is the interesting one. A timer armed from inside a callback is due from when that callback **actually ran**, so its deadline slides with the stall while an already-armed timer's does not. With a stall of `S` the outer runs at `S`, so the nested timer is due at `S + 5` against the 20 armed up front — and it loses the moment `S + 5 ≥ 20`, i.e. **from S = 15**, the tie at exactly 15 going to the pre-armed timer because libuv orders equal deadlines by start id. Measured, that is exactly where it goes: identical at 12, 13 and 14 ms, inverted at 15 and at everything above. At +15 the nested one is due at `S + 15 ≥ 25` against 20 and no stall can reorder them, because a stall only ever pushes it further out. Which means the differential can ask the question **in one direction only** — that a nested arm does not jump _ahead_ of an earlier deadline. The other half, that it is queued by due time rather than appended, is asserted against the fake clock alone in §2, where there is no scheduler to interfere.
+
+**The second failure mode, which the ordering fix does not touch.** The oracle used to sleep `byMs + 10` and compare whatever had been recorded. A timer armed _mid-scenario_ whose deadline lands past that window is simply missing, and the comparison fails on a short list rather than a wrong one. Measured, with the loop blocked from t≈1 to t≈46 ms:
+
+```
+real (advance returned): ["outer","armed up front for 20"]
+real 50 ms later:        ["outer","armed up front for 20","armed from inside the outer"]
+```
+
+Both `nestedArming` and `asyncCallbackAwaitingSleep` lose an event this way. Pre-armed timers cannot: the oracle's own sleep is a timer too, with a later deadline, so Node runs them first however long the stall. The fix is that `advance()` waits for **what it armed** — a count that load can only make slower — rather than for a duration.
+
+**The stalled third pass.** Every scenario is then run again with the loop deliberately blocked for longer than any delay it arms, and must produce the same order. That is the reproduction above kept as a regression test: it is what would have caught #258 before it shipped, and it is what keeps the table in this section true when somebody adds a sixth scenario.
+
+**Seams, and why each one is also a bypass.** Three exist for these checks: `FreezeFrameReadOptions.now` (§5), `recordArrival()` in `src/can/signals.ts`, and `arm(key, reading)` in `public/lib/arming.js`. Each removes the machine from a measurement, and each would also switch off the thing it measures if production used it — a backdated arrival defeats every freshness gate, an injected `now` defeats a deadline, an injected reading defeats a dwell. So each is guarded by a scan asserting no shipping file calls it — and **a scan whose expected answer is zero cannot fail on its own**, so each needs a positive control as well. They do not all carry the same one, and the difference is worth knowing:
+
+- `recordArrival()` and `FreezeFrameReadOptions.now` share `scripts/seam-scan.ts`. It builds its pattern from the imported symbol, so a rename retargets it instead of leaving it behind; it strips `//` comments, so the pointer comment this repo asks you to leave at the code is not read as a call; and it reports how many files it read. Their controls assert that count and put a LITERAL through the matcher — never the check file's own text, which contains the seam's name in prose and would satisfy a self-scan even after the function had been renamed out from under it.
+- `arm(key, reading)` in `check-arming.ts` §7 is rename-proof for a different reason: its pattern matches eleven real call sites and the check asserts it found at least eight, so a rename drops that to zero and goes red. What nothing there asserts yet is that the predicate separating an injecting call from an ordinary one still recognises either — issue #271.
+
 ## 12. Extracting Energica's VCU parameter tables
 
 `scripts/extract-vcu-tables.ts` pulls the tables out of the manufacturer's service-tool executable and writes `src/vcu/table-catalog.data.ts`. README §"Adding your bike's VCU parameter table" is the operator-facing walkthrough.
