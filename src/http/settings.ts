@@ -4,7 +4,7 @@ import { validBleSecret } from "../../public/lib/ble-secret.js";
 import { bluetoothCodeId, type SettingsRuntime } from "../settings/startup.ts";
 import { pendingSettings, record } from "../settings/schema.ts";
 import { validateSettingsPatch } from "../settings/validation.ts";
-import { publicSettings, type SettingsReply, type HubCandidate } from "../settings/view.ts";
+import { publicSettings, type BluetoothKeyReply, type SettingsReply, type HubCandidate } from "../settings/view.ts";
 import type { SettingsRestart, RestartOperation } from "../settings/restart.ts";
 import { retiredLegacyChoices } from "../settings/legacy.ts";
 import { csrfRefusal } from "./mutation-guard.ts";
@@ -58,10 +58,17 @@ export async function handleSettingsEndpoint(
       });
       return;
     }
+    if (path === "/settings/bluetooth-key") {
+      // POST behind the settings header, so a cross-origin page cannot read the reply.
+      const requester = cameThroughBluetoothTunnel(req)
+        ? "the Bluetooth tunnel"
+        : (req.socket.remoteAddress ?? "an unknown address");
+      console.log(`settings: Bluetooth key shown on request from ${requester}`);
+      respond(res, 200, bluetoothKeyReply(context.runtime));
+      return;
+    }
     if (path === "/settings/apply") {
-      const fromBluetooth =
-        req.headers["x-cool-eva-tunnel"] === "1" &&
-        ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "");
+      const fromBluetooth = cameThroughBluetoothTunnel(req);
       const reserved = await reserveSettingsRestart(req, body, context);
       let finished: () => void = () => {};
       const delivery = new Promise<void>(resolve => {
@@ -202,10 +209,7 @@ export async function reserveSettingsRestart(
     throw new Error("Reload settings before restarting.");
   }
   if (body.expectedGeneration !== context.restart.generation) return false;
-  const fromBluetooth =
-    req.headers["x-cool-eva-tunnel"] === "1" &&
-    ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "");
-  validateRestartBluetoothKey(body, context, fromBluetooth);
+  validateRestartBluetoothKey(body, context, cameThroughBluetoothTunnel(req));
   return context.restart.reserve(
     body.expectedGeneration,
     body.revision === null ? null : Number(body.revision),
@@ -226,6 +230,22 @@ export function validateRestartBluetoothKey(
   ) {
     throw new Error("Save this Pi’s pending Bluetooth key on this phone, or reconnect over Wi-Fi, before restarting.");
   }
+}
+
+function cameThroughBluetoothTunnel(req: IncomingMessage): boolean {
+  return (
+    req.headers["x-cool-eva-tunnel"] === "1" &&
+    ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress ?? "")
+  );
+}
+
+function bluetoothKeyReply(runtime: SettingsRuntime): BluetoothKeyReply {
+  const state = runtime.store.read();
+  const active = runtime.active.dashboardBluetoothSecret || null;
+  if (state.kind !== "ready") {
+    return { ok: false, message: "Settings are unreadable, so the saved key cannot be shown.", saved: null, active };
+  }
+  return { ok: true, message: "", saved: state.document.values.dashboardBluetoothSecret || null, active };
 }
 
 function respond(res: ServerResponse, status: number, value: unknown): void {

@@ -48,6 +48,14 @@ export interface SettingsActionReply {
   settings?: SettingsReply;
 }
 
+/** `POST /settings/bluetooth-key`: the only reply that carries the key, and only when asked. */
+export interface BluetoothKeyReply {
+  ok: boolean;
+  message: string;
+  saved: string | null;
+  active: string | null;
+}
+
 export interface HubCandidate {
   address: string;
   name: string;
