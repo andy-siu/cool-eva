@@ -131,7 +131,10 @@ export async function createRig(options: RigOptions = {}) {
   const environment: Partial<BleEnvironment> = {
     ...clock,
     url: new URL("https://cool-eva.athegen.com/"),
-    bluetooth: () => ({ requestDevice: async () => device }),
+    bluetooth: () => ({
+      requestDevice: async () => device,
+      ...(options.permittedDevices ? { getDevices: async () => options.permittedDevices!(device) } : {}),
+    }),
     secure: () => true,
     shell: () => undefined,
     storage: {
@@ -227,6 +230,8 @@ interface RigOptions {
   multiple?: boolean;
   session?: BleSession;
   holdNotifications?: boolean;
+  /** Gives the fake browser `getDevices`, answering with what this returns for the rig's Pi. */
+  permittedDevices?: (pi: BleDevice) => BleDevice[];
 }
 export const KEY = "0123456789abcdef".repeat(4);
 export const PHONE = "/org/bluez/hci0/dev_PHONE";
