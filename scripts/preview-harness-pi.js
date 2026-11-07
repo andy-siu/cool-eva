@@ -148,6 +148,15 @@ window.fetch = function previewFetch(input, init) {
     };
     return json({ ok: true, message: SETTINGS.restart.message, settings: SETTINGS });
   }
+  if (path === "/settings/bluetooth-key") {
+    const synthetic = "0123456789abcdef".repeat(4);
+    return json({
+      ok: true,
+      message: "",
+      saved: SETTINGS.saved.bluetoothCodeId ? synthetic : null,
+      active: SETTINGS.active.bluetoothCodeId ? synthetic : null,
+    });
+  }
   if (path === "/settings/hub-candidates")
     return json({
       ok: true,

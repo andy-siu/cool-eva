@@ -1129,7 +1129,7 @@ const CHECKS: SelfCheck[] = [
   {
     script: "scripts/check-settings-http.ts",
     covers:
-      "settings redaction, strict HTTP mutations, pending/active state, canonical public keys and Bluetooth key handover",
+      "settings redaction, strict HTTP mutations, pending/active state, canonical public keys, the guarded Bluetooth key read-back and Bluetooth key handover",
   },
   {
     script: "scripts/check-settings-migration-guards.ts",

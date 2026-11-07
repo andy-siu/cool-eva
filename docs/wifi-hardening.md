@@ -30,6 +30,7 @@ The header **values differ per endpoint** so a caller built for one cannot reach
 | `/status`, `/dl` | stored state, the sealed ride log | none — reads. ⚠️ `/dl` authenticates nobody; the log is unreadable without the laptop's private key, but the ciphertext is pullable |
 | `/dtc-table`, `/fault-infokeys`, `/lifetime-stats`, `/vcu-params`, `/stored-dtcs`, `/vcu-backup.csv` | stored snapshots and static tables | none — `/lifetime-stats`' handler takes no `req` at all, so "cannot reach the bus" is type-checked rather than promised |
 | `/waypoint` | the ride log (GPS) | **none, and it ignores `req.method`** — see below |
+| `/settings/bluetooth-key` | **returns the dashboard Bluetooth key** | `X-Cool-Eva: settings` on a POST. ⚠️ That stops another website, not anyone on the wifi: one `curl` reads the key, which then connects over Bluetooth from anywhere in range. Accepted on purpose so the owner can recover a lost copy; each read is logged ([settings.md](settings.md)) |
 | `/can-restart` | the Pi's CAN interface | `X-Cool-Eva: can-restart` (#150) |
 | `/update` | `sudo git pull` + `systemctl restart` | `X-Cool-Eva: update` (#150) |
 | `/fan` | the Pi's GPIO | `X-Cool-Eva: fan` |

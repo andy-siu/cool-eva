@@ -9,7 +9,7 @@ import { promisify } from "util";
 import { startSettings } from "../src/settings/startup.ts";
 import { createSettingsRestart } from "../src/settings/restart.ts";
 import { handleSettingsEndpoint } from "../src/http/settings.ts";
-import type { SettingsReply, SettingsActionReply } from "../src/settings/view.ts";
+import type { SettingsReply, SettingsActionReply, BluetoothKeyReply } from "../src/settings/view.ts";
 import { closeSettingsFixture, settingsFixture } from "./settings-check-fixtures.ts";
 
 const fixture = await settingsFixture();
@@ -134,6 +134,19 @@ try {
   assert.equal(readback.includes(secret), false);
   assert.equal(readback.includes("BEGIN PUBLIC KEY"), false);
   assert.equal(readback.includes("PRIVATE KEY"), false);
+  for (const headers of rejectedHeaders) {
+    const refusedKey = await fetch(base + "/settings/bluetooth-key", { method: "POST", headers, body: "{}" });
+    assert.equal(refusedKey.status, 403, "the key route answered without the settings header");
+    assert.equal((await refusedKey.text()).includes(secret), false);
+  }
+  const keyByGet = await fetch(base + "/settings/bluetooth-key");
+  assert.equal(keyByGet.status, 405);
+  assert.equal((await keyByGet.text()).includes(secret), false);
+  assert.equal((await send("/settings/bluetooth-key", "POST", { extra: true })).status, 409);
+  const keyReply = (await (await send("/settings/bluetooth-key", "POST", {})).json()) as BluetoothKeyReply;
+  assert.equal(keyReply.ok, true);
+  assert.equal(keyReply.saved, secret, "Show key did not return the saved key");
+  assert.equal(keyReply.active, null, "the active key changed before a restart");
   assert.equal((await send("/settings", "PATCH", { revision: 0, changes: { radiatorFanEnabled: true } })).status, 409);
   const tunnelHeaders = { ...jsonHeaders, "X-Cool-Eva-Tunnel": "1" };
   const refused = await fetch(base + "/settings/apply", {
@@ -171,7 +184,7 @@ try {
   assert.equal(scheduled, 1);
   assert.equal((await send("/settings", "PATCH", { revision: 1, changes: { radiatorFanEnabled: true } })).status, 409);
   console.log(
-    "  header/method/content-type guards, private-key rejection, canonical public-key save, redacted GET, stale revision, Bluetooth handover and process-generation idempotence"
+    "  header/method/content-type guards, private-key rejection, canonical public-key save, redacted GET, guarded Bluetooth key read-back, stale revision, Bluetooth handover and process-generation idempotence"
   );
 } finally {
   finishDrain();
